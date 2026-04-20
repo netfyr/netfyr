@@ -465,14 +465,6 @@ mod tests {
     }
 
     /// Scenario: String values that look like IPs are parsed as IpAddr
-    ///
-    /// BUG: The `ipnetwork` crate accepts bare IP addresses (no `/prefix`) and
-    /// treats them as host-route networks (e.g. "10.0.1.1" → Ipv4Network /32).
-    /// Because `IpNetwork::from_str` is tried before `IpAddr::from_str`, bare
-    /// IPs currently become `Value::IpNetwork(10.0.1.1/32)` rather than
-    /// `Value::IpAddr(10.0.1.1)` as the spec requires.  This test documents the
-    /// expected behaviour; it will fail until the heuristic is fixed (e.g. by
-    /// requiring a `/` character before attempting IpNetwork parse).
     #[test]
     fn test_deserialize_value_ip_addr_string_becomes_ip_addr() {
         let result =
@@ -904,15 +896,12 @@ mod tests {
 
     /// Scenario: Round-trip with various field types preserves all values.
     ///
-    /// String, U64, Bool, IpNetwork (with prefix), List, and Map all survive a
-    /// YAML round-trip.  IpAddr is omitted here because of the IpNetwork heuristic
-    /// bug documented in `test_deserialize_value_ip_addr_string_becomes_ip_addr`
-    /// — a bare IP serialised as "10.0.1.1" is re-parsed as IpNetwork(/32), not
-    /// IpAddr.  A dedicated test below (`test_round_trip_yaml_ip_addr_becomes_ip_network`)
-    /// documents that specific failure against the spec.
+    /// String, U64, Bool, IpAddr, IpNetwork (with prefix), List, and Map all survive
+    /// a YAML round-trip.
     #[test]
     fn test_round_trip_yaml_various_field_types() {
         let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
+        let ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
 
         let mut inner_map = IndexMap::new();
         inner_map.insert("proto".to_string(), Value::String("tcp".to_string()));
@@ -921,6 +910,7 @@ mod tests {
         fields.insert("mtu".to_string(), make_fv(Value::U64(9000)));
         fields.insert("enabled".to_string(), make_fv(Value::Bool(true)));
         fields.insert("label".to_string(), make_fv(Value::String("uplink".to_string())));
+        fields.insert("gateway".to_string(), make_fv(Value::IpAddr(ip)));
         fields.insert("network".to_string(), make_fv(Value::IpNetwork(net)));
         fields.insert(
             "tags".to_string(),
@@ -948,6 +938,7 @@ mod tests {
         assert_eq!(restored.fields["mtu"].value, Value::U64(9000));
         assert_eq!(restored.fields["enabled"].value, Value::Bool(true));
         assert_eq!(restored.fields["label"].value, Value::String("uplink".to_string()));
+        assert_eq!(restored.fields["gateway"].value, Value::IpAddr(ip));
         assert_eq!(restored.fields["network"].value, Value::IpNetwork(net));
 
         let tags = restored.fields["tags"].value.as_list().unwrap();
@@ -959,16 +950,78 @@ mod tests {
         assert_eq!(opts.get("proto"), Some(&Value::String("tcp".to_string())));
     }
 
-    /// BUG: A `Value::IpAddr` field does not survive a YAML round-trip.
-    ///
-    /// The spec requires that "10.0.1.1" deserializes to `Value::IpAddr`.
-    /// In practice, `IpNetwork::from_str("10.0.1.1")` succeeds (returning a /32
-    /// host-route network), so the heuristic never reaches the `IpAddr` branch.
-    /// After serialising `Value::IpAddr(10.0.1.1)` and re-parsing, the result is
-    /// `Value::IpNetwork(10.0.1.1/32)`.  This test will fail until the heuristic
-    /// is corrected to require a `/` before attempting IpNetwork parsing.
+    /// Scenario: Parse route objects — destination is IpNetwork, gateway is IpAddr, metric is U64
     #[test]
-    fn test_round_trip_yaml_ip_addr_becomes_ip_network_bug() {
+    fn test_parse_yaml_route_values_are_correctly_typed() {
+        let yaml = "type: ethernet\nname: eth0\nroutes:\n  - destination: 0.0.0.0/0\n    gateway: 10.0.1.1\n    metric: 100\n";
+        let states = parse_yaml(yaml).unwrap();
+        let routes = states[0].fields["routes"].value.as_list().unwrap();
+        let route_map = routes[0].as_map().unwrap();
+
+        let expected_net: Ipv4Network = "0.0.0.0/0".parse().unwrap();
+        assert_eq!(
+            route_map.get("destination"),
+            Some(&Value::IpNetwork(expected_net)),
+            "destination should be Value::IpNetwork"
+        );
+
+        let expected_gw: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        assert_eq!(
+            route_map.get("gateway"),
+            Some(&Value::IpAddr(expected_gw)),
+            "gateway should be Value::IpAddr"
+        );
+
+        assert_eq!(
+            route_map.get("metric"),
+            Some(&Value::U64(100)),
+            "metric should be Value::U64"
+        );
+    }
+
+    /// Scenario: Address list ordering — element order from YAML is preserved through parsing
+    #[test]
+    fn test_parse_yaml_list_element_order_is_preserved() {
+        // Three addresses in a specific order; the first should stay first after parsing.
+        let yaml = "type: ethernet\nname: eth0\naddresses:\n  - 10.0.1.50/24\n  - 10.0.2.50/24\n  - 10.0.3.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        let list = states[0].fields["addresses"].value.as_list().unwrap();
+
+        assert_eq!(list.len(), 3, "all three addresses should be present");
+
+        let n1: Ipv4Network = "10.0.1.50/24".parse().unwrap();
+        let n2: Ipv4Network = "10.0.2.50/24".parse().unwrap();
+        let n3: Ipv4Network = "10.0.3.50/24".parse().unwrap();
+
+        assert_eq!(list[0], Value::IpNetwork(n1), "first address should be 10.0.1.50/24");
+        assert_eq!(list[1], Value::IpNetwork(n2), "second address should be 10.0.2.50/24");
+        assert_eq!(list[2], Value::IpNetwork(n3), "third address should be 10.0.3.50/24");
+    }
+
+    /// Scenario: mac selector key in YAML is parsed into selector.mac (not fields)
+    #[test]
+    fn test_parse_yaml_mac_selector_parsed_to_selector_mac() {
+        let yaml = "type: ethernet\nmac: aa:bb:cc:dd:ee:ff\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        let state = &states[0];
+
+        // mac must land on the selector, not in fields
+        assert!(
+            state.selector.mac.is_some(),
+            "mac should be parsed into selector.mac"
+        );
+        let mac = state.selector.mac.as_ref().unwrap();
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+
+        assert!(
+            !state.fields.contains_key("mac"),
+            "mac should not appear in fields"
+        );
+    }
+
+    /// Scenario: A `Value::IpAddr` field survives a YAML round-trip correctly.
+    #[test]
+    fn test_round_trip_yaml_ip_addr_round_trips_correctly() {
         let ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
 
         let mut fields = IndexMap::new();
@@ -986,7 +1039,6 @@ mod tests {
         let yaml = state_to_yaml(&state).unwrap();
         let restored = &parse_yaml(&yaml).unwrap()[0];
 
-        // Per spec this must be Value::IpAddr; currently returns Value::IpNetwork.
         assert_eq!(restored.fields["gateway"].value, Value::IpAddr(ip));
     }
 }

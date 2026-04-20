@@ -245,6 +245,26 @@ mod tests {
         assert_eq!(states[0].selector.name, Some("eth0".to_string()));
     }
 
+    /// Scenario: load_file multi-document — two states from one file with separator
+    #[test]
+    fn test_load_file_multi_document_returns_two_states() {
+        let dir = temp_dir("load_file_multi");
+        let path = dir.join("interfaces.yaml");
+        fs::write(
+            &path,
+            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+        )
+        .unwrap();
+
+        let result = load_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+
+        let states = result.expect("load_file should succeed for multi-document YAML");
+        assert_eq!(states.len(), 2, "expected 2 states from a two-document file");
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[1].selector.name, Some("eth1".to_string()));
+    }
+
     /// load_file on a non-existent path returns YamlError::Io
     #[test]
     fn test_load_file_nonexistent_path_returns_io_error() {
