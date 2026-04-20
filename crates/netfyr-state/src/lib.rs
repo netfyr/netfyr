@@ -27,11 +27,11 @@ pub type EntityType = String;
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
-use ipnetwork::IpNetwork;
+use ipnetwork::Ipv4Network;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -246,8 +246,8 @@ pub enum Value {
     I64(i64),
     // IpNetwork before IpAddr: the ipnetwork deserializer requires a `/prefix`,
     // so it will fail on bare IPs and fall through to IpAddr.
-    IpNetwork(IpNetwork),
-    IpAddr(IpAddr),
+    IpNetwork(Ipv4Network),
+    IpAddr(Ipv4Addr),
     List(Vec<Value>),
     Map(IndexMap<String, Value>),
     // String is last — it matches any JSON string, so it must come after all
@@ -318,14 +318,14 @@ impl From<bool> for Value {
     }
 }
 
-impl From<IpAddr> for Value {
-    fn from(ip: IpAddr) -> Self {
+impl From<Ipv4Addr> for Value {
+    fn from(ip: Ipv4Addr) -> Self {
         Value::IpAddr(ip)
     }
 }
 
-impl From<IpNetwork> for Value {
-    fn from(net: IpNetwork) -> Self {
+impl From<Ipv4Network> for Value {
+    fn from(net: Ipv4Network) -> Self {
         Value::IpNetwork(net)
     }
 }
@@ -359,14 +359,14 @@ impl Value {
         }
     }
 
-    pub fn as_ip_addr(&self) -> Option<&IpAddr> {
+    pub fn as_ip_addr(&self) -> Option<&Ipv4Addr> {
         match self {
             Value::IpAddr(ip) => Some(ip),
             _ => None,
         }
     }
 
-    pub fn as_ip_network(&self) -> Option<&IpNetwork> {
+    pub fn as_ip_network(&self) -> Option<&Ipv4Network> {
         match self {
             Value::IpNetwork(net) => Some(net),
             _ => None,
@@ -483,7 +483,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use indexmap::IndexMap;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     // ── MacAddr tests ─────────────────────────────────────────────────────────
 
@@ -929,8 +929,8 @@ mod tests {
 
     #[test]
     fn test_value_all_variants_constructable() {
-        let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let ip = Ipv4Addr::new(10, 0, 1, 1);
+        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
         let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
 
@@ -949,8 +949,8 @@ mod tests {
 
     #[test]
     fn test_value_all_variants_clone_debug_partialeq() {
-        let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let ip = Ipv4Addr::new(10, 0, 1, 1);
+        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
         let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
 
@@ -1010,13 +1010,13 @@ mod tests {
 
     #[test]
     fn test_value_from_ip_addr() {
-        let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let ip = Ipv4Addr::new(192, 168, 1, 1);
         assert_eq!(Value::from(ip), Value::IpAddr(ip));
     }
 
     #[test]
     fn test_value_from_ip_network() {
-        let net: IpNetwork = "192.168.1.0/24".parse().unwrap();
+        let net: Ipv4Network = "192.168.1.0/24".parse().unwrap();
         assert_eq!(Value::from(net), Value::IpNetwork(net));
     }
 
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn test_value_ip_addr_accessor_returns_some() {
-        let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+        let ip = Ipv4Addr::new(10, 0, 1, 1);
         assert_eq!(Value::IpAddr(ip).as_ip_addr(), Some(&ip));
     }
 
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_value_ip_network_accessor_returns_some() {
-        let net: IpNetwork = "10.0.0.0/8".parse().unwrap();
+        let net: Ipv4Network = "10.0.0.0/8".parse().unwrap();
         assert_eq!(Value::IpNetwork(net).as_ip_network(), Some(&net));
     }
 
@@ -1132,13 +1132,13 @@ mod tests {
 
     #[test]
     fn test_value_display_ip_addr() {
-        let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+        let ip = Ipv4Addr::new(10, 0, 1, 1);
         assert_eq!(format!("{}", Value::IpAddr(ip)), "10.0.1.1");
     }
 
     #[test]
     fn test_value_display_ip_network() {
-        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
         assert_eq!(format!("{}", Value::IpNetwork(net)), "10.0.1.0/24");
     }
 

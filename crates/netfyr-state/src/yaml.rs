@@ -8,9 +8,9 @@
 
 use crate::{FieldValue, MacAddr, MacAddrParseError, Provenance, Selector, State, StateMetadata, Value};
 use indexmap::IndexMap;
-use ipnetwork::IpNetwork;
+use ipnetwork::Ipv4Network;
 use serde::de::Deserialize;
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -108,11 +108,11 @@ pub fn deserialize_value(v: &serde_yaml::Value) -> Result<Value, YamlError> {
             // host-route networks, which would prevent bare IPs from being parsed
             // as Value::IpAddr as the spec requires.
             if s.contains('/') {
-                if let Ok(net) = IpNetwork::from_str(s) {
+                if let Ok(net) = Ipv4Network::from_str(s) {
                     return Ok(Value::IpNetwork(net));
                 }
             }
-            if let Ok(ip) = IpAddr::from_str(s) {
+            if let Ok(ip) = Ipv4Addr::from_str(s) {
                 Ok(Value::IpAddr(ip))
             } else {
                 Ok(Value::String(s.clone()))
@@ -390,8 +390,8 @@ mod tests {
     use super::*;
     use crate::{FieldValue, Provenance, Selector, State, StateMetadata, Value};
     use indexmap::IndexMap;
-    use ipnetwork::IpNetwork;
-    use std::net::IpAddr;
+    use ipnetwork::Ipv4Network;
+    use std::net::Ipv4Addr;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -477,7 +477,7 @@ mod tests {
     fn test_deserialize_value_ip_addr_string_becomes_ip_addr() {
         let result =
             deserialize_value(&serde_yaml::Value::String("10.0.1.1".to_string())).unwrap();
-        let expected_ip: IpAddr = "10.0.1.1".parse().unwrap();
+        let expected_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
         assert_eq!(result, Value::IpAddr(expected_ip));
     }
 
@@ -486,7 +486,7 @@ mod tests {
     fn test_deserialize_value_cidr_string_becomes_ip_network() {
         let result =
             deserialize_value(&serde_yaml::Value::String("10.0.1.0/24".to_string())).unwrap();
-        let expected_net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let expected_net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
         assert_eq!(result, Value::IpNetwork(expected_net));
     }
 
@@ -514,7 +514,7 @@ mod tests {
         let result = deserialize_value(&seq).unwrap();
         let list = result.as_list().expect("should be a list");
         assert_eq!(list.len(), 1);
-        let expected_net: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        let expected_net: Ipv4Network = "10.0.1.50/24".parse().unwrap();
         assert_eq!(list[0], Value::IpNetwork(expected_net));
     }
 
@@ -573,7 +573,7 @@ mod tests {
         let addrs = &states[0].fields["addresses"].value;
         let list = addrs.as_list().expect("addresses should be a list");
         assert_eq!(list.len(), 1);
-        let expected_net: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        let expected_net: Ipv4Network = "10.0.1.50/24".parse().unwrap();
         assert_eq!(list[0], Value::IpNetwork(expected_net));
     }
 
@@ -912,7 +912,7 @@ mod tests {
     /// documents that specific failure against the spec.
     #[test]
     fn test_round_trip_yaml_various_field_types() {
-        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
 
         let mut inner_map = IndexMap::new();
         inner_map.insert("proto".to_string(), Value::String("tcp".to_string()));
@@ -969,7 +969,7 @@ mod tests {
     /// is corrected to require a `/` before attempting IpNetwork parsing.
     #[test]
     fn test_round_trip_yaml_ip_addr_becomes_ip_network_bug() {
-        let ip: IpAddr = "10.0.1.1".parse().unwrap();
+        let ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
 
         let mut fields = IndexMap::new();
         fields.insert("gateway".to_string(), make_fv(Value::IpAddr(ip)));

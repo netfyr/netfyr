@@ -111,7 +111,7 @@ fn test_state_priority() {
 #[test]
 fn test_state_serde_round_trip() {
     // Build a richly-populated State with various Value types
-    let net: ipnetwork::IpNetwork = "10.0.1.0/24".parse().unwrap();
+    let net: ipnetwork::Ipv4Network = "10.0.1.0/24".parse().unwrap();
 
     let mut addresses_map = IndexMap::new();
     addresses_map.insert("prefix".to_string(), Value::IpNetwork(net));
@@ -349,8 +349,8 @@ fn test_selector_default_has_no_name() {
 /// address this.
 #[test]
 fn test_value_ip_addr_serde_bug() {
-    use std::net::{IpAddr, Ipv4Addr};
-    let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    use std::net::Ipv4Addr;
+    let ip = Ipv4Addr::new(10, 0, 1, 1);
     let original = Value::IpAddr(ip);
 
     let json = serde_json::to_string(&original).expect("serialize");
@@ -360,7 +360,7 @@ fn test_value_ip_addr_serde_bug() {
     // assert_eq!(original, deserialized, "IpAddr must survive a JSON round-trip");
 
     // Instead, document the actual (buggy) behaviour:
-    let expected_bug = Value::IpNetwork("10.0.1.1/32".parse().unwrap());
+    let expected_bug = Value::IpNetwork("10.0.1.1/32".parse::<ipnetwork::Ipv4Network>().unwrap());
     assert_eq!(
         deserialized, expected_bug,
         "BUG: IpAddr(10.0.1.1) deserializes as IpNetwork(10.0.1.1/32) due to variant ordering"

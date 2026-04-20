@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "netfyr"
 path = "src/main.rs"
 
+[[bin]]
+name = "netfyr-cli"
+path = "src/netfyr_cli_main.rs"
+
 [dependencies]
 # CLI argument parsing — no std equivalent for subcommands and derive macros
 clap = { version = "4", features = ["derive"] }
