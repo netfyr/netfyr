@@ -441,7 +441,7 @@ async fn apply_remove(
 ///
 /// Field changes are applied in prescribed order:
 /// 1. Link-level (mtu, operstate)
-/// 2. Addresses (add before remove to avoid transient address loss)
+/// 2. Addresses (remove before add to preserve YAML ordering)
 /// 3. Routes
 ///
 /// Read-only fields produce `SkippedOperation` entries. Errors are collected and
@@ -591,32 +591,9 @@ async fn apply_modify_fields(
             .filter(|a| !desired_addrs.contains(a))
             .collect();
 
-        // Add new addresses first (to avoid transient loss of all addresses).
-        for cidr in &to_add {
-            match parse_cidr(cidr) {
-                Ok((ip, prefix)) => {
-                    match handle.address().add(index, ip, prefix).execute().await {
-                        Ok(()) => fields_changed.push("addresses".to_string()),
-                        Err(ref e) if is_eexist(e) => {
-                            skipped.push(SkippedOperation {
-                                operation: DiffOpKind::Modify,
-                                entity_type: "ethernet".to_string(),
-                                selector: Selector::with_name(name),
-                                reason: format!("address {cidr} already present"),
-                            });
-                        }
-                        Err(e) => failures.push(make_field_failure(
-                            name,
-                            map_netlink_error(e, &format!("add address {cidr} on {name}")),
-                            "addresses",
-                        )),
-                    }
-                }
-                Err(e) => failures.push(make_field_failure(name, e, "addresses")),
-            }
-        }
-
-        // Then remove unwanted addresses.
+        // Remove unwanted addresses first, then add new ones in desired order.
+        // This ensures the kernel's address list order matches YAML order, and
+        // the first address in the policy becomes the primary (source) address.
         if !to_remove.is_empty() {
             match query_address_messages(handle, index).await {
                 Ok(msgs) => {
@@ -666,6 +643,31 @@ async fn apply_modify_fields(
                             }
                             Err(e) => failures.push(make_field_failure(name, e, "addresses")),
                         }
+                    }
+                }
+                Err(e) => failures.push(make_field_failure(name, e, "addresses")),
+            }
+        }
+
+        // Add new addresses in the order they appear in the desired state.
+        for cidr in &to_add {
+            match parse_cidr(cidr) {
+                Ok((ip, prefix)) => {
+                    match handle.address().add(index, ip, prefix).execute().await {
+                        Ok(()) => fields_changed.push("addresses".to_string()),
+                        Err(ref e) if is_eexist(e) => {
+                            skipped.push(SkippedOperation {
+                                operation: DiffOpKind::Modify,
+                                entity_type: "ethernet".to_string(),
+                                selector: Selector::with_name(name),
+                                reason: format!("address {cidr} already present"),
+                            });
+                        }
+                        Err(e) => failures.push(make_field_failure(
+                            name,
+                            map_netlink_error(e, &format!("add address {cidr} on {name}")),
+                            "addresses",
+                        )),
                     }
                 }
                 Err(e) => failures.push(make_field_failure(name, e, "addresses")),

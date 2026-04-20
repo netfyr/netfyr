@@ -141,9 +141,6 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     }
 
     // 9. No changes — exit early.
-    // Use reconcile_diff.has_meaningful_changes() to match dry-run semantics: Unset-only
-    // diffs (kernel-managed fields like link-local addresses in actual but absent from the
-    // policy) are not treated as actionable changes.
     if !reconcile_diff.has_meaningful_changes() {
         if reconciliation.conflicts.is_empty() {
             println!("No changes needed. System is already in desired state.");

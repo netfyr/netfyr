@@ -128,18 +128,17 @@ impl StateDiff {
     }
 
     /// Returns `true` if any operation represents a change that would actually
-    /// be applied. Unlike `is_empty()`, this excludes Modify operations whose
-    /// only field changes are `Unset` — those correspond to fields that are in
-    /// actual state but absent from the desired policy, which the backend skips
-    /// as kernel-managed (e.g., operstate, link-local addresses). A policy that
-    /// only specifies mtu should not report "changes needed" for kernel fields.
+    /// be applied. Read-only fields (carrier, speed, mac, driver) are already
+    /// excluded from the diff by `generate_diff` via the schema registry, so
+    /// any `Unset` changes that reach this point represent writable fields
+    /// (e.g., `addresses`, `routes`) that the backend will act on.
     pub fn has_meaningful_changes(&self) -> bool {
         self.operations.iter().any(|op| {
             matches!(op.kind, DiffKind::Add | DiffKind::Remove)
                 || op
                     .field_changes
                     .iter()
-                    .any(|fc| matches!(fc.change, FieldChangeKind::Set { .. }))
+                    .any(|fc| matches!(fc.change, FieldChangeKind::Set { .. } | FieldChangeKind::Unset { .. }))
         })
     }
 }
