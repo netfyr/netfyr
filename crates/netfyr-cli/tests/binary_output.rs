@@ -2,7 +2,8 @@
 //!
 //! Verifies that:
 //! - The `netfyr-cli` binary exists in the target directory after building.
-//! - Running the binary with no arguments prints "netfyr" to stdout and exits 0.
+//! - Running the binary with no arguments prints usage help (including "netfyr") to stderr and exits 2.
+//!   (SPEC-301: clap uses SubcommandRequiredElseHelp, which exits 2 and writes help to stderr.)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,24 +28,26 @@ fn test_cli_binary_exists_in_target_directory() {
     );
 }
 
-/// AC: Running the binary prints "netfyr" to stdout.
+/// AC: Running the binary with no arguments prints usage help containing "netfyr" to stderr.
 ///
-/// The CLI prints "netfyr" when invoked with no subcommand (see src/main.rs).
+/// SPEC-301: clap SubcommandRequiredElseHelp writes help to stderr when no subcommand is given.
 #[test]
 fn test_cli_binary_prints_netfyr_to_stdout_when_no_args_given() {
     let output = Command::new(netfyr_bin())
         .output()
         .expect("Failed to spawn netfyr-cli binary");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("netfyr"),
-        "Expected 'netfyr' in stdout when running netfyr-cli with no arguments, got: {:?}",
-        stdout
+        stderr.contains("netfyr"),
+        "Expected 'netfyr' in stderr when running netfyr-cli with no arguments, got: {:?}",
+        stderr
     );
 }
 
-/// AC: The binary exits with code 0 when invoked with no arguments.
+/// AC: The binary exits with code 2 when invoked with no arguments (no subcommand given).
+///
+/// SPEC-301: SubcommandRequiredElseHelp exits 2 when no subcommand is provided.
 #[test]
 fn test_cli_binary_exits_zero_with_no_args() {
     let status = Command::new(netfyr_bin())
@@ -52,8 +55,8 @@ fn test_cli_binary_exits_zero_with_no_args() {
         .expect("Failed to spawn netfyr-cli binary");
 
     assert!(
-        status.success(),
-        "Expected netfyr-cli to exit with code 0 when called with no arguments, got: {:?}",
+        status.code() == Some(2),
+        "Expected netfyr-cli to exit with code 2 when called with no arguments, got: {:?}",
         status.code()
     );
 }

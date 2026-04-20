@@ -32,9 +32,10 @@ use clap::{Parser, Subcommand};
 ///   query   Query current network state from the kernel or daemon.
 #[derive(Parser)]
 #[command(name = "netfyr", about = "Declarative Linux network configuration")]
+#[command(subcommand_required = true, arg_required_else_help = true)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub command: Commands,
 }
 
 #[derive(Subcommand)]

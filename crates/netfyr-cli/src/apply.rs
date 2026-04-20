@@ -141,7 +141,10 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     }
 
     // 9. No changes — exit early.
-    if state_diff.is_empty() {
+    // Use reconcile_diff.has_meaningful_changes() to match dry-run semantics: Unset-only
+    // diffs (kernel-managed fields like link-local addresses in actual but absent from the
+    // policy) are not treated as actionable changes.
+    if !reconcile_diff.has_meaningful_changes() {
         if reconciliation.conflicts.is_empty() {
             println!("No changes needed. System is already in desired state.");
             return Ok(ExitCode::SUCCESS);
@@ -1028,5 +1031,166 @@ mod tests {
             ExitCode::from(1u8),
             "daemon mode partial failure with conflicts must return exit 1"
         );
+    }
+
+    // ── Additional load_policies edge-case tests ──────────────────────────────
+
+    /// AC "Apply a single YAML policy file" — a single valid YAML file produces exactly one policy.
+    #[test]
+    fn test_load_policies_single_valid_file_returns_one_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eth0.yaml");
+        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+
+        let policy_set = load_policies(&[path]).unwrap();
+        assert_eq!(policy_set.len(), 1, "single YAML file must produce exactly one policy");
+    }
+
+    /// AC "Apply all files in a directory" — two explicit file paths are combined into one policy set.
+    #[test]
+    fn test_load_policies_two_file_paths_combined_into_single_policy_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path0 = dir.path().join("eth0.yaml");
+        let path1 = dir.path().join("eth1.yaml");
+        fs::write(&path0, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path1, "type: ethernet\nname: eth1\nmtu: 9000\n").unwrap();
+
+        let policy_set = load_policies(&[path0, path1]).unwrap();
+        assert_eq!(policy_set.len(), 2, "two file paths must produce two policies in combined set");
+        assert!(policy_set.get("eth0").is_some(), "policy 'eth0' must be in combined set");
+        assert!(policy_set.get("eth1").is_some(), "policy 'eth1' must be in combined set");
+    }
+
+    /// Edge: loading an empty directory returns an empty policy set without error.
+    #[test]
+    fn test_load_policies_empty_directory_returns_empty_policy_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_set = load_policies(&[dir.path().to_path_buf()]).unwrap();
+        assert!(policy_set.is_empty(), "empty directory must yield an empty policy set");
+    }
+
+    /// Edge: two paths that both produce a policy with the same name return a duplicate error.
+    #[test]
+    fn test_load_policies_duplicate_policy_name_across_paths_returns_error() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        // Both files have stem "eth0" so both produce policy name "eth0" (bare-state auto-wrap).
+        let path1 = dir1.path().join("eth0.yaml");
+        let path2 = dir2.path().join("eth0.yaml");
+        fs::write(&path1, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path2, "type: ethernet\nname: eth0\nmtu: 9000\n").unwrap();
+
+        let result = load_policies(&[path1, path2]);
+        assert!(result.is_err(), "duplicate policy names across paths must return Err");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("duplicate"),
+            "error must mention 'duplicate', got: {}",
+            err
+        );
+    }
+
+    // ── display_apply_report smoke tests ─────────────────────────────────────
+    //
+    // These tests verify that display_apply_report does not panic for various
+    // combinations of succeeded/failed operations and conflicts.
+
+    /// AC "Apply a single YAML policy file" — display_apply_report does not panic for empty report.
+    #[test]
+    fn test_display_apply_report_no_panic_empty_report_no_conflicts() {
+        let report = ApplyReport::new();
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// Smoke: display_apply_report handles a single add operation without panic.
+    #[test]
+    fn test_display_apply_report_no_panic_single_add_operation() {
+        let mut report = ApplyReport::new();
+        report.succeeded.push(AppliedOperation {
+            operation: DiffOpKind::Add,
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth1"),
+            fields_changed: vec!["mtu".to_string()],
+        });
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// Smoke: display_apply_report handles a remove operation without panic.
+    #[test]
+    fn test_display_apply_report_no_panic_single_remove_operation() {
+        let mut report = ApplyReport::new();
+        report.succeeded.push(AppliedOperation {
+            operation: DiffOpKind::Remove,
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth1"),
+            fields_changed: vec![],
+        });
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// AC "Partial failure reports mixed results" — display_apply_report does not panic for
+    /// partial failure (some succeeded, some failed).
+    #[test]
+    fn test_display_apply_report_no_panic_partial_failure() {
+        let mut report = ApplyReport::new();
+        report.succeeded.push(make_applied("ethernet", "eth0"));
+        report.failed.push(make_failed("ethernet", "eth99"));
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// AC "Total failure returns exit code 2" — display_apply_report does not panic for total failure.
+    #[test]
+    fn test_display_apply_report_no_panic_total_failure() {
+        let mut report = ApplyReport::new();
+        report.failed.push(make_failed("ethernet", "eth99"));
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// AC "Conflicts are reported as warnings" — display_apply_report does not panic with conflicts.
+    #[test]
+    fn test_display_apply_report_no_panic_with_conflict_warning() {
+        let report = ApplyReport::new();
+        let conflicts = conflict_report_with_one();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// Smoke: display_apply_report handles mixed add/modify/remove operations without panic.
+    #[test]
+    fn test_display_apply_report_no_panic_mixed_operation_types() {
+        let mut report = ApplyReport::new();
+        report.succeeded.push(AppliedOperation {
+            operation: DiffOpKind::Add,
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields_changed: vec!["mtu".to_string()],
+        });
+        report.succeeded.push(make_applied("ethernet", "eth1"));
+        report.succeeded.push(AppliedOperation {
+            operation: DiffOpKind::Remove,
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth2"),
+            fields_changed: vec![],
+        });
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
+    }
+
+    /// Smoke: display_apply_report handles operations with no fields_changed without panic.
+    #[test]
+    fn test_display_apply_report_no_panic_operation_with_empty_fields_changed() {
+        let mut report = ApplyReport::new();
+        report.succeeded.push(AppliedOperation {
+            operation: DiffOpKind::Modify,
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields_changed: vec![],
+        });
+        let conflicts = empty_conflict_report();
+        display_apply_report(&report, &conflicts);
     }
 }

@@ -8,18 +8,14 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        None => {
-            println!("netfyr");
-            ExitCode::from(0u8)
-        }
-        Some(Commands::Apply(args)) => match run_apply(args).await {
+        Commands::Apply(args) => match run_apply(args).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("Error: {:#}", e);
                 ExitCode::from(2u8)
             }
         },
-        Some(Commands::Query(args)) => match run_query(args).await {
+        Commands::Query(args) => match run_query(args).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("Error: {:#}", e);
