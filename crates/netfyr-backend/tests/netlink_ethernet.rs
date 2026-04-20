@@ -1072,23 +1072,22 @@ async fn test_netlinkbackend_query_unsupported_entity_type_returns_error() {
     );
 }
 
-// ── Test 30: IPv6 link-local address present after bringing up ────────────────
+// ── Test 30: IPv6 addresses are excluded from query results ──────────────────
 
-/// Scenario: Query ethernet interface includes IP addresses — after bringing an
-/// interface up, the kernel assigns a link-local IPv6 address (fe80::/64).
+/// Scenario: Query ethernet interface includes IP addresses — IPv6 addresses
+/// (e.g., fe80::) are excluded from the results even when the interface is up
+/// and the kernel has assigned link-local IPv6 addresses.
 ///
-/// This partially covers the spec scenario "fe80::1/64" address expectation.
-/// In a namespace we can't control the exact address, but we can verify that
-/// IPv6 link-local addresses (fe80::) appear in the addresses list when the
-/// interface is up.
+/// Covers acceptance criterion: "And IPv6 addresses (e.g., fe80::) are excluded".
 #[tokio::test(flavor = "multi_thread")]
-async fn test_query_includes_ipv6_link_local_when_interface_is_up() {
+async fn test_query_excludes_ipv6_addresses() {
     require_netns!(_guard);
 
     create_veth_pair("veth-v6-0", "veth-v6-1").await.unwrap();
     set_link_up("veth-v6-0").await.unwrap();
     set_link_up("veth-v6-1").await.unwrap();
-    // Give the kernel a moment to generate the link-local address.
+    add_address("veth-v6-0", "10.99.6.1/24").await.unwrap();
+    // Give the kernel a moment to assign the IPv6 link-local address.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let handle = establish_connection().await.unwrap();
@@ -1106,21 +1105,23 @@ async fn test_query_includes_ipv6_link_local_when_interface_is_up() {
         .as_list()
         .expect("addresses must be a list");
 
-    // A veth pair with both ends up may or may not have a link-local address
-    // depending on the kernel's network namespace configuration. If present,
-    // it must start with "fe80::" and have /64 prefix.
+    // The IPv4 address must appear.
+    let has_ipv4 = addresses
+        .iter()
+        .any(|v| v.as_str() == Some("10.99.6.1/24"));
+    assert!(has_ipv4, "Expected 10.99.6.1/24 in addresses, got: {addresses:?}");
+
+    // No IPv6 address must appear (no colon in any address string).
     for addr in addresses {
         if let Some(s) = addr.as_str() {
-            if s.starts_with("fe80:") {
-                assert!(
-                    s.ends_with("/64"),
-                    "IPv6 link-local address must use /64 prefix, got: {s}"
-                );
-            }
+            assert!(
+                !s.contains(':'),
+                "IPv6 address must not appear in query results, got: {s}"
+            );
         }
     }
 
-    // All addresses must have KernelDefault provenance.
+    // Addresses field must have KernelDefault provenance.
     assert_eq!(
         state.fields.get("addresses").unwrap().provenance,
         Provenance::KernelDefault

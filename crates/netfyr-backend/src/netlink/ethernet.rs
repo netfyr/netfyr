@@ -10,7 +10,7 @@ use netlink_packet_route::link::{
     InfoKind, LinkAttribute, LinkInfo, LinkLayerType, LinkMessage,
 };
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
-use rtnetlink::{Handle, IpVersion};
+use rtnetlink::Handle;
 use tracing::warn;
 
 use crate::BackendError;
@@ -172,6 +172,11 @@ async fn dump_addresses(
         entity_type: "ethernet".to_string(),
         source: Box::new(e),
     })? {
+        // Only include IPv4 addresses; skip IPv6 and any other address family.
+        if msg.header.family != netlink_packet_route::AddressFamily::Inet {
+            continue;
+        }
+
         let index = msg.header.index;
         let prefix_len = msg.header.prefix_len;
 
@@ -188,35 +193,30 @@ async fn dump_addresses(
 
 // ── Route dump ────────────────────────────────────────────────────────────────
 
-/// Dump IPv4 and IPv6 routes and return a map from output interface index to
+/// Dump IPv4 routes and return a map from output interface index to
 /// route `Value::Map` objects.
 ///
 /// Only unicast routes (RTN_UNICAST) are included. Routes with no output
 /// interface (`RTA_OIF`) — e.g., local/blackhole routes — are skipped.
+/// IPv6 routes are not queried per spec.
 async fn dump_routes(
     handle: &Handle,
     known_indices: &std::collections::HashSet<u32>,
 ) -> Result<HashMap<u32, Vec<Value>>, BackendError> {
     let mut map: HashMap<u32, Vec<Value>> = HashMap::new();
 
-    for ip_version in [IpVersion::V4, IpVersion::V6] {
-        // Build an empty RouteMessage for the given address family.
-        let mut route_msg = netlink_packet_route::route::RouteMessage::default();
-        route_msg.header.address_family = match ip_version {
-            IpVersion::V4 => netlink_packet_route::AddressFamily::Inet,
-            IpVersion::V6 => netlink_packet_route::AddressFamily::Inet6,
-        };
+    let mut route_msg = RouteMessage::default();
+    route_msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
 
-        let mut stream = handle.route().get(route_msg).execute();
-        while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
-            entity_type: "ethernet".to_string(),
-            source: Box::new(e),
-        })? {
-            if let Some(route_val) = parse_route_message(&msg, known_indices) {
-                let oif = extract_oif(&msg);
-                if let Some(idx) = oif {
-                    map.entry(idx).or_default().push(route_val);
-                }
+    let mut stream = handle.route().get(route_msg).execute();
+    while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
+        entity_type: "ethernet".to_string(),
+        source: Box::new(e),
+    })? {
+        if let Some(route_val) = parse_route_message(&msg, known_indices) {
+            let oif = extract_oif(&msg);
+            if let Some(idx) = oif {
+                map.entry(idx).or_default().push(route_val);
             }
         }
     }
@@ -268,14 +268,11 @@ fn parse_route_message(
     let destination = if let Some(ip) = destination_ip {
         format!("{ip}/{dst_prefix_len}")
     } else {
-        // Default route: 0.0.0.0/0 or ::/0
+        // Default route: 0.0.0.0/0 (IPv4 only; IPv6 routes are not queried).
         let af = msg.header.address_family;
         match af {
             netlink_packet_route::AddressFamily::Inet => {
                 format!("0.0.0.0/{dst_prefix_len}")
-            }
-            netlink_packet_route::AddressFamily::Inet6 => {
-                format!("::/{dst_prefix_len}")
             }
             _ => return None,
         }
