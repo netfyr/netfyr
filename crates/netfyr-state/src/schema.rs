@@ -7,7 +7,7 @@
 
 use crate::{FieldValue, State, Value};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // Embedded JSON Schema files — paths are relative to this source file.
@@ -217,28 +217,56 @@ impl SchemaRegistry {
         };
 
         let instance = fields_to_json(&state.fields);
-        let errors: Vec<ValidationError> = entity_schema
+        let mut errors: Vec<ValidationError> = entity_schema
             .validator
             .iter_errors(&instance)
-            .map(|err| {
+            .flat_map(|err| {
                 use jsonschema::error::ValidationErrorKind as JsKind;
-                let mut field = json_pointer_to_field_path(&err.instance_path.to_string());
-                // For Required errors, the instance_path points to the parent object.
-                // Append the missing property name so the path matches the spec
-                // (e.g., "routes[0].destination" instead of "routes[0]").
-                if let JsKind::Required { property } = &err.kind {
-                    if let Some(prop_name) = property.as_str() {
-                        if !field.is_empty() {
-                            field.push('.');
+                let base_field = json_pointer_to_field_path(&err.instance_path.to_string());
+                match &err.kind {
+                    // AdditionalProperties carries the unknown field names directly.
+                    // Emit one error per unknown field so the field path is correct.
+                    JsKind::AdditionalProperties { unexpected } => unexpected
+                        .iter()
+                        .map(|name| {
+                            let field = if base_field.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{base_field}.{name}")
+                            };
+                            ValidationError {
+                                field,
+                                message: err.to_string(),
+                                kind: ValidationErrorKind::UnknownField,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    // For Required errors the instance_path points to the parent object;
+                    // append the missing property name to form the full field path.
+                    JsKind::Required { property } => {
+                        let mut field = base_field;
+                        if let Some(prop_name) = property.as_str() {
+                            if !field.is_empty() {
+                                field.push('.');
+                            }
+                            field.push_str(prop_name);
                         }
-                        field.push_str(prop_name);
+                        vec![ValidationError {
+                            field,
+                            message: err.to_string(),
+                            kind: ValidationErrorKind::MissingRequired,
+                        }]
+                    }
+                    _ => {
+                        let kind = classify_error_kind(&err);
+                        let message = err.to_string();
+                        vec![ValidationError { field: base_field, message, kind }]
                     }
                 }
-                let kind = classify_error_kind(&err);
-                let message = err.to_string();
-                ValidationError { field, message, kind }
             })
             .collect();
+
+        errors.extend(run_custom_checks(state));
 
         if errors.is_empty() {
             Ok(())
@@ -452,6 +480,62 @@ fn parse_constraints(field_schema: &serde_json::Value) -> Option<FieldConstraint
     } else {
         None
     }
+}
+
+/// Dispatches entity-type-specific custom validation checks that go beyond what
+/// JSON Schema alone can express (e.g., duplicate detection with named values).
+fn run_custom_checks(state: &State) -> Vec<ValidationError> {
+    match state.entity_type.as_str() {
+        "ethernet" => check_ethernet_addresses(state),
+        _ => Vec::new(),
+    }
+}
+
+/// Custom validation for the `addresses` field of an ethernet entity:
+/// - Rejects duplicate CIDR strings with a `ConstraintViolation` error.
+/// - Rejects IPv6 addresses (containing `:`) with an `InvalidFormat` error.
+///
+/// Only runs when `addresses` is present and is a `Value::List`; if it has the
+/// wrong type, JSON Schema already emitted a type error — no cascading errors.
+fn check_ethernet_addresses(state: &State) -> Vec<ValidationError> {
+    let addresses = match state.fields.get("addresses").map(|fv| &fv.value) {
+        Some(Value::List(items)) => items,
+        _ => return Vec::new(),
+    };
+
+    let mut errors = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut reported_dup: HashSet<&str> = HashSet::new();
+
+    for item in addresses {
+        let addr = match item.as_str() {
+            Some(s) => s,
+            None => continue, // non-string items are already caught by JSON Schema
+        };
+
+        // Duplicate detection: one error per unique duplicated address.
+        if !seen.insert(addr) && reported_dup.insert(addr) {
+            errors.push(ValidationError {
+                field: "addresses".into(),
+                message: format!("duplicate address \"{addr}\""),
+                kind: ValidationErrorKind::ConstraintViolation,
+            });
+        }
+
+        // IPv6 detection: the prefix part (before '/') contains ':'.
+        let prefix = addr.split_once('/').map_or(addr, |(p, _)| p);
+        if prefix.contains(':') {
+            errors.push(ValidationError {
+                field: "addresses".into(),
+                message: format!(
+                    "IPv6 address \"{addr}\" is not supported; use IPv4 CIDR format"
+                ),
+                kind: ValidationErrorKind::InvalidFormat,
+            });
+        }
+    }
+
+    errors
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1099,6 +1183,184 @@ mod tests {
             display.contains("unknown entity type"),
             "entity-level error should appear in display, got: {}",
             display
+        );
+    }
+
+    // ── Feature: Duplicate address and IPv6 rejection ─────────────────────────
+
+    /// Scenario: Duplicate addresses are rejected
+    #[test]
+    fn test_duplicate_addresses_are_rejected() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![
+                    Value::String("10.0.1.50/24".to_string()),
+                    Value::String("10.0.1.50/24".to_string()),
+                ]),
+            )],
+        );
+        assert!(
+            registry.validate(&state).is_err(),
+            "duplicate addresses should fail validation"
+        );
+    }
+
+    /// Scenario: Duplicate addresses — error kind is ConstraintViolation for field "addresses"
+    #[test]
+    fn test_duplicate_addresses_error_kind_is_constraint_violation() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![
+                    Value::String("10.0.1.50/24".to_string()),
+                    Value::String("10.0.1.50/24".to_string()),
+                ]),
+            )],
+        );
+        let errs = registry.validate(&state).unwrap_err();
+        let has_constraint = errs
+            .errors()
+            .iter()
+            .any(|e| e.field == "addresses" && e.kind == ValidationErrorKind::ConstraintViolation);
+        assert!(
+            has_constraint,
+            "expected ConstraintViolation for 'addresses', got: {:?}",
+            errs.errors()
+        );
+    }
+
+    /// Scenario: Duplicate addresses — message mentions the duplicated CIDR string
+    #[test]
+    fn test_duplicate_addresses_message_mentions_duplicated_value() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![
+                    Value::String("10.0.1.50/24".to_string()),
+                    Value::String("10.0.1.50/24".to_string()),
+                ]),
+            )],
+        );
+        let errs = registry.validate(&state).unwrap_err();
+        let dup_err = errs
+            .errors()
+            .iter()
+            .find(|e| e.field == "addresses" && e.kind == ValidationErrorKind::ConstraintViolation)
+            .expect("should have a ConstraintViolation for 'addresses'");
+        assert!(
+            dup_err.message.contains("10.0.1.50/24"),
+            "error message should mention the duplicate address '10.0.1.50/24', got: {}",
+            dup_err.message
+        );
+    }
+
+    /// Non-duplicate distinct addresses pass validation
+    #[test]
+    fn test_distinct_addresses_pass_validation() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![
+                    Value::String("10.0.1.50/24".to_string()),
+                    Value::String("10.0.1.51/24".to_string()),
+                ]),
+            )],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "two distinct addresses should pass validation"
+        );
+    }
+
+    /// Scenario: IPv6 addresses are rejected
+    #[test]
+    fn test_ipv6_address_is_rejected() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![Value::String("fe80::1/64".to_string())]),
+            )],
+        );
+        assert!(
+            registry.validate(&state).is_err(),
+            "IPv6 address in 'addresses' should be rejected"
+        );
+    }
+
+    /// Scenario: IPv6 addresses — error kind is InvalidFormat for field "addresses"
+    #[test]
+    fn test_ipv6_address_error_kind_is_invalid_format() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![Value::String("fe80::1/64".to_string())]),
+            )],
+        );
+        let errs = registry.validate(&state).unwrap_err();
+        let has_invalid_format = errs
+            .errors()
+            .iter()
+            .any(|e| e.field == "addresses" && e.kind == ValidationErrorKind::InvalidFormat);
+        assert!(
+            has_invalid_format,
+            "expected InvalidFormat for 'addresses' with IPv6 input, got: {:?}",
+            errs.errors()
+        );
+    }
+
+    /// Scenario: IPv6 addresses — message mentions IPv6 is not supported
+    #[test]
+    fn test_ipv6_address_message_mentions_not_supported() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![(
+                "addresses",
+                Value::List(vec![Value::String("fe80::1/64".to_string())]),
+            )],
+        );
+        let errs = registry.validate(&state).unwrap_err();
+        let ipv6_err = errs
+            .errors()
+            .iter()
+            .find(|e| e.field == "addresses" && e.kind == ValidationErrorKind::InvalidFormat)
+            .expect("should have an InvalidFormat error for 'addresses'");
+        let msg_lower = ipv6_err.message.to_lowercase();
+        assert!(
+            msg_lower.contains("ipv6"),
+            "message should mention 'IPv6', got: {}",
+            ipv6_err.message
+        );
+    }
+
+    /// Unknown field error should reference the field name in the error's field path
+    #[test]
+    fn test_unknown_field_error_references_field_name() {
+        let registry = SchemaRegistry::new();
+        let state = make_state("ethernet", vec![("mtt", Value::U64(1500))]);
+        let errs = registry.validate(&state).unwrap_err();
+        let unknown_err = errs
+            .errors()
+            .iter()
+            .find(|e| e.kind == ValidationErrorKind::UnknownField)
+            .expect("should have an UnknownField error");
+        assert_eq!(
+            unknown_err.field, "mtt",
+            "UnknownField error should reference 'mtt', got: {:?}",
+            unknown_err.field
         );
     }
 }
