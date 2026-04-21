@@ -288,3 +288,465 @@ fn test_revert_entry_appears_as_most_recent_after_apply_entry() {
         recent[0].trigger
     );
 }
+
+// ── Feature: Revert integration tests (unprivileged netns) ───────────────────
+//
+// Each test:
+//   1. Enters a new user+network namespace (skipped if unavailable).
+//   2. Creates a veth pair inside the namespace.
+//   3. Runs `netfyr apply` as a subprocess (inherits namespace, uses temp journal).
+//   4. Runs `netfyr revert` as a subprocess.
+//   5. Verifies system state via sysfs / `ip addr show`.
+//
+// All subprocesses point to a non-existent NETFYR_SOCKET_PATH to force
+// standalone (daemon-free) mode, and to a temp NETFYR_JOURNAL_DIR so
+// journal entries written by apply are visible to the subsequent revert.
+
+#[cfg(test)]
+mod netns_tests {
+    use super::*;
+    use netfyr_test_utils::netns::{create_veth_pair, set_link_up};
+    use netfyr_test_utils::NetnsGuard;
+    use std::fs;
+
+    // Nonexistent socket → forces standalone (daemon-free) mode in subprocesses.
+    const NO_DAEMON_SOCK: &str = "/tmp/netfyr-revert-inttest-no-daemon.sock";
+
+    fn read_mtu(iface: &str) -> u32 {
+        let path = format!("/sys/class/net/{iface}/mtu");
+        fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+            .trim()
+            .parse()
+            .expect("mtu should be numeric")
+    }
+
+    fn has_address(iface: &str, addr_fragment: &str) -> bool {
+        let out = std::process::Command::new("ip")
+            .args(["addr", "show", iface])
+            .output()
+            .expect("failed to run ip");
+        String::from_utf8_lossy(&out.stdout).contains(addr_fragment)
+    }
+
+    fn enter_namespace() -> Option<NetnsGuard> {
+        match NetnsGuard::new() {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("Skipping netns test: {e}");
+                None
+            }
+        }
+    }
+
+    /// Run `netfyr apply` with a bare-state YAML string, storing the journal in `journal_dir`.
+    async fn apply_yaml(yaml: &str, journal_dir: &std::path::Path) -> std::process::Output {
+        let policy_dir = tempfile::tempdir().unwrap();
+        let policy_file = policy_dir.path().join("policy.yaml");
+        fs::write(&policy_file, yaml).unwrap();
+        tokio::process::Command::new(netfyr_bin())
+            .args(["apply", policy_file.to_str().unwrap()])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_JOURNAL_DIR", journal_dir)
+            .env("NETFYR_SOCKET_PATH", NO_DAEMON_SOCK)
+            .output()
+            .await
+            .expect("failed to run netfyr apply")
+    }
+
+    /// Run `netfyr revert <seq>` (with optional `--dry-run`), using `journal_dir`.
+    async fn revert_seq(
+        seq: u64,
+        dry_run: bool,
+        journal_dir: &std::path::Path,
+    ) -> std::process::Output {
+        let mut cmd = tokio::process::Command::new(netfyr_bin());
+        cmd.arg("revert")
+            .arg(seq.to_string())
+            .env("NO_COLOR", "1")
+            .env("NETFYR_JOURNAL_DIR", journal_dir)
+            .env("NETFYR_SOCKET_PATH", NO_DAEMON_SOCK);
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        cmd.output().await.expect("failed to run netfyr revert")
+    }
+
+    /// AC: Revert to a previous state — veth MTU is restored from 1300 back to 1400.
+    ///
+    /// Scenario:
+    ///   apply mtu=1400 → seq=1
+    ///   apply mtu=1300 → seq=2
+    ///   revert 1       → mtu must return to 1400
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_revert_changes_mtu_to_target_state() {
+        let _guard = match enter_namespace() {
+            Some(g) => g,
+            None => return,
+        };
+        create_veth_pair("veth-rv0", "veth-rv1").await.expect("create_veth_pair failed");
+        set_link_up("veth-rv0").await.expect("set_link_up failed");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+
+        // Apply mtu=1400 → journal entry seq=1.
+        let out1 = apply_yaml(
+            "type: ethernet\nname: veth-rv0\nmtu: 1400\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(
+            out1.status.code(),
+            Some(0),
+            "first apply must exit 0; got: {}",
+            combined(&out1)
+        );
+
+        // Apply mtu=1300 → journal entry seq=2.
+        let out2 = apply_yaml(
+            "type: ethernet\nname: veth-rv0\nmtu: 1300\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(
+            out2.status.code(),
+            Some(0),
+            "second apply must exit 0; got: {}",
+            combined(&out2)
+        );
+
+        assert_eq!(read_mtu("veth-rv0"), 1300, "precondition: mtu must be 1300 after second apply");
+
+        // Revert to seq=1 (target mtu=1400).
+        let out = revert_seq(1, false, journal_dir.path()).await;
+        let text = combined(&out);
+
+        // AC: exit code 0, output mentions "Applied", MTU is restored.
+        assert_eq!(out.status.code(), Some(0), "revert must exit 0; got: {text}");
+        assert!(
+            text.contains("Applied"),
+            "revert output must contain 'Applied'; got: {text}"
+        );
+        assert_eq!(read_mtu("veth-rv0"), 1400, "mtu must be 1400 after revert to seq=1");
+    }
+
+    /// AC: Revert dry-run previews changes — output shows current → target MTU, MTU unchanged.
+    ///
+    /// Scenario:
+    ///   apply mtu=1400 → seq=1
+    ///   apply mtu=1300 → seq=2
+    ///   revert 1 --dry-run → output shows "1300" and "1400", mtu stays 1300
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_revert_dry_run_shows_mtu_change_without_applying() {
+        let _guard = match enter_namespace() {
+            Some(g) => g,
+            None => return,
+        };
+        create_veth_pair("veth-rvd0", "veth-rvd1").await.expect("create_veth_pair failed");
+        set_link_up("veth-rvd0").await.expect("set_link_up failed");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+
+        // Apply mtu=1400 → seq=1.
+        let out1 = apply_yaml(
+            "type: ethernet\nname: veth-rvd0\nmtu: 1400\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(
+            out1.status.code(),
+            Some(0),
+            "first apply must exit 0; got: {}",
+            combined(&out1)
+        );
+
+        // Apply mtu=1300 → seq=2.
+        let out2 = apply_yaml(
+            "type: ethernet\nname: veth-rvd0\nmtu: 1300\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(
+            out2.status.code(),
+            Some(0),
+            "second apply must exit 0; got: {}",
+            combined(&out2)
+        );
+
+        assert_eq!(read_mtu("veth-rvd0"), 1300, "precondition: mtu must be 1300");
+
+        // Dry-run revert to seq=1 (target mtu=1400, current mtu=1300).
+        let out = revert_seq(1, true, journal_dir.path()).await;
+        let text = combined(&out);
+
+        // AC: output shows both the current value (1300) and the target value (1400).
+        assert!(
+            text.contains("1300") && text.contains("1400"),
+            "dry-run output must show current (1300) and target (1400) values; got: {text}"
+        );
+        assert!(
+            text.contains("mtu"),
+            "dry-run output must mention 'mtu'; got: {text}"
+        );
+
+        // AC: MTU must not have changed (dry-run only previews).
+        assert_eq!(read_mtu("veth-rvd0"), 1300, "dry-run must not change the mtu");
+    }
+
+    /// AC: Revert when already at target state — "No changes needed" message, exit 0.
+    ///
+    /// Scenario:
+    ///   apply mtu=1400 → seq=1 (system is now at mtu=1400)
+    ///   revert 1       → no-op (already at target)
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_revert_no_changes_needed_when_already_at_target_state() {
+        let _guard = match enter_namespace() {
+            Some(g) => g,
+            None => return,
+        };
+        create_veth_pair("veth-rvnc0", "veth-rvnc1").await.expect("create_veth_pair failed");
+        set_link_up("veth-rvnc0").await.expect("set_link_up failed");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+
+        // Apply mtu=1400 → seq=1. The system is now at mtu=1400.
+        let out1 = apply_yaml(
+            "type: ethernet\nname: veth-rvnc0\nmtu: 1400\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(
+            out1.status.code(),
+            Some(0),
+            "apply must exit 0; got: {}",
+            combined(&out1)
+        );
+        assert_eq!(read_mtu("veth-rvnc0"), 1400, "precondition: mtu must be 1400");
+
+        // Revert to seq=1 — system already matches the target.
+        let out = revert_seq(1, false, journal_dir.path()).await;
+        let text = combined(&out);
+
+        // AC: exit code 0 and "No changes needed" in output.
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "revert with no changes must exit 0; got: {text}"
+        );
+        assert!(
+            text.contains("No changes needed"),
+            "output must say 'No changes needed'; got: {text}"
+        );
+    }
+
+    /// AC: Revert records journal entry with trigger "revert" and target_seq.
+    ///
+    /// After a successful revert, the most recent journal entry must have
+    /// Trigger::Revert { target_seq } pointing at the entry that was reverted to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_revert_records_journal_entry_with_revert_trigger_and_correct_state_after() {
+        let _guard = match enter_namespace() {
+            Some(g) => g,
+            None => return,
+        };
+        create_veth_pair("veth-rvj0", "veth-rvj1").await.expect("create_veth_pair failed");
+        set_link_up("veth-rvj0").await.expect("set_link_up failed");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+
+        // Apply mtu=1400 → seq=1.
+        let out1 = apply_yaml(
+            "type: ethernet\nname: veth-rvj0\nmtu: 1400\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(out1.status.code(), Some(0), "first apply must exit 0");
+
+        // Apply mtu=1300 → seq=2.
+        let out2 = apply_yaml(
+            "type: ethernet\nname: veth-rvj0\nmtu: 1300\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(out2.status.code(), Some(0), "second apply must exit 0");
+
+        // Revert to seq=1 → writes revert journal entry (seq=3).
+        let out = revert_seq(1, false, journal_dir.path()).await;
+        let text = combined(&out);
+        assert_eq!(out.status.code(), Some(0), "revert must exit 0; got: {text}");
+
+        // AC: most recent journal entry has Trigger::Revert { target_seq: 1 }.
+        let journal = Journal::open(journal_dir.path()).expect("journal must open");
+        let entries = journal.read_recent(1).expect("read_recent must succeed");
+        assert!(!entries.is_empty(), "journal must have at least 1 entry after revert");
+        let latest = &entries[0];
+
+        match &latest.trigger {
+            Trigger::Revert { target_seq } => {
+                assert_eq!(*target_seq, 1, "revert entry must reference target_seq=1");
+            }
+            other => panic!(
+                "most recent journal entry must be Trigger::Revert, got {:?}",
+                other
+            ),
+        }
+
+        // AC: outcome reflects the apply result (at least 1 succeeded).
+        assert!(
+            matches!(latest.outcome, ApplyOutcome::Applied { succeeded, .. } if succeeded >= 1),
+            "revert journal entry outcome must record at least 1 succeeded; got {:?}",
+            latest.outcome
+        );
+
+        // AC: state_after matches the target entry's state_after (mtu=1400).
+        assert!(
+            !latest.state_after.entities.is_empty(),
+            "revert journal entry state_after must not be empty"
+        );
+        let entity = latest
+            .state_after
+            .entities
+            .iter()
+            .find(|e| e.selector_name == "veth-rvj0")
+            .expect("state_after must contain veth-rvj0");
+        assert_eq!(
+            entity.fields["mtu"],
+            serde_json::json!(1400u64),
+            "state_after mtu must be 1400 (the target state from seq=1)"
+        );
+    }
+
+    /// AC: Revert with address changes — original addresses are restored, new address removed.
+    ///
+    /// Scenario:
+    ///   apply addresses=[10.99.0.1/24, 10.99.0.2/24] → seq=1
+    ///   apply addresses=[10.99.0.3/24]               → seq=2
+    ///   revert 1 → 10.99.0.1 and 10.99.0.2 restored, 10.99.0.3 removed
+    ///
+    /// NOTE: Interface addresses use host-bit notation (e.g. "10.99.0.1/24"),
+    /// which are stored as Value::String in the journal (Ipv4Network rejects host
+    /// bits). The round-trip through the journal serializer preserves the string
+    /// representation, so the revert should correctly restore the original addresses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_revert_restores_addresses_from_journal_snapshot() {
+        let _guard = match enter_namespace() {
+            Some(g) => g,
+            None => return,
+        };
+        create_veth_pair("veth-rva0", "veth-rva1").await.expect("create_veth_pair failed");
+        set_link_up("veth-rva0").await.expect("set_link_up failed");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+
+        // Apply with two addresses → seq=1.
+        let yaml_a = "type: ethernet\nname: veth-rva0\nmtu: 1400\naddresses:\n  - 10.99.0.1/24\n  - 10.99.0.2/24\n";
+        let out1 = apply_yaml(yaml_a, journal_dir.path()).await;
+        assert_eq!(
+            out1.status.code(),
+            Some(0),
+            "first apply must exit 0; got: {}",
+            combined(&out1)
+        );
+        assert!(
+            has_address("veth-rva0", "10.99.0.1"),
+            "precondition: 10.99.0.1 must be set after first apply"
+        );
+        assert!(
+            has_address("veth-rva0", "10.99.0.2"),
+            "precondition: 10.99.0.2 must be set after first apply"
+        );
+
+        // Apply with one different address → seq=2.
+        let yaml_b =
+            "type: ethernet\nname: veth-rva0\nmtu: 1400\naddresses:\n  - 10.99.0.3/24\n";
+        let out2 = apply_yaml(yaml_b, journal_dir.path()).await;
+        assert_eq!(
+            out2.status.code(),
+            Some(0),
+            "second apply must exit 0; got: {}",
+            combined(&out2)
+        );
+        assert!(
+            has_address("veth-rva0", "10.99.0.3"),
+            "precondition: 10.99.0.3 must be set after second apply"
+        );
+
+        // Revert to seq=1 — should restore original addresses.
+        let out = revert_seq(1, false, journal_dir.path()).await;
+        let text = combined(&out);
+        assert_eq!(out.status.code(), Some(0), "revert must exit 0; got: {text}");
+
+        // AC: 10.99.0.1 and 10.99.0.2 are restored.
+        assert!(
+            has_address("veth-rva0", "10.99.0.1"),
+            "10.99.0.1 must be restored after revert"
+        );
+        assert!(
+            has_address("veth-rva0", "10.99.0.2"),
+            "10.99.0.2 must be restored after revert"
+        );
+        // AC: 10.99.0.3 is removed.
+        assert!(
+            !has_address("veth-rva0", "10.99.0.3"),
+            "10.99.0.3 must be removed after revert"
+        );
+    }
+
+    /// AC: Dry-run does not record a journal entry.
+    ///
+    /// After a dry-run revert, the journal must not contain a new revert entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_revert_dry_run_does_not_record_journal_entry() {
+        let _guard = match enter_namespace() {
+            Some(g) => g,
+            None => return,
+        };
+        create_veth_pair("veth-rvdj0", "veth-rvdj1").await.expect("create_veth_pair failed");
+        set_link_up("veth-rvdj0").await.expect("set_link_up failed");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+
+        // Apply mtu=1400 → seq=1.
+        let out1 = apply_yaml(
+            "type: ethernet\nname: veth-rvdj0\nmtu: 1400\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(out1.status.code(), Some(0), "apply must exit 0");
+
+        // Apply mtu=1300 → seq=2.
+        let out2 = apply_yaml(
+            "type: ethernet\nname: veth-rvdj0\nmtu: 1300\n",
+            journal_dir.path(),
+        )
+        .await;
+        assert_eq!(out2.status.code(), Some(0), "second apply must exit 0");
+
+        // Count entries before dry-run revert.
+        let journal = Journal::open(journal_dir.path()).expect("journal must open");
+        let entries_before = journal.read_recent(100).expect("read_recent must succeed");
+        let count_before = entries_before.len();
+
+        // Dry-run revert to seq=1 — must not write a new journal entry.
+        let out = revert_seq(1, true, journal_dir.path()).await;
+        let text = combined(&out);
+        // Dry-run with pending changes → non-zero exit code (1).
+        assert!(
+            out.status.code() != Some(2),
+            "dry-run revert must not exit 2; got: {text}"
+        );
+
+        // Re-open the journal and count entries again.
+        let journal2 = Journal::open(journal_dir.path()).expect("journal must open after dry-run");
+        let entries_after = journal2.read_recent(100).expect("read_recent must succeed");
+        let count_after = entries_after.len();
+
+        assert_eq!(
+            count_after, count_before,
+            "dry-run revert must not add a new journal entry (before={count_before}, after={count_after})"
+        );
+
+        // Verify the MTU was not changed by the dry-run.
+        assert_eq!(read_mtu("veth-rvdj0"), 1300, "dry-run must not change mtu");
+    }
+}
