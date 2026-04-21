@@ -197,6 +197,44 @@ assert_has_address veth-e2e0 10.99.0.2/24
 # Verify the daemon did not re-reconcile (mtu stays at 1500).
 assert_mtu veth-e2e0 1500
 
+# ── Phase 4: Unmanaged interface ignored ─────────────────────────────────────
+
+create_veth veth-unmanaged0 veth-unmanaged1
+
+# Brief pause so any netlink events from veth creation settle before we
+# snapshot the external_change count.
+sleep 1
+
+EC_COUNT_BEFORE_UNMANAGED=$(jq -rs '[.[] | select(.trigger.type == "external_change")] | length' \
+    "$JOURNAL_DIR/current.ndjson")
+
+# Change MTU on the unmanaged interface (default is 1500, so 1400 is a real change).
+ip link set veth-unmanaged0 mtu 1400
+
+# Wait for debounce window to fire (500ms) plus margin.
+sleep 1
+
+EC_COUNT_AFTER_UNMANAGED=$(jq -rs '[.[] | select(.trigger.type == "external_change")] | length' \
+    "$JOURNAL_DIR/current.ndjson")
+if [[ "$EC_COUNT_AFTER_UNMANAGED" -ne "$EC_COUNT_BEFORE_UNMANAGED" ]]; then
+    echo "FAIL: 600-e2e-external-change: daemon recorded an external_change entry for unmanaged interface" \
+         "(before=$EC_COUNT_BEFORE_UNMANAGED, after=$EC_COUNT_AFTER_UNMANAGED)" >&2
+    cat "$JOURNAL_DIR/current.ndjson" >&2
+    exit 1
+fi
+
+# Secondary defense: no entry should mention veth-unmanaged0.
+UNMANAGED_REF_COUNT=$(jq -rs '
+    [.[] | select(.trigger.type == "external_change") |
+     .diff.operations[]? |
+     select(.entity_name == "veth-unmanaged0")] | length' \
+    "$JOURNAL_DIR/current.ndjson")
+if [[ "$UNMANAGED_REF_COUNT" -ne 0 ]]; then
+    echo "FAIL: 600-e2e-external-change: journal references veth-unmanaged0 ($UNMANAGED_REF_COUNT times)" >&2
+    cat "$JOURNAL_DIR/current.ndjson" >&2
+    exit 1
+fi
+
 # ── Final: no new policy_apply entries ───────────────────────────────────────
 
 # The daemon must not have re-applied the original policy in response to any

@@ -724,4 +724,106 @@ mod tests {
 
         assert_eq!(deadline, far, "unrecognized buffer must not change the debounce deadline");
     }
+
+    // ── AC: Edge cases: invalid ifindex values ─────────────────────────────────
+
+    /// AC: RTM_NEWLINK with ifindex=0 is silently ignored (invalid interface index).
+    #[test]
+    fn test_process_buffer_link_message_with_zero_ifindex_is_ignored() {
+        let buf = build_link_msg(RTM_NEWLINK, 0, "lo");
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert!(!has_pending, "link message with ifindex=0 must be ignored");
+        assert!(pending.is_empty(), "no pending entries expected for ifindex=0");
+    }
+
+    /// AC: RTM_NEWLINK with a negative ifindex is silently ignored.
+    #[test]
+    fn test_process_buffer_link_message_with_negative_ifindex_is_ignored() {
+        let buf = build_link_msg(RTM_NEWLINK, -1, "eth0");
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert!(!has_pending, "link message with negative ifindex must be ignored");
+        assert!(pending.is_empty(), "no pending entries expected for negative ifindex");
+    }
+
+    // ── AC: Address message before link message — name resolved via backfill ────
+
+    /// AC: When an address event arrives before a link event for the same ifindex,
+    /// the pending entry's ifname is updated ("backfilled") once the link message
+    /// arrives. This ensures the monitor can always associate a name with changes.
+    #[test]
+    fn test_addr_then_link_for_same_ifindex_backfills_ifname_from_link_message() {
+        // Address message arrives first — no name is available yet.
+        let addr_msg = build_addr_msg(RTM_NEWADDR, 10);
+        // Link message arrives second — it supplies the name.
+        let link_msg = build_link_msg(RTM_NEWLINK, 10, "eth2");
+        let mut buf = addr_msg;
+        buf.extend(link_msg);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending, "events must set has_pending");
+        assert!(pending.contains_key(&10), "ifindex 10 must be in pending");
+        let (ifname, kinds) = &pending[&10];
+        assert_eq!(
+            ifname.as_deref(),
+            Some("eth2"),
+            "ifname must be backfilled from the subsequent link message"
+        );
+        // Both an address event and a link event must be recorded for the same interface.
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::AddressAdded)),
+            "AddressAdded kind must be present"
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::LinkChanged)),
+            "LinkChanged kind must be present"
+        );
+    }
+
+    // ── AC: Burst changes — same-kind accumulation before drain deduplication ───
+
+    /// AC: Burst changes are coalesced — two RTM_NEWLINK events for the same interface
+    /// accumulate in one pending entry (verified here). The deduplication of identical
+    /// ChangeKind variants happens at drain time in the async task.
+    #[test]
+    fn test_process_buffer_same_kind_for_same_ifindex_accumulates_before_drain() {
+        let msg1 = build_link_msg(RTM_NEWLINK, 5, "eth0");
+        let msg2 = build_link_msg(RTM_NEWLINK, 5, "eth0");
+        let mut buf = msg1;
+        buf.extend(msg2);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        // Both events coalesce into a single pending entry for ifindex 5.
+        assert_eq!(pending.len(), 1, "two link events for the same ifindex → one pending entry");
+        assert!(pending.contains_key(&5));
+        let (_, kinds) = &pending[&5];
+        // Two events are recorded before drain-time deduplication.
+        assert_eq!(kinds.len(), 2, "both events are accumulated before the debounce drain");
+    }
+
+    // ── AC: Monitor ignores unmanaged interfaces — only managed ifaces emit ─────
+
+    /// AC: Address message for ifindex that has no associated name (no NEWLINK seen,
+    /// no name cache entry) leaves ifname=None in the pending entry. The daemon's
+    /// event loop uses the ifname to filter unmanaged interfaces; None causes skip.
+    #[test]
+    fn test_process_buffer_addr_msg_with_unknown_ifindex_has_none_ifname() {
+        // No preceding NEWLINK for ifindex 99 → name cache is empty for it.
+        let addr_msg = build_addr_msg(RTM_NEWADDR, 99);
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&addr_msg, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending, "addr event must set has_pending");
+        assert!(pending.contains_key(&99));
+        let (ifname, _) = &pending[&99];
+        assert!(
+            ifname.is_none(),
+            "ifname must be None when no link message has been seen for this ifindex"
+        );
+    }
 }

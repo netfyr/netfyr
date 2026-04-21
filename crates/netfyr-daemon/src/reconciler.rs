@@ -641,6 +641,7 @@ mod tests {
     use super::*;
     use crate::factory_manager::FactoryManager;
     use crate::policy_store::PolicyStore;
+    use netfyr_state::{FieldValue, Provenance, State, StateMetadata, Value};
 
     // ── Feature: Reconciler initialization ────────────────────────────────────
 
@@ -971,5 +972,240 @@ mod tests {
             result.is_ok(),
             "record_external_change for multiple nonexistent interfaces must return Ok"
         );
+    }
+
+    // ── Feature: compute_external_field_changes ───────────────────────────────
+    //
+    // These tests verify the diff logic that underpins "the entry's diff shows
+    // mtu: 9000 -> 1500" and related acceptance criteria.
+
+    /// Build a SerializableState (journal snapshot) with the given JSON fields.
+    fn make_journal_snapshot(name: &str, fields: serde_json::Value) -> SerializableState {
+        SerializableState {
+            entity_type: "ethernet".to_string(),
+            selector_name: name.to_string(),
+            fields,
+        }
+    }
+
+    /// Build a netfyr_state::State with the given (field_name, Value) pairs.
+    fn make_current_state(name: &str, fields: Vec<(&str, Value)>) -> State {
+        let mut state = State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name(name),
+            fields: Default::default(),
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 100,
+        };
+        for (k, v) in fields {
+            state.fields.insert(
+                k.to_string(),
+                FieldValue { value: v, provenance: Provenance::KernelDefault },
+            );
+        }
+        state
+    }
+
+    /// AC: Monitor detects MTU change — diff shows mtu: 9000 -> 1500.
+    /// The changed field records the old value as 'current' (from journal snapshot)
+    /// and the new value as 'desired' (from the current system state).
+    #[test]
+    fn test_compute_external_field_changes_mtu_9000_to_1500_records_old_and_new_values() {
+        let last = make_journal_snapshot("veth-e2e0", serde_json::json!({ "mtu": 9000u64 }));
+        let current = make_current_state("veth-e2e0", vec![("mtu", Value::U64(1500))]);
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "exactly one field change should be detected for mtu");
+        let change = &changes[0];
+        assert_eq!(change.field_name, "mtu");
+        assert_eq!(change.change_kind, "set", "mtu change must have kind 'set'");
+        assert_eq!(
+            change.current,
+            Some(serde_json::json!(9000u64)),
+            "current must be the old value (9000) from the journal snapshot"
+        );
+        assert_eq!(
+            change.desired,
+            Some(serde_json::json!(1500u64)),
+            "desired must be the new value (1500) from the live system"
+        );
+    }
+
+    /// AC: Unchanged fields do not appear in the diff — no spurious journal entries.
+    #[test]
+    fn test_compute_external_field_changes_unchanged_field_is_not_included() {
+        let last = make_journal_snapshot("eth0", serde_json::json!({ "mtu": 1500u64 }));
+        let current = make_current_state("eth0", vec![("mtu", Value::U64(1500))]);
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert!(changes.is_empty(), "unchanged field must produce no change entries");
+    }
+
+    /// AC: Monitor detects address addition — field present in current but not in snapshot
+    /// appears with change_kind="set" and no 'current' value.
+    #[test]
+    fn test_compute_external_field_changes_new_field_in_current_has_none_current() {
+        let last = make_journal_snapshot("eth0", serde_json::json!({ "mtu": 1500u64 }));
+        let current = make_current_state(
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),    // unchanged
+                ("speed", Value::U64(1000)),  // new field (address-like addition)
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "only the newly added field should appear");
+        let change = &changes[0];
+        assert_eq!(change.field_name, "speed");
+        assert_eq!(change.change_kind, "set");
+        assert!(
+            change.current.is_none(),
+            "added field must have no 'current' value — it was not in the snapshot"
+        );
+        assert_eq!(change.desired, Some(serde_json::json!(1000u64)));
+    }
+
+    /// AC: Monitor detects address removal — field present in snapshot but absent from
+    /// current appears with change_kind="unset" and no 'desired' value.
+    #[test]
+    fn test_compute_external_field_changes_removed_field_has_unset_kind_and_no_desired() {
+        let last = make_journal_snapshot(
+            "eth0",
+            serde_json::json!({ "mtu": 1500u64, "speed": 1000u64 }),
+        );
+        let current = make_current_state("eth0", vec![("mtu", Value::U64(1500))]);
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "only the removed field should appear");
+        let change = &changes[0];
+        assert_eq!(change.field_name, "speed");
+        assert_eq!(change.change_kind, "unset", "removed field must have kind 'unset'");
+        assert_eq!(
+            change.current,
+            Some(serde_json::json!(1000u64)),
+            "removed field must record its last known value from the snapshot"
+        );
+        assert!(
+            change.desired.is_none(),
+            "removed field must have no 'desired' value"
+        );
+    }
+
+    /// AC: Both snapshot and current state empty → no changes (no spurious entries).
+    #[test]
+    fn test_compute_external_field_changes_both_empty_produces_no_changes() {
+        let last = make_journal_snapshot("eth0", serde_json::json!({}));
+        let current = make_current_state("eth0", vec![]);
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert!(changes.is_empty(), "both empty → no changes");
+    }
+
+    /// AC: Mixed changed and unchanged fields — only changed fields appear in the diff.
+    #[test]
+    fn test_compute_external_field_changes_mixed_only_changed_fields_in_result() {
+        let last = make_journal_snapshot(
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64, "speed": 1000u64 }),
+        );
+        let current = make_current_state(
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),   // changed
+                ("speed", Value::U64(1000)), // unchanged
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "only the changed field should appear");
+        assert_eq!(changes[0].field_name, "mtu", "speed must not appear — it is unchanged");
+        assert_eq!(changes[0].current, Some(serde_json::json!(9000u64)));
+        assert_eq!(changes[0].desired, Some(serde_json::json!(1500u64)));
+    }
+
+    /// AC: Burst changes coalesced — multiple changed fields are all captured in one diff.
+    #[test]
+    fn test_compute_external_field_changes_multiple_changed_fields_all_captured() {
+        let last = make_journal_snapshot(
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64, "speed": 100u64 }),
+        );
+        let current = make_current_state(
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),   // changed
+                ("speed", Value::U64(1000)), // also changed
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 2, "both changed fields must appear");
+        let mtu = changes.iter().find(|c| c.field_name == "mtu").expect("mtu must be present");
+        assert_eq!(mtu.current, Some(serde_json::json!(9000u64)));
+        assert_eq!(mtu.desired, Some(serde_json::json!(1500u64)));
+        let speed =
+            changes.iter().find(|c| c.field_name == "speed").expect("speed must be present");
+        assert_eq!(speed.current, Some(serde_json::json!(100u64)));
+        assert_eq!(speed.desired, Some(serde_json::json!(1000u64)));
+    }
+
+    /// AC: External changes do not trigger re-reconciliation — record_external_change
+    /// is a pure observation (ApplyOutcome::Observed) and never calls reconcile_and_apply.
+    /// Verified here at the type level: the Observed variant serializes as "observed".
+    #[test]
+    fn test_apply_outcome_observed_serializes_as_observed_for_external_change_entries() {
+        let outcome = ApplyOutcome::Observed;
+        let json = serde_json::to_string(&outcome).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["kind"].as_str(),
+            Some("observed"),
+            "ExternalChange entries must carry ApplyOutcome::Observed (kind='observed')"
+        );
+    }
+
+    /// AC: Journal entry trigger type is "external_change" and contains changed_entities.
+    #[test]
+    fn test_external_change_trigger_has_correct_type_and_changed_entities() {
+        let trigger = Trigger::ExternalChange {
+            changed_entities: vec!["veth-e2e0".to_string()],
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["type"].as_str(),
+            Some("external_change"),
+            "trigger type discriminator must be 'external_change'"
+        );
+        let entities =
+            value["changed_entities"].as_array().expect("changed_entities must be an array");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].as_str(), Some("veth-e2e0"));
+    }
+
+    /// AC: changed_entities in trigger includes all interfaces that actually changed.
+    #[test]
+    fn test_external_change_trigger_changed_entities_includes_all_changed_interfaces() {
+        let trigger = Trigger::ExternalChange {
+            changed_entities: vec!["eth0".to_string(), "eth1".to_string(), "eth2".to_string()],
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entities =
+            value["changed_entities"].as_array().expect("changed_entities must be an array");
+        assert_eq!(entities.len(), 3, "all three changed interfaces must appear");
+        let names: Vec<&str> = entities.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"eth0"), "eth0 must be in changed_entities");
+        assert!(names.contains(&"eth1"), "eth1 must be in changed_entities");
+        assert!(names.contains(&"eth2"), "eth2 must be in changed_entities");
     }
 }
