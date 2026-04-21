@@ -65,10 +65,15 @@
       "description": "Routes via this interface",
       "x-netfyr-writable": true
     },
+    "name": {
+      "type": "string",
+      "description": "Interface name (kernel-assigned, not settable via policy)",
+      "x-netfyr-writable": false
+    },
     "operstate": {
       "type": "string",
       "description": "Operational state of the interface (up/down/unknown)",
-      "x-netfyr-writable": true
+      "x-netfyr-writable": false
     },
     "dns_servers": {
       "type": "array",

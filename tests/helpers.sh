@@ -185,3 +185,47 @@ wait_for_address() {
         (( waited++ )) || true
     done
 }
+
+# assert_address_count IFACE EXPECTED_COUNT -- Fail if the number of IPv4 (inet)
+# addresses on IFACE does not match EXPECTED_COUNT. Uses "inet " (with trailing
+# space) to exclude inet6 lines.
+assert_address_count() {
+    local iface="$1"
+    local expected="$2"
+    local output
+    output=$(ip addr show dev "$iface" 2>&1) || true
+    local count
+    count=$(echo "$output" | grep -c "inet ") || count=0
+    if [[ "$count" -ne "$expected" ]]; then
+        echo "FAIL: interface '$iface' has $count inet address(es), expected $expected" >&2
+        echo "      ip addr output: $output" >&2
+        exit 1
+    fi
+}
+
+# assert_json_address_order JSON_TEXT ADDR [ADDR ...] -- Fail if any ADDR is absent
+# from JSON_TEXT or if the addresses do not appear in the given left-to-right order.
+# Determines order via character-offset comparison using bash parameter expansion
+# (no jq required). The pattern "${json%%addr*}" yields the text before the first
+# occurrence of addr, so its length is the character offset of that occurrence.
+assert_json_address_order() {
+    local json_text="$1"
+    shift
+    local prev_offset=-1
+    local addr before offset
+    for addr in "$@"; do
+        if ! echo "$json_text" | grep -qF "$addr"; then
+            echo "FAIL: address '$addr' not found in JSON output" >&2
+            echo "      JSON: $json_text" >&2
+            exit 1
+        fi
+        before="${json_text%%"$addr"*}"
+        offset="${#before}"
+        if (( offset <= prev_offset )); then
+            echo "FAIL: address '$addr' is not in expected position (offset $offset <= previous $prev_offset)" >&2
+            echo "      JSON: $json_text" >&2
+            exit 1
+        fi
+        prev_offset="$offset"
+    done
+}

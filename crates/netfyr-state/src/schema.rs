@@ -504,17 +504,20 @@ fn check_ethernet_addresses(state: &State) -> Vec<ValidationError> {
     };
 
     let mut errors = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut reported_dup: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut reported_dup: HashSet<String> = HashSet::new();
 
     for item in addresses {
-        let addr = match item.as_str() {
-            Some(s) => s,
-            None => continue, // non-string items are already caught by JSON Schema
+        // Addresses arrive as Value::IpNetwork (parsed from YAML strings like
+        // "10.99.0.1/24") or Value::String (raw strings). Non-address types
+        // are caught by JSON Schema before this function runs.
+        let addr = match item {
+            Value::IpNetwork(_) | Value::String(_) => item.to_string(),
+            _ => continue,
         };
 
         // Duplicate detection: one error per unique duplicated address.
-        if !seen.insert(addr) && reported_dup.insert(addr) {
+        if !seen.insert(addr.clone()) && reported_dup.insert(addr.clone()) {
             errors.push(ValidationError {
                 field: "addresses".into(),
                 message: format!("duplicate address \"{addr}\""),
@@ -523,7 +526,7 @@ fn check_ethernet_addresses(state: &State) -> Vec<ValidationError> {
         }
 
         // IPv6 detection: the prefix part (before '/') contains ':'.
-        let prefix = addr.split_once('/').map_or(addr, |(p, _)| p);
+        let prefix = addr.split_once('/').map_or(addr.as_str(), |(p, _)| p);
         if prefix.contains(':') {
             errors.push(ValidationError {
                 field: "addresses".into(),

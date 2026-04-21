@@ -25,7 +25,7 @@ use netfyr_reconcile::{
 // Import the state-level diff function via its full module path to avoid the
 // name ambiguity between the `diff` module and the re-exported `diff` function.
 use netfyr_state::diff::diff as compute_state_diff;
-use netfyr_state::{SchemaRegistry, StateDiff as StateDiffState};
+use netfyr_state::{SchemaRegistry, State, StateDiff as StateDiffState, StateSet};
 use netfyr_varlink::{
     VarlinkApplyReport, VarlinkClient, VarlinkError, VarlinkPolicy, VarlinkStateDiff,
 };
@@ -60,6 +60,10 @@ pub struct ApplyArgs {
 pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     // 1. Load all policies from the provided paths.
     let policy_set = load_policies(&args.paths)?;
+
+    // 1a. Validate all policy states before applying.
+    let schema = SchemaRegistry::default();
+    validate_policies(&policy_set, &schema)?;
 
     // 2. Detect runtime mode: try connecting to the daemon socket.
     let socket_path = daemon_socket_path();
@@ -123,10 +127,20 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     //
     // generate_diff(desired, actual, managed_entities, schema) — desired first, then actual
     // compute_state_diff(from, to) — from=actual, to=desired
-    let schema = SchemaRegistry::default();
     let reconcile_diff: ReconcileDiff =
         generate_diff(effective_state, &actual_state, &managed_entities, &schema);
-    let state_diff: StateDiffState = compute_state_diff(&actual_state, effective_state);
+
+    // Restrict actual_state to only managed entities before computing state_diff.
+    // This matches the daemon's reconciler behavior: only entities covered by an
+    // active policy can receive Remove operations — unmanaged interfaces are
+    // left completely untouched.
+    let mut managed_actual = StateSet::new();
+    for (entity_type, selector_key) in effective_state.entities() {
+        if let Some(state) = actual_state.get(&entity_type, &selector_key) {
+            managed_actual.insert(state.clone());
+        }
+    }
+    let state_diff: StateDiffState = compute_state_diff(&managed_actual, effective_state);
 
     // 8. Dry-run: display planned changes and exit without applying.
     if args.dry_run {
@@ -233,6 +247,39 @@ fn load_policies(paths: &[PathBuf]) -> Result<PolicySet> {
     }
 
     Ok(policy_set)
+}
+
+// ── Validation ───────────────────────────────────────────────────────────────
+
+/// Validate all states in every policy. Returns an error listing all violations
+/// so the user sees the full picture before any changes are applied.
+fn validate_policies(policy_set: &PolicySet, schema: &SchemaRegistry) -> Result<()> {
+    let mut all_errors: Vec<String> = Vec::new();
+
+    for policy in policy_set.iter() {
+        let states: Vec<&State> = policy
+            .state
+            .iter()
+            .chain(policy.states.iter().flatten())
+            .collect();
+
+        for state in states {
+            if let Err(errs) = schema.validate(state) {
+                for err in errs.errors() {
+                    all_errors.push(format!(
+                        "policy '{}': field '{}': {}",
+                        policy.name, err.field, err.message
+                    ));
+                }
+            }
+        }
+    }
+
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", all_errors.join("\n"))
+    }
 }
 
 // ── Reconciliation helpers ────────────────────────────────────────────────────

@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use netfyr_state::{FieldValue, SchemaRegistry, Selector, StateSet};
+use netfyr_state::{FieldValue, SchemaRegistry, Selector, StateSet, Value};
 use serde::Serialize;
 
 use crate::{EntityKey, FieldName};
@@ -255,6 +255,14 @@ pub fn generate_diff(
                     .unwrap_or(false); // unknown fields treated as writable
 
                 if is_read_only {
+                    continue;
+                }
+
+                // Unsetting an already-empty list is a no-op: the desired
+                // state has no entry for this field, and the actual state has
+                // an empty list — no backend action can produce a meaningful
+                // change here, so skip it to avoid spurious diff reports.
+                if matches!(&actual_fv.value, Value::List(v) if v.is_empty()) {
                     continue;
                 }
 
