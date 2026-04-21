@@ -5,12 +5,22 @@
 //! documentation artifacts such as man pages.
 
 pub mod apply;
+pub mod history;
 pub mod query;
 
 pub use apply::run_apply;
+pub use history::run_history;
 pub use query::run_query;
 
 use clap::{Parser, Subcommand};
+
+/// Unix socket path for the netfyr daemon's Varlink API.
+/// Override with `NETFYR_SOCKET_PATH` environment variable (used in tests and
+/// non-systemd deployments that place the socket at a custom path).
+pub(crate) fn daemon_socket_path() -> String {
+    std::env::var("NETFYR_SOCKET_PATH")
+        .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
+}
 
 /// Declarative Linux network configuration.
 ///
@@ -27,9 +37,11 @@ use clap::{Parser, Subcommand};
 ///
 /// Subcommands:
 ///
-///   apply   Load and apply policy files to the system.
+///   apply    Load and apply policy files to the system.
 ///
-///   query   Query current network state from the kernel or daemon.
+///   query    Query current network state from the kernel or daemon.
+///
+///   history  Show journal history of state changes.
 #[derive(Parser)]
 #[command(name = "netfyr", about = "Declarative Linux network configuration")]
 #[command(subcommand_required = true, arg_required_else_help = true)]
@@ -62,4 +74,14 @@ pub enum Commands {
     /// driver, MAC address, or PCI path. Multiple selectors are combined with
     /// AND logic. Use --output (-o) to select yaml (default) or json output.
     Query(query::QueryArgs),
+
+    /// Show journal history of state changes
+    ///
+    /// Display a log of reconciliation events recorded by the journal.
+    /// Shows what changed, when, and why. Supports filtering by time,
+    /// trigger type, and entity name.
+    ///
+    /// If the netfyr daemon is running, history is retrieved via Varlink.
+    /// Otherwise, journal files are read directly.
+    History(history::HistoryArgs),
 }

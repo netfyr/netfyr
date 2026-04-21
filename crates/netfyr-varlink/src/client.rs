@@ -132,6 +132,60 @@ impl VarlinkClient {
         })
     }
 
+    /// Get journal history entries, optionally filtered by count, time range, trigger, or entity.
+    ///
+    /// Returns raw `serde_json::Value` objects (one per entry) so that `netfyr-varlink`
+    /// does not need to depend on `netfyr-journal`. The CLI deserializes them into
+    /// `JournalEntry` on its end.
+    pub async fn get_history(
+        &mut self,
+        count: Option<usize>,
+        since: Option<String>,
+        trigger: Option<String>,
+        selector_name: Option<String>,
+    ) -> Result<Vec<serde_json::Value>, VarlinkError> {
+        let mut params = serde_json::Map::new();
+        if let Some(c) = count {
+            params.insert("count".to_string(), serde_json::json!(c));
+        }
+        if let Some(s) = since {
+            params.insert("since".to_string(), serde_json::json!(s));
+        }
+        if let Some(t) = trigger {
+            params.insert("trigger".to_string(), serde_json::json!(t));
+        }
+        if let Some(n) = selector_name {
+            params.insert("selector_name".to_string(), serde_json::json!(n));
+        }
+        let response = self
+            .call("io.netfyr.GetHistory", serde_json::Value::Object(params))
+            .await?;
+        match response["entries"].as_array() {
+            Some(arr) => Ok(arr.clone()),
+            None => Err(VarlinkError::Protocol(
+                "response missing 'entries' array".into(),
+            )),
+        }
+    }
+
+    /// Get a single journal entry by sequence ID.
+    ///
+    /// Returns `None` if the entry does not exist. Returns raw `serde_json::Value`
+    /// to avoid a dependency on `netfyr-journal` in this crate.
+    pub async fn get_journal_entry(
+        &mut self,
+        seq: u64,
+    ) -> Result<Option<serde_json::Value>, VarlinkError> {
+        let params = serde_json::json!({ "seq": seq });
+        let response = self.call("io.netfyr.GetJournalEntry", params).await?;
+        let entry = &response["entry"];
+        if entry.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(entry.clone()))
+        }
+    }
+
     /// Get daemon status including uptime, active policy count, and running factories.
     pub async fn get_status(&mut self) -> Result<VarlinkDaemonStatus, VarlinkError> {
         let response = self.call("io.netfyr.GetStatus", serde_json::json!({})).await?;

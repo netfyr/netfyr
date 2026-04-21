@@ -1,0 +1,72 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-history 1  "netfyr-history " 
+.SH NAME
+netfyr\-history \- Show journal history of state changes
+.SH SYNOPSIS
+\fBnetfyr\-history\fR [\fB\-n\fR|\fB\-\-count\fR] [\fB\-\-since\fR] [\fB\-\-trigger\fR] [\fB\-s\fR|\fB\-\-selector\fR] [\fB\-\-show\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Show journal history of state changes
+.PP
+Display a log of reconciliation events recorded by the journal. Shows what changed, when, and why. Supports filtering by time, trigger type, and entity name.
+.PP
+If the netfyr daemon is running, history is retrieved via Varlink. Otherwise, journal files are read directly.
+.SH OPTIONS
+.TP
+\fB\-n\fR, \fB\-\-count\fR \fI<COUNT>\fR [default: 20]
+Number of entries to show (most recent first)
+.TP
+\fB\-\-since\fR \fI<SINCE>\fR
+Show entries since this time (e.g. 1h, 30m, 7d or ISO 8601)
+.TP
+\fB\-\-trigger\fR \fI<TRIGGER>\fR
+Filter by trigger type (apply, dhcp, external, startup, revert)
+.TP
+\fB\-s\fR, \fB\-\-selector\fR \fI<SELECTOR>\fR
+Filter by entity name (name=X)
+.TP
+\fB\-\-show\fR \fI<SHOW>\fR
+Show full detail for a single entry by sequence ID
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: text]
+Output format: text (default), json
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+text
+.IP \(bu 2
+json
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+See
+.BR netfyr-history (1)
+for usage details.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-apply (1),
+.BR netfyr-query (1),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

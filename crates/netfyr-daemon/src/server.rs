@@ -279,6 +279,165 @@ async fn handle_get_status(
     write_success(stream, serde_json::json!({ "status": status })).await
 }
 
+// ── Journal history handlers ──────────────────────────────────────────────────
+
+/// `io.netfyr.GetHistory` — return journal entries, optionally filtered.
+async fn handle_get_history(
+    stream: &mut UnixStream,
+    params: &serde_json::Value,
+) -> Result<()> {
+    let count = params
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(20);
+    let since_str = params.get("since").and_then(|v| v.as_str()).map(str::to_string);
+    let trigger_filter = params.get("trigger").and_then(|v| v.as_str()).map(str::to_string);
+    let selector_name = params.get("selector_name").and_then(|v| v.as_str()).map(str::to_string);
+
+    let journal = match netfyr_journal::Journal::open_default() {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to open journal: {}", e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    let has_filters = since_str.is_some() || trigger_filter.is_some() || selector_name.is_some();
+    let read_count = if has_filters { 10_000 } else { count };
+
+    let all_entries = match journal.read_recent(read_count) {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to read journal entries: {}", e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    // Parse the since cutoff if provided.
+    let since_cutoff: Option<chrono::DateTime<chrono::Utc>> = if let Some(ref s) = since_str {
+        match server_parse_since(s) {
+            Ok(dt) => Some(dt),
+            Err(e) => {
+                return write_error(stream, "InternalError", &format!("invalid since: {}", e))
+                    .await;
+            }
+        }
+    } else {
+        None
+    };
+
+    let filtered: Vec<serde_json::Value> = all_entries
+        .into_iter()
+        .filter(|e| {
+            if let Some(cutoff) = since_cutoff {
+                if e.timestamp < cutoff {
+                    return false;
+                }
+            }
+            if let Some(ref tf) = trigger_filter {
+                let trigger_type = server_trigger_type_str(&e.trigger);
+                if !trigger_type.to_lowercase().contains(&tf.to_lowercase()) {
+                    return false;
+                }
+            }
+            if let Some(ref name) = selector_name {
+                if !e.diff.operations.iter().any(|op| op.entity_name == *name) {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(count)
+        .filter_map(|e| serde_json::to_value(&e).ok())
+        .collect();
+
+    write_success(stream, serde_json::json!({ "entries": filtered })).await
+}
+
+/// `io.netfyr.GetJournalEntry` — return a single journal entry by sequence ID.
+async fn handle_get_journal_entry(
+    stream: &mut UnixStream,
+    params: &serde_json::Value,
+) -> Result<()> {
+    let seq = match params.get("seq").and_then(|v| v.as_u64()) {
+        Some(s) => s,
+        None => {
+            return write_error(stream, "InternalError", "missing or invalid 'seq' parameter")
+                .await;
+        }
+    };
+
+    let journal = match netfyr_journal::Journal::open_default() {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to open journal: {}", e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    let entry = match journal.read_entry(seq) {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to read journal entry #{}: {}", seq, e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    let entry_value = match entry {
+        Some(e) => serde_json::to_value(&e).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    };
+
+    write_success(stream, serde_json::json!({ "entry": entry_value })).await
+}
+
+fn server_trigger_type_str(trigger: &netfyr_journal::Trigger) -> &'static str {
+    match trigger {
+        netfyr_journal::Trigger::PolicyApply { .. } => "policy_apply",
+        netfyr_journal::Trigger::DhcpEvent { .. } => "dhcp_event",
+        netfyr_journal::Trigger::ExternalChange { .. } => "external_change",
+        netfyr_journal::Trigger::DaemonStartup => "daemon_startup",
+        netfyr_journal::Trigger::Revert { .. } => "revert",
+    }
+}
+
+fn server_parse_since(s: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let now = chrono::Utc::now();
+
+    // Try relative duration: 30s, 5m, 1h, 7d
+    let units = ["d", "h", "m", "s"];
+    for unit in &units {
+        if let Some(num_str) = s.strip_suffix(unit) {
+            if !num_str.is_empty() {
+                let num: u64 = num_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid number in duration: {:?}", s))?;
+                let seconds: u64 = match *unit {
+                    "s" => num,
+                    "m" => num * 60,
+                    "h" => num * 3600,
+                    "d" => num * 86400,
+                    _ => unreachable!(),
+                };
+                let duration = chrono::Duration::try_seconds(seconds as i64)
+                    .ok_or_else(|| anyhow::anyhow!("duration overflow"))?;
+                return Ok(now - duration);
+            }
+        }
+    }
+
+    // Try ISO 8601 / RFC 3339
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "invalid duration or timestamp {:?}; use e.g. 1h, 30m, 7d or ISO 8601",
+                s
+            )
+        })
+}
+
 // ── Connection handler ────────────────────────────────────────────────────────
 
 /// Handle all requests on a single connection until the client disconnects.
@@ -341,6 +500,8 @@ async fn handle_connection(
             "io.netfyr.GetStatus" => {
                 handle_get_status(stream, policy_store, factory_manager, start_time).await
             }
+            "io.netfyr.GetHistory" => handle_get_history(stream, &params).await,
+            "io.netfyr.GetJournalEntry" => handle_get_journal_entry(stream, &params).await,
             other => {
                 write_error(
                     stream,

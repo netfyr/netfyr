@@ -16,13 +16,7 @@ use netfyr_backend::{BackendError, BackendRegistry, NetlinkBackend};
 use netfyr_state::{MacAddr, Selector, State};
 use netfyr_varlink::{VarlinkClient, VarlinkError, VarlinkSelector, VarlinkState};
 
-/// Unix socket path for the netfyr daemon's Varlink API.
-/// Override with `NETFYR_SOCKET_PATH` environment variable (used in tests and
-/// non-systemd deployments that place the socket at a custom path).
-fn daemon_socket_path() -> String {
-    std::env::var("NETFYR_SOCKET_PATH")
-        .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
-}
+use crate::daemon_socket_path;
 
 /// Valid selector keys for the `--selector` / `-s` flag.
 const VALID_SELECTOR_KEYS: &[&str] = &["type", "name", "driver", "mac", "pci_path"];
