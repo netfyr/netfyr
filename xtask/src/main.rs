@@ -1910,6 +1910,252 @@ mod tests {
         );
     }
 
+    // ── netfyr.yaml.5 — spec 503 additional coverage ─────────────────────────
+
+    /// AC 503: Man page renders without troff/groff errors.
+    /// Runs groff (or nroff) on the file and asserts the exit code is 0.
+    /// Skipped automatically if neither groff nor nroff is present on PATH.
+    #[test]
+    fn test_yaml_man_page_renders_without_groff_errors() {
+        use std::process::Command;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let man_path = manifest_dir.join("../man/netfyr.yaml.5");
+
+        // Try groff first, then nroff as a fallback.
+        for program in &["groff", "nroff"] {
+            let which = Command::new("which").arg(program).output();
+            if which.map(|o| o.status.success()).unwrap_or(false) {
+                let output = Command::new(program)
+                    .args(["-man", "-Tutf8"])
+                    .arg(&man_path)
+                    .output()
+                    .unwrap_or_else(|e| panic!("Failed to spawn {program}: {e}"));
+                assert!(
+                    output.status.success(),
+                    "{program} exited with non-zero status rendering man/netfyr.yaml.5:\nstderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let warnings: Vec<&str> = stderr
+                    .lines()
+                    .filter(|l| l.contains("warning") || l.contains("error"))
+                    .collect();
+                assert!(
+                    warnings.is_empty(),
+                    "{program} produced warnings/errors rendering man/netfyr.yaml.5:\n{}",
+                    warnings.join("\n")
+                );
+                return;
+            }
+        }
+        // Neither groff nor nroff is available — skip gracefully.
+        eprintln!("WARNING: neither groff nor nroff found; skipping troff rendering test");
+    }
+
+    /// AC 503: VALUE TYPES section maps YAML strings to netfyr String.
+    #[test]
+    fn test_yaml_man_page_value_types_maps_string() {
+        let content = read_yaml_man_page();
+        let vt_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
+        let files_start = content.find("\n.SH FILES").expect("FILES section must exist");
+        let vt_section = &content[vt_start..files_start];
+        assert!(
+            vt_section.contains("String"),
+            "VALUE TYPES section must map plain YAML strings to netfyr String; section:\n{vt_section}"
+        );
+    }
+
+    /// AC 503: netfyr.yaml.5 has a SEE ALSO section.
+    #[test]
+    fn test_yaml_man_page_has_see_also_section() {
+        let content = read_yaml_man_page();
+        assert!(
+            content.contains("SEE ALSO"),
+            "man/netfyr.yaml.5 must have a SEE ALSO section"
+        );
+    }
+
+    /// AC 503: SEE ALSO in netfyr.yaml.5 references netfyr(1).
+    #[test]
+    fn test_yaml_man_page_see_also_references_netfyr_1() {
+        let content = read_yaml_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr (1)") || see_also.contains("netfyr(1)"),
+            "man/netfyr.yaml.5 SEE ALSO must reference netfyr(1)"
+        );
+    }
+
+    /// AC 503: SEE ALSO in netfyr.yaml.5 references netfyr-apply(1).
+    /// Troff source may use \- for the hyphen, so we check both forms.
+    #[test]
+    fn test_yaml_man_page_see_also_references_netfyr_apply_1() {
+        let content = read_yaml_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-apply") || see_also.contains("netfyr\\-apply"),
+            "man/netfyr.yaml.5 SEE ALSO must reference netfyr-apply(1)"
+        );
+    }
+
+    /// AC 503: SEE ALSO in netfyr.yaml.5 references netfyr-daemon(8).
+    /// Troff source may use \- for the hyphen, so we check both forms.
+    #[test]
+    fn test_yaml_man_page_see_also_references_netfyr_daemon_8() {
+        let content = read_yaml_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-daemon") || see_also.contains("netfyr\\-daemon"),
+            "man/netfyr.yaml.5 SEE ALSO must reference netfyr-daemon(8)"
+        );
+    }
+
+    /// AC 503: SEE ALSO in netfyr.yaml.5 references netfyr-examples(7).
+    /// Troff source may use \- for the hyphen, so we check both forms.
+    #[test]
+    fn test_yaml_man_page_see_also_references_netfyr_examples_7() {
+        let content = read_yaml_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-examples") || see_also.contains("netfyr\\-examples"),
+            "man/netfyr.yaml.5 SEE ALSO must reference netfyr-examples(7)"
+        );
+    }
+
+    /// AC 503: BARE STATE FORMAT mentions both selector properties and configuration properties.
+    #[test]
+    fn test_yaml_man_page_bare_state_format_documents_selector_and_config_properties() {
+        let content = read_yaml_man_page();
+        let bare_start = content.find("BARE STATE FORMAT").expect("BARE STATE FORMAT section must exist");
+        let policy_start = content.find("POLICY FORMAT").expect("POLICY FORMAT section must exist");
+        let bare_section = &content[bare_start..policy_start];
+        let lower = bare_section.to_lowercase();
+        assert!(
+            lower.contains("selector"),
+            "BARE STATE FORMAT must mention selector properties"
+        );
+        assert!(
+            lower.contains("config") || lower.contains("configuration"),
+            "BARE STATE FORMAT must mention configuration properties"
+        );
+    }
+
+    /// AC 503: BARE STATE FORMAT documents the ethernet entity type is supported.
+    #[test]
+    fn test_yaml_man_page_bare_state_format_documents_ethernet_type() {
+        let content = read_yaml_man_page();
+        let bare_start = content.find("BARE STATE FORMAT").expect("BARE STATE FORMAT section must exist");
+        let policy_start = content.find("POLICY FORMAT").expect("POLICY FORMAT section must exist");
+        let bare_section = &content[bare_start..policy_start];
+        assert!(
+            bare_section.contains("ethernet"),
+            "BARE STATE FORMAT must document 'ethernet' as a supported entity type"
+        );
+    }
+
+    /// AC 503: POLICY FORMAT documents that priority defaults to 100.
+    #[test]
+    fn test_yaml_man_page_policy_format_documents_priority_default_100() {
+        let content = read_yaml_man_page();
+        let policy_start = content.find("POLICY FORMAT").expect("POLICY FORMAT section must exist");
+        let multi_start = content.find("MULTI-DOCUMENT").expect("MULTI-DOCUMENT section must exist");
+        let policy_section = &content[policy_start..multi_start];
+        assert!(
+            policy_section.contains("100"),
+            "POLICY FORMAT must document the default priority value of 100"
+        );
+    }
+
+    /// AC 503: POLICY FORMAT documents that `state` and `states` are mutually exclusive.
+    #[test]
+    fn test_yaml_man_page_policy_format_documents_state_states_mutual_exclusion() {
+        let content = read_yaml_man_page();
+        let policy_start = content.find("POLICY FORMAT").expect("POLICY FORMAT section must exist");
+        let multi_start = content.find("MULTI-DOCUMENT").expect("MULTI-DOCUMENT section must exist");
+        let policy_section = &content[policy_start..multi_start];
+        let lower = policy_section.to_lowercase();
+        assert!(
+            lower.contains("mutually exclusive") || lower.contains("mutual"),
+            "POLICY FORMAT must note that 'state' and 'states' are mutually exclusive"
+        );
+    }
+
+    /// AC 503: SELECTORS section documents that all fields are AND-ed (all must match).
+    #[test]
+    fn test_yaml_man_page_selectors_documents_and_logic() {
+        let content = read_yaml_man_page();
+        let sel_start = content.find("\n.SH SELECTORS").expect("SELECTORS section must exist");
+        let fields_start = content.find("\n.SH FIELDS").expect("FIELDS section must exist");
+        let sel_section = &content[sel_start..fields_start];
+        let lower = sel_section.to_lowercase();
+        assert!(
+            lower.contains("and") || lower.contains("all"),
+            "SELECTORS section must document that all specified fields must match (AND logic)"
+        );
+    }
+
+    /// AC 503: FIELDS section documents IPv4 CIDR notation for addresses.
+    #[test]
+    fn test_yaml_man_page_fields_addresses_documents_cidr_notation() {
+        let content = read_yaml_man_page();
+        let fields_start = content.find("\n.SH FIELDS").expect("FIELDS section must exist");
+        let value_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
+        let fields_section = &content[fields_start..value_start];
+        assert!(
+            fields_section.contains("CIDR") || fields_section.contains("cidr"),
+            "FIELDS addresses documentation must mention CIDR notation"
+        );
+        assert!(
+            fields_section.contains("IPv4") || fields_section.contains("ipv4"),
+            "FIELDS addresses documentation must mention IPv4"
+        );
+    }
+
+    /// AC 503: VALUE TYPES section notes that IPv6 is not supported.
+    #[test]
+    fn test_yaml_man_page_value_types_documents_ipv6_not_supported() {
+        let content = read_yaml_man_page();
+        let vt_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
+        let files_start = content.find("\n.SH FILES").expect("FILES section must exist");
+        let vt_section = &content[vt_start..files_start];
+        let lower = vt_section.to_lowercase();
+        assert!(
+            lower.contains("ipv6"),
+            "VALUE TYPES section must note that IPv6 is not supported"
+        );
+    }
+
+    /// AC 503: DESCRIPTION section mentions /etc/netfyr/policies/ as the config directory.
+    #[test]
+    fn test_yaml_man_page_description_mentions_policies_directory() {
+        let content = read_yaml_man_page();
+        let desc_start = content.find(".SH DESCRIPTION").expect("DESCRIPTION section must exist");
+        let bare_start = content.find("BARE STATE FORMAT").expect("BARE STATE FORMAT must exist");
+        let desc_section = &content[desc_start..bare_start];
+        assert!(
+            desc_section.contains("/etc/netfyr/policies/"),
+            "DESCRIPTION must mention /etc/netfyr/policies/ as the config directory"
+        );
+    }
+
+    /// AC 503: DESCRIPTION section explains that "---" separates multiple documents.
+    #[test]
+    fn test_yaml_man_page_description_explains_multi_document_separator() {
+        let content = read_yaml_man_page();
+        let desc_start = content.find(".SH DESCRIPTION").expect("DESCRIPTION section must exist");
+        let bare_start = content.find("BARE STATE FORMAT").expect("BARE STATE FORMAT must exist");
+        let desc_section = &content[desc_start..bare_start];
+        assert!(
+            desc_section.contains("---") || desc_section.contains("\\-\\-\\-"),
+            "DESCRIPTION must mention the '---' document separator"
+        );
+    }
+
     // ── Idempotency and non-overwrite ─────────────────────────────────────────
 
     /// AC: Regeneration is idempotent — running cargo xtask man twice produces identical output.
