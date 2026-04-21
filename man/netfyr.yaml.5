@@ -259,10 +259,12 @@ Valid range: 68\(en65535.
 .TP
 .B addresses
 (sequence of strings)
-IP addresses assigned to the interface, in CIDR notation
+IPv4 addresses assigned to the interface, in CIDR notation
 (e.g.,
 .BR 10.0.1.50/24 ).
-Both IPv4 and IPv6 addresses are accepted.
+Order is preserved: the first address becomes the primary (source) address.
+Duplicate addresses are rejected.
+IPv6 is not supported.
 .TP
 .B routes
 (sequence of mappings)
@@ -306,18 +308,23 @@ netfyr
 netfyr
 .B I64
 .TP
-.B "YAML string (valid IP address)"
+.B "YAML string (valid IPv4 address)"
 netfyr
 .B IpAddr
 (e.g.,
-.BR 10.0.0.1 ,
-.BR "::1" )
+.BR 10.0.0.1 )
 .TP
-.B "YAML string (valid CIDR prefix)"
+.B "YAML string (valid IPv4 CIDR prefix)"
 netfyr
 .B IpNetwork
 (e.g.,
 .BR 10.0.0.0/24 )
+.PP
+IPv6 addresses are not supported.
+Strings containing IPv6 addresses (e.g.,
+.BR fe80::1 )
+are treated as plain strings and will fail schema validation if used in
+address fields.
 .TP
 .B "YAML string (other)"
 netfyr
