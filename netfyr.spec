@@ -43,8 +43,8 @@ tar xf %{SOURCE1}
 cargo run -p xtask -- man
 
 %install
-# Install CLI binary (the Cargo binary is named netfyr-cli; rename on install)
-install -Dpm 0755 target/release/netfyr-cli %{buildroot}%{_bindir}/netfyr
+# Install CLI binary
+install -Dpm 0755 target/release/netfyr %{buildroot}%{_bindir}/netfyr
 
 # Install daemon binary
 install -Dpm 0755 target/release/netfyr-daemon %{buildroot}%{_bindir}/netfyr-daemon
@@ -73,8 +73,7 @@ install -pm 0644 examples/policies/*.yaml %{buildroot}%{_docdir}/%{name}/example
 
 %check
 # Smoke-test: verify the built binaries are functional.
-# Note: the CLI binary is named netfyr-cli in the build output.
-target/release/netfyr-cli --help > /dev/null
+target/release/netfyr --help > /dev/null
 target/release/netfyr-daemon --help > /dev/null
 
 %post daemon

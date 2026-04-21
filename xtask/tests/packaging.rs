@@ -633,3 +633,318 @@ fn test_examples_policies_directory_exists_with_files() {
          (spec installs examples/policies/*.yaml)"
     );
 }
+
+// ── Scenario: Service unit — Restart and directory directives ────────────────
+
+/// AC: service unit must restart on failure (Restart=on-failure).
+#[test]
+fn test_service_unit_restarts_on_failure() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("Restart=on-failure"),
+        "dist/systemd/netfyr.service must have 'Restart=on-failure'"
+    );
+}
+
+/// AC: service unit must declare RuntimeDirectory=netfyr so systemd creates
+///     /run/netfyr/ before the daemon starts (the Varlink socket lives there).
+#[test]
+fn test_service_unit_declares_runtime_directory() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("RuntimeDirectory=netfyr"),
+        "dist/systemd/netfyr.service must have 'RuntimeDirectory=netfyr'"
+    );
+}
+
+/// AC: service unit must declare StateDirectory=netfyr so systemd creates
+///     /var/lib/netfyr/ for persistent daemon state.
+#[test]
+fn test_service_unit_declares_state_directory() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("StateDirectory=netfyr"),
+        "dist/systemd/netfyr.service must have 'StateDirectory=netfyr'"
+    );
+}
+
+/// AC: service unit must be installed in multi-user.target.
+#[test]
+fn test_service_unit_installed_in_multi_user_target() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("WantedBy=multi-user.target"),
+        "dist/systemd/netfyr.service [Install] must have 'WantedBy=multi-user.target'"
+    );
+}
+
+/// AC: service unit must declare Wants=network-pre.target.
+#[test]
+fn test_service_unit_wants_network_pre_target() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("Wants=network-pre.target"),
+        "dist/systemd/netfyr.service must have 'Wants=network-pre.target'"
+    );
+}
+
+// ── Scenario: Socket unit — mode and install target ──────────────────────────
+
+/// AC: socket unit must set SocketMode=0666 so unprivileged callers can reach
+///     the Varlink socket.
+#[test]
+fn test_socket_unit_mode_is_0666() {
+    let content = read_workspace_file("dist/systemd/netfyr.socket");
+    assert!(
+        content.contains("SocketMode=0666"),
+        "dist/systemd/netfyr.socket must have 'SocketMode=0666'"
+    );
+}
+
+/// AC: socket unit must be installed in sockets.target so it is activated at boot.
+#[test]
+fn test_socket_unit_installed_in_sockets_target() {
+    let content = read_workspace_file("dist/systemd/netfyr.socket");
+    assert!(
+        content.contains("WantedBy=sockets.target"),
+        "dist/systemd/netfyr.socket [Install] must have 'WantedBy=sockets.target'"
+    );
+}
+
+// ── Scenario: Spec file — additional content checks ──────────────────────────
+
+/// AC: spec file must declare License: MIT (Fedora requires SPDX identifiers).
+#[test]
+fn test_spec_declares_mit_license() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("License:") && content.contains("MIT"),
+        "netfyr.spec must declare 'License: MIT'"
+    );
+}
+
+/// AC: %prep must use %autosetup to apply patches and set up the source tree.
+#[test]
+fn test_spec_prep_uses_autosetup() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%autosetup"),
+        "netfyr.spec %prep must use '%autosetup' to set up the source tree"
+    );
+}
+
+/// AC: %files must list netfyr-history.1 man page.
+#[test]
+fn test_spec_files_includes_netfyr_history_man_page() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%{_mandir}/man1/netfyr-history.1"),
+        "netfyr.spec %files must include netfyr-history.1 man page"
+    );
+}
+
+/// AC: %files must list netfyr-revert.1 man page.
+#[test]
+fn test_spec_files_includes_netfyr_revert_man_page() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%{_mandir}/man1/netfyr-revert.1"),
+        "netfyr.spec %files must include netfyr-revert.1 man page"
+    );
+}
+
+/// AC: daemon subpackage must have a %description daemon section.
+#[test]
+fn test_spec_has_description_for_daemon_subpackage() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%description daemon"),
+        "netfyr.spec must have a '%description daemon' section for the daemon subpackage"
+    );
+}
+
+/// AC: %install must install example policies to the doc directory.
+#[test]
+fn test_spec_install_copies_example_policies_to_docdir() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%{_docdir}") && content.contains("examples/policies"),
+        "netfyr.spec %install must copy example policies to %{{_docdir}}/%{{name}}/examples/policies/"
+    );
+}
+
+/// AC: %files must include the example policies under %{_docdir}.
+#[test]
+fn test_spec_files_includes_docdir_examples() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%{_docdir}/%{name}/examples/policies/"),
+        "netfyr.spec %files must list '%{{_docdir}}/%{{name}}/examples/policies/'"
+    );
+}
+
+/// AC: %check must smoke-test the CLI binary (not just the daemon).
+#[test]
+fn test_spec_check_smoke_tests_cli_binary() {
+    let content = read_workspace_file("netfyr.spec");
+    // The %check section should verify both binaries work.
+    // We look for netfyr --help or netfyr --version (without -daemon suffix).
+    let check_start = content.find("%check").expect("%check section must exist");
+    let check_end = content[check_start..]
+        .find("\n%")
+        .map(|i| check_start + i)
+        .unwrap_or(content.len());
+    let check_section = &content[check_start..check_end];
+    assert!(
+        check_section.contains("netfyr --help")
+            || check_section.contains("netfyr --version")
+            || check_section.contains("target/release/netfyr "),
+        "netfyr.spec %check must smoke-test the netfyr CLI binary; %check section:\n{check_section}"
+    );
+}
+
+/// AC: spec URL must reference the project's source repository.
+#[test]
+fn test_spec_url_references_project_repository() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("URL:") && content.contains("netfyr"),
+        "netfyr.spec must have a URL: field referencing the netfyr project repository"
+    );
+}
+
+/// AC: spec must have a %changelog entry.
+#[test]
+fn test_spec_has_changelog() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%changelog"),
+        "netfyr.spec must have a %changelog section (required by Fedora packaging guidelines)"
+    );
+}
+
+/// AC: spec %prep must extract the vendor tarball from Source1.
+#[test]
+fn test_spec_prep_extracts_vendor_tarball() {
+    let content = read_workspace_file("netfyr.spec");
+    let prep_start = content.find("%prep").expect("%prep section must exist");
+    let build_start = content.find("%build").expect("%build section must exist");
+    let prep_section = &content[prep_start..build_start];
+    assert!(
+        prep_section.contains("%{SOURCE1}") || prep_section.contains("SOURCE1"),
+        "netfyr.spec %prep must extract the vendor tarball from Source1"
+    );
+}
+
+/// AC: %cargo_prep must pass the vendor directory flag (-v vendor) so cargo
+///     uses the vendored crates for an offline build.
+#[test]
+fn test_spec_cargo_prep_uses_vendor_flag() {
+    let content = read_workspace_file("netfyr.spec");
+    assert!(
+        content.contains("%cargo_prep") && content.contains("vendor"),
+        "netfyr.spec must call '%cargo_prep -v vendor' to enable offline cargo builds"
+    );
+}
+
+/// AC: build script must copy the spec file to rpmbuild/SPECS/.
+#[test]
+fn test_build_script_copies_spec_to_rpmbuild_specs() {
+    let content = read_workspace_file("scripts/build-rpm.sh");
+    assert!(
+        content.contains("SPECS") && (content.contains("cp") || content.contains("copy")),
+        "scripts/build-rpm.sh must copy the spec file to ~/rpmbuild/SPECS/"
+    );
+}
+
+/// AC: build script must create the standard rpmbuild directory tree.
+#[test]
+fn test_build_script_creates_rpmbuild_directory_tree() {
+    let content = read_workspace_file("scripts/build-rpm.sh");
+    assert!(
+        content.contains("rpmbuild") && content.contains("BUILD"),
+        "scripts/build-rpm.sh must create the ~/rpmbuild/{{BUILD,RPMS,SOURCES,SPECS,SRPMS}} tree"
+    );
+}
+
+/// AC: service unit must have a [Service] section.
+#[test]
+fn test_service_unit_has_service_section() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("[Service]"),
+        "dist/systemd/netfyr.service must have a [Service] section"
+    );
+}
+
+/// AC: service unit must have an [Install] section.
+#[test]
+fn test_service_unit_has_install_section() {
+    let content = read_workspace_file("dist/systemd/netfyr.service");
+    assert!(
+        content.contains("[Install]"),
+        "dist/systemd/netfyr.service must have an [Install] section"
+    );
+}
+
+/// AC: socket unit must have an [Install] section.
+#[test]
+fn test_socket_unit_has_install_section() {
+    let content = read_workspace_file("dist/systemd/netfyr.socket");
+    assert!(
+        content.contains("[Install]"),
+        "dist/systemd/netfyr.socket must have an [Install] section"
+    );
+}
+
+/// AC: spec %install must install the CLI binary with correct permissions (0755).
+#[test]
+fn test_spec_install_sets_executable_permissions_for_cli_binary() {
+    let content = read_workspace_file("netfyr.spec");
+    let install_start = content.find("%install").expect("%install section must exist");
+    let check_start = content.find("%check").expect("%check section must exist");
+    let install_section = &content[install_start..check_start];
+    assert!(
+        install_section.contains("0755") && install_section.contains("netfyr"),
+        "netfyr.spec %install must install binaries with 0755 permissions"
+    );
+}
+
+/// AC: spec %install must install the daemon binary.
+#[test]
+fn test_spec_install_installs_daemon_binary() {
+    let content = read_workspace_file("netfyr.spec");
+    let install_start = content.find("%install").expect("%install section must exist");
+    let check_start = content.find("%check").expect("%check section must exist");
+    let install_section = &content[install_start..check_start];
+    assert!(
+        install_section.contains("netfyr-daemon"),
+        "netfyr.spec %install must install the netfyr-daemon binary"
+    );
+}
+
+/// AC: spec %install must install the systemd service unit file.
+#[test]
+fn test_spec_install_installs_service_unit() {
+    let content = read_workspace_file("netfyr.spec");
+    let install_start = content.find("%install").expect("%install section must exist");
+    let check_start = content.find("%check").expect("%check section must exist");
+    let install_section = &content[install_start..check_start];
+    assert!(
+        install_section.contains("netfyr.service"),
+        "netfyr.spec %install must install the netfyr.service systemd unit"
+    );
+}
+
+/// AC: spec %install must install the systemd socket unit file.
+#[test]
+fn test_spec_install_installs_socket_unit() {
+    let content = read_workspace_file("netfyr.spec");
+    let install_start = content.find("%install").expect("%install section must exist");
+    let check_start = content.find("%check").expect("%check section must exist");
+    let install_section = &content[install_start..check_start];
+    assert!(
+        install_section.contains("netfyr.socket"),
+        "netfyr.spec %install must install the netfyr.socket systemd unit"
+    );
+}
