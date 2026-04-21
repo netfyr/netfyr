@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
+use colored::Colorize;
 
 use netfyr_journal::{ApplyOutcome, Journal, JournalEntry, SerializableDiffOp, Trigger};
 use netfyr_varlink::{VarlinkClient, VarlinkError};
@@ -333,10 +334,15 @@ fn print_detail(entry: &JournalEntry, format: &HistoryOutputFormat) -> Result<()
 // ── Text formatting ───────────────────────────────────────────────────────────
 
 pub fn format_text_list(entries: &[JournalEntry]) -> String {
+    // Fixed-width overhead: SEQ(5)+sp+TIMESTAMP(21)+sp+TRIGGER(15)+sp+ENTITIES(14)+sp+OUTCOME(16)+sp = 76
+    const FIXED_OVERHEAD: usize = 76;
+    let terminal_width = get_terminal_width();
+    let max_changes_width = terminal_width.saturating_sub(FIXED_OVERHEAD).max(10);
+
     let mut out = String::new();
     out.push_str(&format!(
         "{:<5} {:<21} {:<15} {:<14} {:<16} {}\n",
-        "SEQ", "TIMESTAMP", "TRIGGER", "ENTITIES", "CHANGES", "OUTCOME"
+        "SEQ", "TIMESTAMP", "TRIGGER", "ENTITIES", "OUTCOME", "CHANGES"
     ));
 
     for entry in entries {
@@ -344,12 +350,22 @@ pub fn format_text_list(entries: &[JournalEntry]) -> String {
         let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
         let trigger = trigger_display_name(&entry.trigger);
         let entities = entities_summary(&entry.diff.operations);
-        let changes = changes_summary(&entry.diff.operations);
         let outcome = outcome_summary(&entry.outcome);
+        let changes_plain = changes_summary(&entry.diff.operations);
+        let changes_truncated = if changes_plain.len() > max_changes_width {
+            let mut trim_to = max_changes_width.saturating_sub(3);
+            while trim_to > 0 && !changes_plain.is_char_boundary(trim_to) {
+                trim_to -= 1;
+            }
+            format!("{}...", &changes_plain[..trim_to])
+        } else {
+            changes_plain
+        };
+        let changes = colorize_changes(&changes_truncated);
 
         out.push_str(&format!(
             "{:<5} {:<21} {:<15} {:<14} {:<16} {}\n",
-            seq, ts, trigger, entities, changes, outcome
+            seq, ts, trigger, entities, outcome, changes
         ));
     }
 
@@ -381,12 +397,12 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
         out.push_str("  (no changes)\n");
     } else {
         for op in &entry.diff.operations {
-            let prefix = match op.kind.as_str() {
-                "add" => "+",
-                "remove" => "-",
-                _ => "~",
+            let colored_prefix = match op.kind.as_str() {
+                "add" => "+".green(),
+                "remove" => "-".red(),
+                _ => "~".yellow(),
             };
-            out.push_str(&format!("  {} {} {}\n", prefix, op.entity_type, op.entity_name));
+            out.push_str(&format!("  {} {} {}\n", colored_prefix, op.entity_type, op.entity_name));
             for fc in &op.field_changes {
                 if fc.change_kind == "unchanged" {
                     continue;
@@ -394,16 +410,16 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
                 let line = match fc.change_kind.as_str() {
                     "set" if fc.current.is_none() => {
                         let desired = opt_json_compact(&fc.desired);
-                        format!("      +{}: {}", fc.field_name, desired)
+                        format!("      {}{}: {}", "+".green(), fc.field_name, desired)
                     }
                     "set" => {
                         let current = opt_json_compact(&fc.current);
                         let desired = opt_json_compact(&fc.desired);
-                        format!("      ~{}: {} -> {}", fc.field_name, current, desired)
+                        format!("      {}{}: {} -> {}", "~".yellow(), fc.field_name, current, desired)
                     }
                     "unset" => {
                         let current = opt_json_compact(&fc.current);
-                        format!("      -{}: {}", fc.field_name, current)
+                        format!("      {}{}: {}", "-".red(), fc.field_name, current)
                     }
                     _ => continue,
                 };
@@ -542,14 +558,53 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
             "remove" => changes.push(format!("-{}", op.entity_name)),
             _ => {
                 for fc in &op.field_changes {
-                    let notation = match fc.change_kind.as_str() {
-                        "set" if fc.current.is_none() => format!("+{}", fc.field_name),
-                        "set" => format!("~{}", fc.field_name),
-                        "unset" => format!("-{}", fc.field_name),
-                        _ => continue,
-                    };
-                    if !changes.contains(&notation) {
-                        changes.push(notation);
+                    if fc.change_kind == "unchanged" {
+                        continue;
+                    }
+                    let is_list = fc.current.as_ref().map(|v| v.is_array()).unwrap_or(false)
+                        || fc.desired.as_ref().map(|v| v.is_array()).unwrap_or(false);
+                    if is_list {
+                        let current_items: Vec<&serde_json::Value> = fc
+                            .current
+                            .as_ref()
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().collect())
+                            .unwrap_or_default();
+                        let desired_items: Vec<&serde_json::Value> = fc
+                            .desired
+                            .as_ref()
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().collect())
+                            .unwrap_or_default();
+                        let additions = desired_items
+                            .iter()
+                            .filter(|d| !current_items.contains(d))
+                            .count();
+                        let removals = current_items
+                            .iter()
+                            .filter(|c| !desired_items.contains(c))
+                            .count();
+                        if additions == 0 && removals == 0 {
+                            continue;
+                        }
+                        let notation = match (additions, removals) {
+                            (a, 0) => format!("{}(+{})", fc.field_name, a),
+                            (0, r) => format!("{}(-{})", fc.field_name, r),
+                            (a, r) => format!("{}(+{},-{})", fc.field_name, a, r),
+                        };
+                        if !changes.contains(&notation) {
+                            changes.push(notation);
+                        }
+                    } else {
+                        let notation = match fc.change_kind.as_str() {
+                            "set" if fc.current.is_none() => format!("+{}", fc.field_name),
+                            "set" => format!("~{}", fc.field_name),
+                            "unset" => format!("-{}", fc.field_name),
+                            _ => continue,
+                        };
+                        if !changes.contains(&notation) {
+                            changes.push(notation);
+                        }
                     }
                 }
             }
@@ -566,6 +621,66 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
         let shown = &changes[..3];
         let remaining = changes.len() - 3;
         format!("{}, +{} more", shown.join(", "), remaining)
+    }
+}
+
+fn get_terminal_width() -> usize {
+    use terminal_size::{terminal_size, Width};
+    terminal_size().map(|(Width(w), _)| w as usize).unwrap_or(120)
+}
+
+fn colorize_changes(plain: &str) -> String {
+    if plain == "(none)" || plain == "(no changes)" {
+        return plain.to_string();
+    }
+    let (main, has_ellipsis) = if plain.ends_with("...") && plain.len() > 3 {
+        (&plain[..plain.len() - 3], true)
+    } else {
+        (plain, false)
+    };
+    if main.is_empty() {
+        return if has_ellipsis { "...".to_string() } else { plain.to_string() };
+    }
+    let colored: String = main
+        .split(", ")
+        .map(colorize_change_token)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if has_ellipsis { format!("{}...", colored) } else { colored }
+}
+
+fn colorize_change_token(token: &str) -> String {
+    if token.is_empty() || token.ends_with(" more") {
+        return token.to_string();
+    }
+    match token.chars().next() {
+        Some('+') => token.green().to_string(),
+        Some('-') => token.red().to_string(),
+        Some('~') => token.yellow().to_string(),
+        _ => {
+            // List notation: "field(+N)", "field(-N)", "field(+N,-M)"
+            if let Some(paren_start) = token.find('(') {
+                if token.ends_with(')') {
+                    let field_name = &token[..paren_start];
+                    let inner = &token[paren_start + 1..token.len() - 1];
+                    let parts: String = inner
+                        .split(',')
+                        .map(|p| {
+                            if p.starts_with('+') {
+                                p.green().to_string()
+                            } else if p.starts_with('-') {
+                                p.red().to_string()
+                            } else {
+                                p.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return format!("{}({})", field_name, parts);
+                }
+            }
+            token.to_string()
+        }
     }
 }
 
@@ -1507,5 +1622,264 @@ mod tests {
         assert_eq!(entries.len(), 5, "read_recent(5) on 30-entry journal should return exactly 5");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── filter_entries count without other filters ─────────────────────────────
+
+    /// AC: filter_entries with count=20 and no other filters returns exactly 20 from 30 entries.
+    #[test]
+    fn test_filter_entries_default_count_20_returns_20_from_30_entries_without_filters() {
+        let entries: Vec<JournalEntry> = (0..30).map(|_| make_entry()).collect();
+
+        let args = default_args(); // count=20, no other filters
+        let result = filter_entries(entries, &args).unwrap();
+        assert_eq!(
+            result.len(),
+            20,
+            "filter_entries with count=20 and no filters should return exactly 20 entries"
+        );
+    }
+
+    // ── changes_summary: list field notation ──────────────────────────────────
+
+    /// AC: List field with only additions shows "field(+N)" notation.
+    #[test]
+    fn test_changes_summary_list_field_additions_shows_plus_n_notation() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!([])),
+                desired: Some(serde_json::json!(["10.0.0.1/24", "10.0.0.2/24"])),
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert!(
+            result.contains("addresses(+2)"),
+            "list field with 2 added items should show 'addresses(+2)', got: {}",
+            result
+        );
+    }
+
+    /// AC: List field with only removals shows "field(-N)" notation.
+    #[test]
+    fn test_changes_summary_list_field_removals_shows_minus_n_notation() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!(["10.0.0.1/24"])),
+                desired: Some(serde_json::json!([])),
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert!(
+            result.contains("addresses(-1)"),
+            "list field with 1 removed item should show 'addresses(-1)', got: {}",
+            result
+        );
+    }
+
+    /// AC: List field with both additions and removals shows "field(+N,-M)" notation.
+    #[test]
+    fn test_changes_summary_list_field_additions_and_removals_shows_combined_notation() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!(["192.168.1.1/24"])),
+                desired: Some(serde_json::json!(["10.0.0.1/24", "10.0.0.2/24"])),
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert!(
+            result.contains("addresses(+2,-1)"),
+            "list field with 2 added and 1 removed should show 'addresses(+2,-1)', got: {}",
+            result
+        );
+    }
+
+    /// AC: List field with no changes (same content) produces "(no changes)".
+    #[test]
+    fn test_changes_summary_list_field_unchanged_content_produces_no_changes() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!(["10.0.0.1/24"])),
+                desired: Some(serde_json::json!(["10.0.0.1/24"])),
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert_eq!(
+            result, "(no changes)",
+            "list field with identical current and desired should produce '(no changes)'"
+        );
+    }
+
+    // ── format_text_detail: empty diff ────────────────────────────────────────
+
+    /// AC: Detail output with empty diff shows "(no changes)" in the Diff section.
+    #[test]
+    fn test_format_text_detail_empty_diff_shows_no_changes() {
+        let entry = make_entry(); // diff has empty operations
+        let output = format_text_detail(&entry);
+        assert!(
+            output.contains("Diff:"),
+            "detail output should always contain 'Diff:' section"
+        );
+        assert!(
+            output.contains("(no changes)"),
+            "detail output with empty diff should show '(no changes)'"
+        );
+    }
+
+    // ── format_text_detail: no active policies ────────────────────────────────
+
+    /// AC: Detail output with no active policies does not show "Active policies:" section.
+    #[test]
+    fn test_format_text_detail_no_active_policies_omits_policies_section() {
+        let entry = make_entry(); // active_policies is empty
+        let output = format_text_detail(&entry);
+        assert!(
+            !output.contains("Active policies:"),
+            "detail output with no active policies should not show 'Active policies:' section"
+        );
+    }
+
+    // ── format_text_list: row data correctness ────────────────────────────────
+
+    /// AC: Each row in the text list shows the trigger display name.
+    #[test]
+    fn test_format_text_list_row_shows_trigger_display_name() {
+        let mut entry = make_entry();
+        entry.seq = 1;
+        entry.trigger = Trigger::ExternalChange { changed_entities: vec![] };
+        let output = format_text_list(&[entry]);
+        let data_row = output.lines().nth(1).unwrap();
+        assert!(
+            data_row.contains("external"),
+            "data row should show trigger display name 'external', got: {}",
+            data_row
+        );
+    }
+
+    /// AC: Each row in the text list shows the entity name from the diff.
+    #[test]
+    fn test_format_text_list_row_shows_entity_name_from_diff() {
+        let entry = make_entry_with_entity("eth0");
+        let output = format_text_list(&[entry]);
+        let data_row = output.lines().nth(1).unwrap();
+        assert!(
+            data_row.contains("eth0"),
+            "data row should show entity name 'eth0', got: {}",
+            data_row
+        );
+    }
+
+    /// AC: Each row in the text list shows the outcome description.
+    #[test]
+    fn test_format_text_list_row_shows_outcome_description() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 2, failed: 0, skipped: 0 };
+        let output = format_text_list(&[entry]);
+        let data_row = output.lines().nth(1).unwrap();
+        assert!(
+            data_row.contains("applied"),
+            "data row should show outcome 'applied', got: {}",
+            data_row
+        );
+    }
+
+    // ── journal_dir_path ──────────────────────────────────────────────────────
+
+    /// AC: journal_dir_path returns the NETFYR_JOURNAL_DIR env var value when set.
+    #[test]
+    fn test_journal_dir_path_returns_netfyr_journal_dir_env_var_when_set() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", "/custom/journal/path") };
+        let path = journal_dir_path();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+        assert_eq!(
+            path, "/custom/journal/path",
+            "journal_dir_path should return the NETFYR_JOURNAL_DIR env var value"
+        );
+    }
+
+    /// AC: journal_dir_path returns default "/var/lib/netfyr/journal" when env var is not set.
+    #[test]
+    fn test_journal_dir_path_returns_default_when_env_var_not_set() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+        let path = journal_dir_path();
+        assert_eq!(
+            path, "/var/lib/netfyr/journal",
+            "journal_dir_path should default to '/var/lib/netfyr/journal'"
+        );
+    }
+
+    // ── changes_summary: mixed entity add/remove ──────────────────────────────
+
+    /// AC: Mix of add and remove entity ops shows individual "+name" and "-name" tokens.
+    #[test]
+    fn test_changes_summary_mixed_add_and_remove_entity_ops_shows_individual_tokens() {
+        let ops = vec![
+            SerializableDiffOp {
+                kind: "add".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth2".to_string(),
+                field_changes: vec![],
+            },
+            SerializableDiffOp {
+                kind: "remove".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth3".to_string(),
+                field_changes: vec![],
+            },
+        ];
+        let result = changes_summary(&ops);
+        assert!(
+            result.contains("+eth2"),
+            "mixed add/remove should show '+eth2', got: {}",
+            result
+        );
+        assert!(
+            result.contains("-eth3"),
+            "mixed add/remove should show '-eth3', got: {}",
+            result
+        );
+    }
+
+    // ── parse_since: edge cases ───────────────────────────────────────────────
+
+    /// AC: --since 0s is valid and returns approximately now.
+    #[test]
+    fn test_parse_since_0s_is_valid_and_returns_approximately_now() {
+        let before = Utc::now();
+        let result = parse_since("0s").unwrap();
+        let after = Utc::now();
+        assert!(
+            result >= before - Duration::seconds(1) && result <= after + Duration::seconds(1),
+            "parse_since(\"0s\") should return approximately now"
+        );
+    }
+
+    /// AC: --since with empty string returns an error.
+    #[test]
+    fn test_parse_since_empty_string_returns_error() {
+        assert!(parse_since("").is_err(), "empty string should return error");
     }
 }

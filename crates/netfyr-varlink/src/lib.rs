@@ -61,8 +61,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            method_count, 4,
-            "Interface must define exactly 4 methods (SubmitPolicies, Query, DryRun, GetStatus), found {method_count}"
+            method_count, 7,
+            "Interface must define exactly 7 methods (SubmitPolicies, Query, DryRun, GetStatus, GetHistory, GetJournalEntry, Revert), found {method_count}"
         );
     }
 

@@ -8,6 +8,12 @@ method DryRun(policies: []Policy) -> (diff: StateDiff)
 
 method GetStatus() -> (status: DaemonStatus)
 
+method GetHistory(count: ?int, since: ?string, trigger: ?string, selector_name: ?string) -> (entries: []object)
+
+method GetJournalEntry(seq: int) -> (entry: ?object)
+
+method Revert(target_seq: int, dry_run: bool) -> (report: ApplyReport, entry_timestamp: string)
+
 type Policy (
     name: string,
     factory: string,
@@ -96,3 +102,4 @@ type FactoryStatus (
 error InvalidPolicy (reason: string)
 error BackendError (reason: string)
 error InternalError (reason: string)
+error EntryNotFound (reason: string)
