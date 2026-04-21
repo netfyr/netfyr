@@ -175,6 +175,40 @@ fn append_examples(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, ".fi")?;
             writeln!(buf, ".RE")?;
         }
+        Some("history") => {
+            writeln!(buf, "Show the 10 most recent history entries:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr history -n 10")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, "Show changes from the last hour triggered by policy apply:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr history --since 1h --trigger apply")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+        }
+        Some("revert") => {
+            writeln!(buf, "Revert to the state recorded in journal entry 42:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr revert 42")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, "Preview what a revert would change without applying:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr revert --dry-run 42")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+        }
         Some(other) => {
             // Fallback for any future subcommands.
             writeln!(buf, "See")?;
@@ -193,6 +227,8 @@ fn append_see_also(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             // Top-level page — reference all subcommand and supplementary pages.
             writeln!(buf, ".BR netfyr-apply (1),")?;
             writeln!(buf, ".BR netfyr-query (1),")?;
+            writeln!(buf, ".BR netfyr-history (1),")?;
+            writeln!(buf, ".BR netfyr-revert (1),")?;
             writeln!(buf, ".BR netfyr-examples (7),")?;
             writeln!(buf, r".BR netfyr.yaml (5)")?;
         }
@@ -977,5 +1013,446 @@ mod tests {
             lower.contains("hand") || lower.contains("maintained") || lower.contains("do not"),
             "man/netfyr.yaml.5 should include a comment noting it is maintained by hand"
         );
+    }
+
+    // ── Generated man page file existence ─────────────────────────────────────
+
+    fn read_generated_man_page(name: &str) -> String {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir.join("../man").join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read man/{name} (run `cargo xtask man` first): {e}"))
+    }
+
+    fn man_page_path_exists(name: &str) -> bool {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir.join("../man").join(name).exists()
+    }
+
+    /// AC: Generate all man pages — netfyr.1 must exist.
+    #[test]
+    fn test_generated_netfyr_1_exists() {
+        assert!(man_page_path_exists("netfyr.1"), "man/netfyr.1 must exist (run `cargo xtask man`)");
+    }
+
+    /// AC: Generate all man pages — netfyr-apply.1 must exist.
+    #[test]
+    fn test_generated_netfyr_apply_1_exists() {
+        assert!(man_page_path_exists("netfyr-apply.1"), "man/netfyr-apply.1 must exist");
+    }
+
+    /// AC: Generate all man pages — netfyr-query.1 must exist.
+    #[test]
+    fn test_generated_netfyr_query_1_exists() {
+        assert!(man_page_path_exists("netfyr-query.1"), "man/netfyr-query.1 must exist");
+    }
+
+    /// AC: Generate all man pages — netfyr-history.1 must exist.
+    #[test]
+    fn test_generated_netfyr_history_1_exists() {
+        assert!(man_page_path_exists("netfyr-history.1"), "man/netfyr-history.1 must exist");
+    }
+
+    /// AC: Generate all man pages — netfyr-revert.1 must exist.
+    #[test]
+    fn test_generated_netfyr_revert_1_exists() {
+        assert!(man_page_path_exists("netfyr-revert.1"), "man/netfyr-revert.1 must exist");
+    }
+
+    // ── Top-level netfyr.1 content ────────────────────────────────────────────
+
+    /// AC: Top-level man page lists all subcommands — DESCRIPTION mentions apply.
+    #[test]
+    fn test_netfyr_1_description_mentions_apply() {
+        let content = read_generated_man_page("netfyr.1");
+        let desc_start = content.find(".SH DESCRIPTION").expect("DESCRIPTION section must exist in netfyr.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr.1");
+        let desc = &content[desc_start..options_start];
+        assert!(desc.contains("apply"), "netfyr.1 DESCRIPTION must mention the apply subcommand");
+    }
+
+    /// AC: Top-level man page lists all subcommands — DESCRIPTION mentions query.
+    #[test]
+    fn test_netfyr_1_description_mentions_query() {
+        let content = read_generated_man_page("netfyr.1");
+        let desc_start = content.find(".SH DESCRIPTION").expect("DESCRIPTION section must exist in netfyr.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr.1");
+        let desc = &content[desc_start..options_start];
+        assert!(desc.contains("query"), "netfyr.1 DESCRIPTION must mention the query subcommand");
+    }
+
+    /// AC: Top-level SEE ALSO references all subcommand man pages.
+    #[test]
+    fn test_netfyr_1_see_also_references_all_subcommands() {
+        let content = read_generated_man_page("netfyr.1");
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist in netfyr.1");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-apply"),
+            "netfyr.1 SEE ALSO must reference netfyr-apply"
+        );
+        assert!(
+            see_also.contains("netfyr-query"),
+            "netfyr.1 SEE ALSO must reference netfyr-query"
+        );
+        assert!(
+            see_also.contains("netfyr-history"),
+            "netfyr.1 SEE ALSO must reference netfyr-history"
+        );
+        assert!(
+            see_also.contains("netfyr-revert"),
+            "netfyr.1 SEE ALSO must reference netfyr-revert"
+        );
+    }
+
+    // ── netfyr-apply.1 OPTIONS ────────────────────────────────────────────────
+
+    /// AC: netfyr-apply.1 OPTIONS lists --dry-run.
+    #[test]
+    fn test_netfyr_apply_1_options_lists_dry_run() {
+        let content = read_generated_man_page("netfyr-apply.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr-apply.1");
+        let next_section = content[options_start + 1..]
+            .find("\n.SH ")
+            .map(|i| options_start + 1 + i)
+            .unwrap_or(content.len());
+        let options = &content[options_start..next_section];
+        assert!(
+            options.contains("dry-run") || options.contains("dry\\-run"),
+            "netfyr-apply.1 OPTIONS must list --dry-run; OPTIONS section:\n{options}"
+        );
+    }
+
+    /// AC: netfyr-apply.1 OPTIONS documents the <path> positional argument.
+    #[test]
+    fn test_netfyr_apply_1_options_documents_paths_argument() {
+        let content = read_generated_man_page("netfyr-apply.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr-apply.1");
+        let next_section = content[options_start + 1..]
+            .find("\n.SH ")
+            .map(|i| options_start + 1 + i)
+            .unwrap_or(content.len());
+        let options = &content[options_start..next_section];
+        // clap_mangen renders positional args with their metavar in angle brackets
+        assert!(
+            options.contains("PATH") || options.contains("path"),
+            "netfyr-apply.1 OPTIONS must document the paths positional argument; OPTIONS:\n{options}"
+        );
+    }
+
+    // ── netfyr-apply.1 required sections ─────────────────────────────────────
+
+    /// AC: netfyr-apply.1 EXIT STATUS documents codes 0, 1, and 2.
+    #[test]
+    fn test_netfyr_apply_1_exit_status_documents_all_codes() {
+        let content = read_generated_man_page("netfyr-apply.1");
+        let es_start = content.find("EXIT STATUS").expect("EXIT STATUS section must exist in netfyr-apply.1");
+        let es = &content[es_start..];
+        assert!(es.contains(".B 0") || es.contains("\\fB0\\fR"), "netfyr-apply.1 EXIT STATUS must document code 0");
+        assert!(es.contains(".B 1") || es.contains("\\fB1\\fR"), "netfyr-apply.1 EXIT STATUS must document code 1");
+        assert!(es.contains(".B 2") || es.contains("\\fB2\\fR"), "netfyr-apply.1 EXIT STATUS must document code 2");
+    }
+
+    /// AC: netfyr-apply.1 EXAMPLES contains at least two usage examples.
+    #[test]
+    fn test_netfyr_apply_1_examples_has_at_least_two_examples() {
+        let content = read_generated_man_page("netfyr-apply.1");
+        let ex_start = content.find(".SH EXAMPLES").expect("EXAMPLES section must exist in netfyr-apply.1");
+        let ex = &content[ex_start..];
+        let nf_count = ex.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "netfyr-apply.1 EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
+    /// AC: netfyr-apply.1 FILES section lists /etc/netfyr/policies/.
+    #[test]
+    fn test_netfyr_apply_1_files_lists_etc_netfyr_policies() {
+        let content = read_generated_man_page("netfyr-apply.1");
+        let files_start = content.find(".SH FILES").expect("FILES section must exist in netfyr-apply.1");
+        let files = &content[files_start..];
+        assert!(
+            files.contains("/etc/netfyr/policies/"),
+            "netfyr-apply.1 FILES must list /etc/netfyr/policies/"
+        );
+    }
+
+    /// AC: netfyr-apply.1 SEE ALSO references netfyr(1), netfyr-query(1), and netfyr.yaml(5).
+    #[test]
+    fn test_netfyr_apply_1_see_also_cross_references() {
+        let content = read_generated_man_page("netfyr-apply.1");
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist in netfyr-apply.1");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr (1)") || see_also.contains("netfyr(1)"),
+            "netfyr-apply.1 SEE ALSO must reference netfyr(1)"
+        );
+        assert!(
+            see_also.contains("netfyr-query") && (see_also.contains("(1)") || see_also.contains(" 1)")),
+            "netfyr-apply.1 SEE ALSO must reference netfyr-query(1)"
+        );
+        assert!(
+            see_also.contains("netfyr.yaml") && (see_also.contains("(5)") || see_also.contains(" 5)")),
+            "netfyr-apply.1 SEE ALSO must reference netfyr.yaml(5)"
+        );
+    }
+
+    // ── All generated section 1 pages have required sections ─────────────────
+
+    /// AC: All subcommand pages include EXIT STATUS, FILES, EXAMPLES, SEE ALSO.
+    #[test]
+    fn test_all_subcommand_pages_have_required_sections() {
+        let pages = ["netfyr-apply.1", "netfyr-query.1", "netfyr-history.1", "netfyr-revert.1"];
+        for page in pages {
+            let content = read_generated_man_page(page);
+            assert!(content.contains("EXIT STATUS"), "{page} must contain EXIT STATUS section");
+            assert!(content.contains(".SH FILES"), "{page} must contain FILES section");
+            assert!(content.contains(".SH EXAMPLES"), "{page} must contain EXAMPLES section");
+            assert!(content.contains("SEE ALSO"), "{page} must contain SEE ALSO section");
+        }
+    }
+
+    /// AC: netfyr-history.1 OPTIONS lists --count/-n and --since flags.
+    #[test]
+    fn test_netfyr_history_1_options_lists_key_flags() {
+        let content = read_generated_man_page("netfyr-history.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr-history.1");
+        let options = &content[options_start..];
+        assert!(
+            options.contains("since"),
+            "netfyr-history.1 OPTIONS must list --since"
+        );
+        assert!(
+            options.contains("count") || options.contains("-n"),
+            "netfyr-history.1 OPTIONS must list --count/-n"
+        );
+    }
+
+    /// AC: netfyr-revert.1 OPTIONS lists --dry-run.
+    #[test]
+    fn test_netfyr_revert_1_options_lists_dry_run() {
+        let content = read_generated_man_page("netfyr-revert.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr-revert.1");
+        let options = &content[options_start..];
+        assert!(
+            options.contains("dry-run") || options.contains("dry\\-run"),
+            "netfyr-revert.1 OPTIONS must list --dry-run"
+        );
+    }
+
+    // ── netfyr-examples.7 existence and content ───────────────────────────────
+
+    fn read_examples_man_page() -> String {
+        read_generated_man_page("netfyr-examples.7")
+    }
+
+    /// AC: Examples man page exists.
+    #[test]
+    fn test_examples_7_exists() {
+        assert!(man_page_path_exists("netfyr-examples.7"), "man/netfyr-examples.7 must exist");
+    }
+
+    /// AC: Examples man page NAME section contains "netfyr-examples".
+    #[test]
+    fn test_examples_7_name_section_contains_netfyr_examples() {
+        let content = read_examples_man_page();
+        assert!(content.contains(".SH NAME"), "man/netfyr-examples.7 must have a NAME section");
+        let name_start = content.find(".SH NAME").unwrap();
+        let after_name = content[name_start..].find("\n.SH").map(|i| name_start + i).unwrap_or(content.len());
+        let name_section = &content[name_start..after_name];
+        assert!(
+            name_section.contains("netfyr") && name_section.contains("examples"),
+            "NAME section must identify this as the netfyr-examples page; got:\n{name_section}"
+        );
+    }
+
+    /// AC: Examples man page TH header declares section 7.
+    #[test]
+    fn test_examples_7_is_section_7() {
+        let content = read_examples_man_page();
+        assert!(
+            content.contains(".TH") && content.contains(" 7 "),
+            "man/netfyr-examples.7 header (.TH) must declare section 7"
+        );
+    }
+
+    /// AC: Examples man page is hand-maintained (contains the required comment).
+    #[test]
+    fn test_examples_7_has_hand_maintained_marker() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("hand") || lower.contains("maintained") || lower.contains("do not"),
+            "man/netfyr-examples.7 must include a comment noting it is maintained by hand"
+        );
+    }
+
+    /// AC: Examples man page covers "Static IP on a single interface" scenario.
+    #[test]
+    fn test_examples_7_has_static_ip_section() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("static ip") || lower.contains("static"),
+            "man/netfyr-examples.7 must include a static IP example scenario"
+        );
+        // The static IP example should show the type, name, and addresses fields
+        assert!(
+            content.contains("type: ethernet"),
+            "static IP example must include 'type: ethernet'"
+        );
+        assert!(
+            content.contains("addresses"),
+            "static IP example must include 'addresses' field"
+        );
+    }
+
+    /// AC: Examples man page covers "Multiple interfaces in one file" scenario.
+    #[test]
+    fn test_examples_7_has_multiple_interfaces_section() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("multiple") || lower.contains("multi"),
+            "man/netfyr-examples.7 must include a multiple-interfaces scenario"
+        );
+        // Should show the YAML document separator
+        assert!(
+            content.contains("---"),
+            "multiple-interfaces example must include the YAML '---' document separator"
+        );
+    }
+
+    /// AC: Examples man page covers "DHCP on an interface" scenario.
+    #[test]
+    fn test_examples_7_has_dhcp_section() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("dhcp"),
+            "man/netfyr-examples.7 must include a DHCP scenario"
+        );
+        assert!(
+            content.contains("factory: dhcpv4") || content.contains("dhcpv4"),
+            "DHCP example must show dhcpv4 factory"
+        );
+    }
+
+    /// AC: Examples man page covers "Mixed static and DHCP" scenario.
+    #[test]
+    fn test_examples_7_has_mixed_static_dhcp_section() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("mixed") || (lower.contains("static") && lower.contains("dhcp")),
+            "man/netfyr-examples.7 must include a mixed static-and-DHCP scenario"
+        );
+    }
+
+    /// AC: Examples man page covers "Priority override" scenario.
+    #[test]
+    fn test_examples_7_has_priority_override_section() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("priority"),
+            "man/netfyr-examples.7 must include a priority override scenario"
+        );
+        assert!(
+            content.contains("priority: 200") || content.contains("priority: 100"),
+            "priority override example must show concrete priority values"
+        );
+    }
+
+    /// AC: Examples man page covers "Selecting by driver" scenario.
+    #[test]
+    fn test_examples_7_has_selecting_by_driver_section() {
+        let content = read_examples_man_page();
+        let lower = content.to_lowercase();
+        assert!(
+            lower.contains("driver"),
+            "man/netfyr-examples.7 must include a selecting-by-driver scenario"
+        );
+        assert!(
+            content.contains("driver: ixgbe") || content.contains("driver:"),
+            "driver example must show a concrete driver selector"
+        );
+    }
+
+    /// AC: Examples man page covers "Dry-run workflow" scenario.
+    #[test]
+    fn test_examples_7_has_dry_run_workflow_section() {
+        let content = read_examples_man_page();
+        assert!(
+            content.contains("dry") || content.contains("dry\\-run"),
+            "man/netfyr-examples.7 must include a dry-run workflow scenario"
+        );
+    }
+
+    /// AC: Each scenario section in examples.7 contains a copy-pasteable YAML example (.nf block).
+    #[test]
+    fn test_examples_7_sections_have_yaml_examples() {
+        let content = read_examples_man_page();
+        let nf_count = content.matches(".nf").count();
+        // The spec requires at least 7 distinct scenarios, each with a YAML block.
+        // Some scenarios (mixed, priority) have multiple files so more than 7 .nf blocks.
+        assert!(
+            nf_count >= 7,
+            "man/netfyr-examples.7 must have at least 7 YAML example (.nf) blocks (one per scenario); found {nf_count}"
+        );
+    }
+
+    /// AC: examples.7 SEE ALSO references the main netfyr man pages.
+    #[test]
+    fn test_examples_7_see_also_references_main_pages() {
+        let content = read_examples_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist in netfyr-examples.7");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr") && (see_also.contains("(1)") || see_also.contains(" 1)")),
+            "netfyr-examples.7 SEE ALSO must reference netfyr(1)"
+        );
+        assert!(
+            see_also.contains("netfyr.yaml") && (see_also.contains("(5)") || see_also.contains(" 5)")),
+            "netfyr-examples.7 SEE ALSO must reference netfyr.yaml(5)"
+        );
+    }
+
+    // ── Idempotency and non-overwrite ─────────────────────────────────────────
+
+    /// AC: Regeneration is idempotent — running cargo xtask man twice produces identical output.
+    /// AC: examples.7 is not overwritten by generate_man_pages().
+    #[test]
+    fn test_regeneration_is_idempotent_and_does_not_overwrite_examples_7() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let man_dir = manifest_dir.join("../man");
+
+        let read_file = |name: &str| -> String {
+            std::fs::read_to_string(man_dir.join(name))
+                .unwrap_or_else(|e| panic!("Failed to read man/{name}: {e}"))
+        };
+
+        // Capture state after first generation (the files already exist from `cargo xtask man`).
+        let before: Vec<(&str, String)> = vec![
+            ("netfyr.1", read_file("netfyr.1")),
+            ("netfyr-apply.1", read_file("netfyr-apply.1")),
+            ("netfyr-query.1", read_file("netfyr-query.1")),
+            ("netfyr-history.1", read_file("netfyr-history.1")),
+            ("netfyr-revert.1", read_file("netfyr-revert.1")),
+            ("netfyr-examples.7", read_file("netfyr-examples.7")),
+        ];
+
+        // Run generation a second time.
+        generate_man_pages().expect("generate_man_pages must succeed on second invocation");
+
+        // Verify all files are identical.
+        for (name, before_content) in &before {
+            let after_content = read_file(name);
+            assert_eq!(
+                *before_content, after_content,
+                "man/{name} must be identical after second `cargo xtask man` run (idempotency)"
+            );
+        }
     }
 }

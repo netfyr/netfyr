@@ -41,9 +41,21 @@ Default directory for policy files.
 .I /var/lib/netfyr/
 State directory for persistent daemon data.
 .SH EXAMPLES
-See
-.BR netfyr-revert (1)
-for usage details.
+Revert to the state recorded in journal entry 42:
+.PP
+.RS 4
+.nf
+netfyr revert 42
+.fi
+.RE
+.PP
+Preview what a revert would change without applying:
+.PP
+.RS 4
+.nf
+netfyr revert --dry-run 42
+.fi
+.RE
 .SH "SEE ALSO"
 .BR netfyr (1),
 .BR netfyr-apply (1),

@@ -61,9 +61,21 @@ Default directory for policy files.
 .I /var/lib/netfyr/
 State directory for persistent daemon data.
 .SH EXAMPLES
-See
-.BR netfyr-history (1)
-for usage details.
+Show the 10 most recent history entries:
+.PP
+.RS 4
+.nf
+netfyr history -n 10
+.fi
+.RE
+.PP
+Show changes from the last hour triggered by policy apply:
+.PP
+.RS 4
+.nf
+netfyr history --since 1h --trigger apply
+.fi
+.RE
 .SH "SEE ALSO"
 .BR netfyr (1),
 .BR netfyr-apply (1),
