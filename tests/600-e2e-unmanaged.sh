@@ -34,7 +34,7 @@ netns_setup "$@"
 
 TMPDIR_TEST=$(mktemp -d)
 DAEMON_PID=""
-trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
+trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
 
 SOCKET_PATH="$TMPDIR_TEST/netfyr.sock"
 POLICY_DIR="$TMPDIR_TEST/policies"
