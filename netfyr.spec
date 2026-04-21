@@ -56,6 +56,8 @@ install -d %{buildroot}%{_mandir}/man5
 install -pm 0644 man/netfyr.yaml.5 %{buildroot}%{_mandir}/man5/
 install -d %{buildroot}%{_mandir}/man7
 install -pm 0644 man/netfyr-examples.7 %{buildroot}%{_mandir}/man7/
+install -d %{buildroot}%{_mandir}/man8
+install -pm 0644 man/netfyr-daemon.8 %{buildroot}%{_mandir}/man8/
 
 # Install systemd units
 install -Dpm 0644 dist/systemd/netfyr.service %{buildroot}%{_unitdir}/netfyr.service
@@ -102,6 +104,7 @@ target/release/netfyr-daemon --help > /dev/null
 %files daemon
 %license LICENSE
 %{_bindir}/netfyr-daemon
+%{_mandir}/man8/netfyr-daemon.8*
 %{_unitdir}/netfyr.service
 %{_unitdir}/netfyr.socket
 
