@@ -9,6 +9,7 @@
 //! - Success:  `{"parameters": {...}}\0`
 //! - Error:    `{"error": "io.netfyr.ErrorName", "parameters": {"reason": "..."}}\0`
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -24,6 +25,7 @@ use tokio::signal::unix::SignalKind;
 use tracing::{debug, error, info, warn};
 
 use crate::factory_manager::FactoryManager;
+use crate::netlink_monitor::NetlinkMonitor;
 use crate::policy_store::PolicyStore;
 use crate::reconciler::Reconciler;
 
@@ -141,7 +143,9 @@ async fn handle_submit_policies(
         _ => {}
     }
 
-    // Reconcile and apply.
+    // Reconcile and apply. Flag is set so the netlink monitor discards
+    // self-generated notifications produced by this apply.
+    reconciler.set_applying(true);
     let apply_result = match reconciler
         .reconcile_and_apply(
             policy_store,
@@ -152,10 +156,12 @@ async fn handle_submit_policies(
     {
         Ok(r) => r,
         Err(e) => {
+            reconciler.set_applying(false);
             error!("Reconciliation failed: {}", e);
             return write_error(stream, "InternalError", &e.to_string()).await;
         }
     };
+    reconciler.set_applying(false);
 
     let varlink_report =
         convert_apply_report_with_conflicts(apply_result.report, &apply_result.conflicts);
@@ -523,10 +529,12 @@ async fn handle_connection(
 
 /// Start the Varlink server and run the main event loop.
 ///
-/// Binds a `UnixListener` at `socket_path` and multiplexes two event sources
-/// using `tokio::select!`:
+/// Binds a `UnixListener` at `socket_path` and multiplexes five event sources:
 /// 1. Incoming Varlink connections — processed to completion before looping.
 /// 2. Factory events (DHCP lease changes) — trigger reconciliation.
+/// 3. SIGTERM signal — graceful shutdown.
+/// 4. SIGINT / Ctrl-C — graceful shutdown.
+/// 5. Netlink monitor — external network state changes recorded in the journal.
 ///
 /// Returns when SIGTERM or SIGINT is received. Removes the socket file and
 /// calls `factory_manager.stop_all()` before returning.
@@ -549,6 +557,24 @@ pub async fn serve_varlink(
 
     info!("Varlink server listening on {}", socket_path);
 
+    // Start the netlink monitor. A failure here is non-fatal — the daemon
+    // continues operating without external change detection.
+    let mut netlink_monitor: Option<NetlinkMonitor> = match NetlinkMonitor::start().await {
+        Ok(m) => {
+            debug!("Netlink monitor started");
+            Some(m)
+        }
+        Err(e) => {
+            warn!("Failed to start netlink monitor (external change detection disabled): {}", e);
+            None
+        }
+    };
+
+    // Track which entity names are covered by the current effective policy set.
+    // Only events for these entities are recorded as external changes.
+    let mut managed_entities: HashSet<String> =
+        reconciler.managed_entity_names(&policy_store, &factory_manager);
+
     // Set up SIGTERM signal handler.
     let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
 
@@ -567,6 +593,9 @@ pub async fn serve_varlink(
                             start_time,
                         )
                         .await;
+                        // Refresh managed entities after potential SubmitPolicies.
+                        managed_entities =
+                            reconciler.managed_entity_names(&policy_store, &factory_manager);
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);
@@ -579,6 +608,7 @@ pub async fn serve_varlink(
                 match event {
                     FactoryEvent::LeaseAcquired { ref policy_name, .. } => {
                         info!(policy = %policy_name, "DHCP lease acquired; re-reconciling");
+                        reconciler.set_applying(true);
                         if let Err(e) = reconciler
                             .reconcile_and_apply(
                                 &policy_store,
@@ -592,9 +622,13 @@ pub async fn serve_varlink(
                         {
                             error!("Reconciliation after lease acquisition failed: {}", e);
                         }
+                        reconciler.set_applying(false);
+                        managed_entities =
+                            reconciler.managed_entity_names(&policy_store, &factory_manager);
                     }
                     FactoryEvent::LeaseRenewed { ref policy_name, .. } => {
                         debug!(policy = %policy_name, "DHCP lease renewed; re-reconciling");
+                        reconciler.set_applying(true);
                         if let Err(e) = reconciler
                             .reconcile_and_apply(
                                 &policy_store,
@@ -608,9 +642,13 @@ pub async fn serve_varlink(
                         {
                             error!("Reconciliation after lease renewal failed: {}", e);
                         }
+                        reconciler.set_applying(false);
+                        managed_entities =
+                            reconciler.managed_entity_names(&policy_store, &factory_manager);
                     }
                     FactoryEvent::LeaseExpired { ref policy_name } => {
                         info!(policy = %policy_name, "DHCP lease expired; re-reconciling");
+                        reconciler.set_applying(true);
                         if let Err(e) = reconciler
                             .reconcile_and_apply(
                                 &policy_store,
@@ -624,6 +662,9 @@ pub async fn serve_varlink(
                         {
                             error!("Reconciliation after lease expiry failed: {}", e);
                         }
+                        reconciler.set_applying(false);
+                        managed_entities =
+                            reconciler.managed_entity_names(&policy_store, &factory_manager);
                     }
                     FactoryEvent::Error { ref policy_name, ref error } => {
                         warn!(policy = %policy_name, error = %error, "DHCP factory error");
@@ -642,10 +683,45 @@ pub async fn serve_varlink(
                 info!("Received SIGINT, shutting down...");
                 break;
             }
+
+            // ── Branch 5: external network state change ───────────────────────
+            result = async {
+                match netlink_monitor.as_mut() {
+                    Some(m) => m.next_change().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(changes) = result {
+                    // Discard notifications produced by our own apply cycles.
+                    if !reconciler.is_applying() {
+                        let changed_names: Vec<String> = {
+                            let mut seen: HashSet<String> = HashSet::new();
+                            changes
+                                .into_iter()
+                                .filter_map(|c| c.ifname)
+                                .filter(|name| managed_entities.contains(name))
+                                .filter(|name| seen.insert(name.clone()))
+                                .collect()
+                        };
+                        if !changed_names.is_empty() {
+                            if let Err(e) = reconciler
+                                .record_external_change(changed_names, &policy_store)
+                                .await
+                            {
+                                error!("Failed to record external change: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    // Graceful shutdown: release all DHCP leases.
+    // Graceful shutdown: stop the netlink monitor, then release DHCP leases.
+    if let Some(monitor) = netlink_monitor.take() {
+        monitor.stop().await;
+    }
+
     info!("Releasing DHCP leases...");
     if let Err(e) = factory_manager.stop_all().await {
         error!("Error during factory shutdown: {}", e);

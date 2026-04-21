@@ -13,6 +13,7 @@
 
 pub mod policy_store;
 mod factory_manager;
+mod netlink_monitor;
 mod reconciler;
 mod server;
 

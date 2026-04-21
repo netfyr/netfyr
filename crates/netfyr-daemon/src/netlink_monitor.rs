@@ -1,0 +1,727 @@
+//! Netlink monitor for external network state change detection.
+//!
+//! Subscribes to RTNLGRP_LINK (link attribute changes) and
+//! RTNLGRP_IPV4_IFADDR (address additions/removals) multicast groups and
+//! emits debounced change notifications to the daemon's event loop.
+//!
+//! Message parsing uses raw byte offsets against the fixed-size Linux kernel
+//! structs (nlmsghdr, ifinfomsg, ifaddrmsg, nlattr) rather than importing an
+//! additional parsing crate. These layouts are stable ABI and documented in
+//! linux/netlink.h and linux/rtnetlink.h.
+
+use std::collections::HashMap;
+
+use anyhow::Result;
+use netlink_sys::{protocols::NETLINK_ROUTE, Socket};
+use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep_until, Duration, Instant};
+use tracing::{debug, error, warn};
+
+// ── Netlink multicast groups ──────────────────────────────────────────────────
+
+const RTNLGRP_LINK: u32 = 1;
+const RTNLGRP_IPV4_IFADDR: u32 = 5;
+
+// ── RTnetlink message types (from linux/rtnetlink.h) ─────────────────────────
+
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
+
+// ── Attribute types ───────────────────────────────────────────────────────────
+
+const IFLA_IFNAME: u16 = 3;
+
+// ── Fixed-size struct layouts (bytes) ────────────────────────────────────────
+
+const NLMSG_HDR_LEN: usize = 16; // sizeof(struct nlmsghdr)
+const IFINFOMSG_LEN: usize = 16; // sizeof(struct ifinfomsg)
+const IFADDRMSG_LEN: usize = 8; // sizeof(struct ifaddrmsg)
+
+// ── Tuning constants ──────────────────────────────────────────────────────────
+
+const DEBOUNCE_MS: u64 = 500;
+const RECV_BUF_CAPACITY: usize = 65536;
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// Classifies the kind of netlink notification received.
+#[derive(Debug, Clone)]
+pub enum ChangeKind {
+    /// A link attribute changed (MTU, operstate, flags, etc.).
+    LinkChanged,
+    /// An IPv4 address was added to an interface.
+    AddressAdded,
+    /// An IPv4 address was removed from an interface.
+    AddressRemoved,
+}
+
+/// A single parsed netlink change notification.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct NetlinkChange {
+    /// The kernel interface index.
+    pub ifindex: u32,
+    /// The interface name, if determinable from this message or cache.
+    pub ifname: Option<String>,
+    /// What kind of change was observed.
+    pub kind: ChangeKind,
+}
+
+// ── NetlinkMonitor ────────────────────────────────────────────────────────────
+
+/// Monitors the kernel's netlink route multicast groups and emits coalesced
+/// change notifications after a 500 ms debounce window.
+pub struct NetlinkMonitor {
+    /// Receives debounced batches of changes from the background task.
+    change_rx: mpsc::Receiver<Vec<NetlinkChange>>,
+    /// Handle to the background monitoring task.
+    task: JoinHandle<()>,
+}
+
+impl NetlinkMonitor {
+    /// Open a netlink socket, subscribe to link and address groups, and start
+    /// the background monitoring task.
+    pub async fn start() -> Result<Self> {
+        let mut socket = Socket::new(NETLINK_ROUTE)
+            .map_err(|e| anyhow::anyhow!("Failed to create netlink monitor socket: {}", e))?;
+
+        socket
+            .bind_auto()
+            .map_err(|e| anyhow::anyhow!("Failed to bind netlink monitor socket: {}", e))?;
+
+        // Subscribe to multicast groups before setting non-blocking so that
+        // any buffered notifications are visible immediately on first read.
+        socket
+            .add_membership(RTNLGRP_LINK)
+            .map_err(|e| anyhow::anyhow!("Failed to join RTNLGRP_LINK: {}", e))?;
+        socket
+            .add_membership(RTNLGRP_IPV4_IFADDR)
+            .map_err(|e| anyhow::anyhow!("Failed to join RTNLGRP_IPV4_IFADDR: {}", e))?;
+
+        socket
+            .set_non_blocking(true)
+            .map_err(|e| anyhow::anyhow!("Failed to set socket non-blocking: {}", e))?;
+
+        // Larger receive buffer reduces risk of ENOBUFS under heavy event load.
+        let _ = socket.set_rx_buf_sz(1024u32 * 1024);
+
+        let async_fd = AsyncFd::new(socket).map_err(|e| {
+            anyhow::anyhow!("Failed to create AsyncFd for netlink monitor socket: {}", e)
+        })?;
+
+        let (tx, rx) = mpsc::channel(32);
+        let task = tokio::spawn(monitor_task(async_fd, tx));
+
+        Ok(Self {
+            change_rx: rx,
+            task,
+        })
+    }
+
+    /// Wait for the next coalesced batch of change notifications.
+    ///
+    /// Returns `None` when the monitor task has exited.
+    pub async fn next_change(&mut self) -> Option<Vec<NetlinkChange>> {
+        self.change_rx.recv().await
+    }
+
+    /// Shut down the monitor and release the netlink socket.
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+// ── Background task ───────────────────────────────────────────────────────────
+
+async fn monitor_task(async_fd: AsyncFd<Socket>, tx: mpsc::Sender<Vec<NetlinkChange>>) {
+    // Pending changes keyed by ifindex: (best-known ifname, accumulated kinds).
+    let mut pending: HashMap<u32, (Option<String>, Vec<ChangeKind>)> = HashMap::new();
+    // Cache ifindex → ifname populated from RTM_NEWLINK messages, used to
+    // resolve the ifname for RTM_NEWADDR/RTM_DELADDR messages that omit it.
+    let mut name_cache: HashMap<u32, String> = HashMap::new();
+
+    // "Far future" sentinel means no pending debounce timer.
+    let far_future = Instant::now() + Duration::from_secs(365 * 24 * 3600);
+    let mut debounce_deadline = far_future;
+    let mut has_pending = false;
+
+    loop {
+        tokio::select! {
+            // biased: check debounce timer first to prevent starvation under
+            // high event rates.
+            biased;
+
+            _ = sleep_until(debounce_deadline), if has_pending => {
+                has_pending = false;
+                debounce_deadline = far_future;
+
+                let changes: Vec<NetlinkChange> = pending
+                    .drain()
+                    .flat_map(|(ifindex, (ifname, kinds))| {
+                        // Deduplicate: emit at most one entry per ChangeKind variant
+                        // per interface per debounce window.
+                        let mut unique: Vec<ChangeKind> = Vec::new();
+                        for k in kinds {
+                            if !unique.iter().any(|u| kind_eq(u, &k)) {
+                                unique.push(k);
+                            }
+                        }
+                        let ifname = ifname.clone();
+                        unique.into_iter().map(move |kind| NetlinkChange {
+                            ifindex,
+                            ifname: ifname.clone(),
+                            kind,
+                        })
+                    })
+                    .collect();
+
+                if !changes.is_empty()
+                    && tx.send(changes).await.is_err()
+                {
+                    debug!("Netlink monitor: receiver dropped, stopping");
+                    break;
+                }
+            }
+
+            guard_result = async_fd.readable() => {
+                let mut guard = match guard_result {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("Netlink monitor: AsyncFd error: {}", e);
+                        break;
+                    }
+                };
+
+                // Vec<u8> implements bytes::BufMut (via the `bytes` crate which is
+                // a transitive dependency through netlink-sys). We pass it here
+                // without importing `bytes` directly — the compiler resolves the
+                // generic bound from the transitive impl.
+                let io_result = guard.try_io(|inner| {
+                    let mut buf = Vec::with_capacity(RECV_BUF_CAPACITY);
+                    inner.get_ref().recv_from(&mut buf, 0).map(|(_n, _addr)| buf)
+                });
+
+                match io_result {
+                    Ok(Ok(data)) => {
+                        process_buffer(
+                            &data,
+                            &mut pending,
+                            &mut name_cache,
+                            &mut has_pending,
+                            &mut debounce_deadline,
+                        );
+                    }
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Ok(Err(e)) => {
+                        warn!("Netlink monitor: recv error: {}", e);
+                    }
+                    Err(_would_block) => {}
+                }
+            }
+        }
+    }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn kind_eq(a: &ChangeKind, b: &ChangeKind) -> bool {
+    matches!(
+        (a, b),
+        (ChangeKind::LinkChanged, ChangeKind::LinkChanged)
+            | (ChangeKind::AddressAdded, ChangeKind::AddressAdded)
+            | (ChangeKind::AddressRemoved, ChangeKind::AddressRemoved)
+    )
+}
+
+/// Process a raw receive buffer that may contain one or more netlink messages.
+fn process_buffer(
+    data: &[u8],
+    pending: &mut HashMap<u32, (Option<String>, Vec<ChangeKind>)>,
+    name_cache: &mut HashMap<u32, String>,
+    has_pending: &mut bool,
+    debounce_deadline: &mut Instant,
+) {
+    let debounce_duration = Duration::from_millis(DEBOUNCE_MS);
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let buf = &data[offset..];
+        if buf.len() < NLMSG_HDR_LEN {
+            break;
+        }
+
+        // struct nlmsghdr: nlmsg_len(u32) nlmsg_type(u16) nlmsg_flags(u16)
+        //                  nlmsg_seq(u32) nlmsg_pid(u32)
+        let nlmsg_len = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if nlmsg_len < NLMSG_HDR_LEN || nlmsg_len > buf.len() {
+            break;
+        }
+
+        let nlmsg_type = u16::from_ne_bytes([buf[4], buf[5]]);
+        let msg_buf = &buf[..nlmsg_len];
+
+        if let Some((ifindex, ifname, kind)) = parse_message(nlmsg_type, msg_buf) {
+            if let Some(ref name) = ifname {
+                name_cache.insert(ifindex, name.clone());
+            }
+            let resolved_name = ifname.or_else(|| name_cache.get(&ifindex).cloned());
+
+            let entry = pending
+                .entry(ifindex)
+                .or_insert((resolved_name.clone(), Vec::new()));
+            if entry.0.is_none() {
+                entry.0 = resolved_name;
+            }
+            entry.1.push(kind);
+
+            // Reset debounce timer on every event (sliding-window debounce).
+            *debounce_deadline = Instant::now() + debounce_duration;
+            *has_pending = true;
+        }
+
+        // Each message is 4-byte aligned in the buffer.
+        let aligned = (nlmsg_len + 3) & !3;
+        offset += aligned.max(NLMSG_HDR_LEN);
+    }
+}
+
+/// Dispatch to the appropriate parser based on message type.
+fn parse_message(nlmsg_type: u16, buf: &[u8]) -> Option<(u32, Option<String>, ChangeKind)> {
+    match nlmsg_type {
+        RTM_NEWLINK | RTM_DELLINK => {
+            let (ifindex, ifname) = parse_link_message(buf)?;
+            Some((ifindex, ifname, ChangeKind::LinkChanged))
+        }
+        RTM_NEWADDR => {
+            let ifindex = parse_addr_message(buf)?;
+            Some((ifindex, None, ChangeKind::AddressAdded))
+        }
+        RTM_DELADDR => {
+            let ifindex = parse_addr_message(buf)?;
+            Some((ifindex, None, ChangeKind::AddressRemoved))
+        }
+        _ => None,
+    }
+}
+
+/// Extract ifindex and IFLA_IFNAME from a RTM_NEWLINK or RTM_DELLINK message.
+///
+/// struct ifinfomsg layout:
+///   ifi_family  u8  (AF_UNSPEC = 0)
+///   ifi_pad     u8
+///   ifi_type    u16 (ARPHRD_*)
+///   ifi_index   i32 (interface index)
+///   ifi_flags   u32
+///   ifi_change  u32
+fn parse_link_message(buf: &[u8]) -> Option<(u32, Option<String>)> {
+    if buf.len() < NLMSG_HDR_LEN + IFINFOMSG_LEN {
+        return None;
+    }
+    let index_off = NLMSG_HDR_LEN + 4; // skip ifi_family(1) + ifi_pad(1) + ifi_type(2)
+    let ifi_index = i32::from_ne_bytes([
+        buf[index_off],
+        buf[index_off + 1],
+        buf[index_off + 2],
+        buf[index_off + 3],
+    ]);
+    if ifi_index <= 0 {
+        return None;
+    }
+    let ifname = parse_nlattr_string(buf, NLMSG_HDR_LEN + IFINFOMSG_LEN, IFLA_IFNAME);
+    Some((ifi_index as u32, ifname))
+}
+
+/// Extract ifindex from a RTM_NEWADDR or RTM_DELADDR message.
+///
+/// struct ifaddrmsg layout:
+///   ifa_family     u8
+///   ifa_prefixlen  u8
+///   ifa_flags      u8
+///   ifa_scope      u8
+///   ifa_index      u32
+fn parse_addr_message(buf: &[u8]) -> Option<u32> {
+    if buf.len() < NLMSG_HDR_LEN + IFADDRMSG_LEN {
+        return None;
+    }
+    let index_off = NLMSG_HDR_LEN + 4; // skip ifa_family(1) + ifa_prefixlen(1) + ifa_flags(1) + ifa_scope(1)
+    Some(u32::from_ne_bytes([
+        buf[index_off],
+        buf[index_off + 1],
+        buf[index_off + 2],
+        buf[index_off + 3],
+    ]))
+}
+
+/// Scan netlink attributes starting at `start`, returning the value of the
+/// first attribute with `target_type` as a UTF-8 string (NUL stripped).
+///
+/// struct nlattr: nla_len(u16) nla_type(u16) data[nla_len - 4]
+/// Attributes are 4-byte aligned.
+fn parse_nlattr_string(buf: &[u8], start: usize, target_type: u16) -> Option<String> {
+    let mut pos = start;
+    while pos + 4 <= buf.len() {
+        let nla_len = u16::from_ne_bytes([buf[pos], buf[pos + 1]]) as usize;
+        let nla_type = u16::from_ne_bytes([buf[pos + 2], buf[pos + 3]]);
+        if nla_len < 4 {
+            break;
+        }
+        let data_end = pos + nla_len;
+        if data_end > buf.len() {
+            break;
+        }
+        if nla_type == target_type {
+            let data = &buf[pos + 4..data_end];
+            let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            return String::from_utf8(data[..end].to_vec()).ok();
+        }
+        let aligned = (nla_len + 3) & !3;
+        pos += aligned.max(4);
+    }
+    None
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── Test message builders ──────────────────────────────────────────────────
+
+    /// Build a minimal valid RTM_NEWLINK buffer with the given ifindex and ifname.
+    ///
+    /// Layout: nlmsghdr(16) + ifinfomsg(16) + nlattr IFLA_IFNAME(4 + name + NUL, aligned)
+    fn build_link_msg(msg_type: u16, ifindex: i32, ifname: &str) -> Vec<u8> {
+        let name_bytes = ifname.as_bytes();
+        let attr_data_len = name_bytes.len() + 1; // +1 for NUL
+        let attr_len = 4 + attr_data_len; // nla_len(2) + nla_type(2) + data
+        let attr_len_aligned = (attr_len + 3) & !3;
+        let msg_len = NLMSG_HDR_LEN + IFINFOMSG_LEN + attr_len_aligned;
+        let mut buf = vec![0u8; msg_len];
+
+        // nlmsghdr
+        buf[0..4].copy_from_slice(&(msg_len as u32).to_ne_bytes()); // nlmsg_len
+        buf[4..6].copy_from_slice(&msg_type.to_ne_bytes()); // nlmsg_type
+
+        // ifinfomsg: ifi_family(1)+ifi_pad(1)+ifi_type(2)+ifi_index(4)+ifi_flags(4)+ifi_change(4)
+        let index_off = NLMSG_HDR_LEN + 4; // skip ifi_family+ifi_pad+ifi_type
+        buf[index_off..index_off + 4].copy_from_slice(&ifindex.to_ne_bytes());
+
+        // nlattr IFLA_IFNAME
+        let attr_off = NLMSG_HDR_LEN + IFINFOMSG_LEN;
+        buf[attr_off..attr_off + 2].copy_from_slice(&(attr_len as u16).to_ne_bytes()); // nla_len
+        buf[attr_off + 2..attr_off + 4].copy_from_slice(&IFLA_IFNAME.to_ne_bytes()); // nla_type
+        buf[attr_off + 4..attr_off + 4 + name_bytes.len()].copy_from_slice(name_bytes);
+        // NUL terminator already zero from vec![0u8; msg_len]
+
+        buf
+    }
+
+    /// Build a minimal RTM_NEWADDR or RTM_DELADDR buffer with the given ifindex.
+    ///
+    /// Layout: nlmsghdr(16) + ifaddrmsg(8)
+    fn build_addr_msg(msg_type: u16, ifindex: u32) -> Vec<u8> {
+        let msg_len = NLMSG_HDR_LEN + IFADDRMSG_LEN;
+        let mut buf = vec![0u8; msg_len];
+
+        // nlmsghdr
+        buf[0..4].copy_from_slice(&(msg_len as u32).to_ne_bytes());
+        buf[4..6].copy_from_slice(&msg_type.to_ne_bytes());
+
+        // ifaddrmsg: ifa_family(1)+ifa_prefixlen(1)+ifa_flags(1)+ifa_scope(1)+ifa_index(4)
+        let index_off = NLMSG_HDR_LEN + 4;
+        buf[index_off..index_off + 4].copy_from_slice(&ifindex.to_ne_bytes());
+
+        buf
+    }
+
+    /// A debounce deadline far in the future — used to assert the deadline was
+    /// moved closer (i.e., reset to ~500ms from now) after an event.
+    fn far_future() -> Instant {
+        Instant::now() + Duration::from_secs(365 * 24 * 3600)
+    }
+
+    fn empty_state() -> (
+        HashMap<u32, (Option<String>, Vec<ChangeKind>)>,
+        HashMap<u32, String>,
+        bool,
+        Instant,
+    ) {
+        (HashMap::new(), HashMap::new(), false, far_future())
+    }
+
+    // ── AC: ChangeKind variants ────────────────────────────────────────────────
+
+    /// AC: ChangeKind::LinkChanged represents a link attribute change.
+    #[test]
+    fn test_change_kind_link_changed_variant_exists() {
+        assert!(matches!(ChangeKind::LinkChanged, ChangeKind::LinkChanged));
+    }
+
+    /// AC: ChangeKind::AddressAdded represents IPv4 address addition.
+    #[test]
+    fn test_change_kind_address_added_variant_exists() {
+        assert!(matches!(ChangeKind::AddressAdded, ChangeKind::AddressAdded));
+    }
+
+    /// AC: ChangeKind::AddressRemoved represents IPv4 address removal.
+    #[test]
+    fn test_change_kind_address_removed_variant_exists() {
+        assert!(matches!(ChangeKind::AddressRemoved, ChangeKind::AddressRemoved));
+    }
+
+    // ── AC: kind_eq deduplication helper ──────────────────────────────────────
+
+    /// AC: kind_eq returns true for matching variants.
+    #[test]
+    fn test_kind_eq_same_variants_are_equal() {
+        assert!(kind_eq(&ChangeKind::LinkChanged, &ChangeKind::LinkChanged));
+        assert!(kind_eq(&ChangeKind::AddressAdded, &ChangeKind::AddressAdded));
+        assert!(kind_eq(&ChangeKind::AddressRemoved, &ChangeKind::AddressRemoved));
+    }
+
+    /// AC: kind_eq returns false for distinct variants.
+    #[test]
+    fn test_kind_eq_different_variants_are_not_equal() {
+        assert!(!kind_eq(&ChangeKind::LinkChanged, &ChangeKind::AddressAdded));
+        assert!(!kind_eq(&ChangeKind::AddressAdded, &ChangeKind::AddressRemoved));
+        assert!(!kind_eq(&ChangeKind::AddressRemoved, &ChangeKind::LinkChanged));
+    }
+
+    // ── AC: process_buffer — edge cases ───────────────────────────────────────
+
+    /// AC: Empty buffer does not set has_pending or add pending entries.
+    #[test]
+    fn test_process_buffer_with_empty_data_is_no_op() {
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&[], &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert!(!has_pending, "empty buffer must not set has_pending");
+        assert!(pending.is_empty(), "empty buffer must not produce pending entries");
+    }
+
+    /// AC: Truncated buffer (shorter than nlmsghdr) is ignored without panic.
+    #[test]
+    fn test_process_buffer_with_truncated_header_is_no_op() {
+        let buf = [0u8; 8]; // shorter than NLMSG_HDR_LEN (16)
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert!(!has_pending);
+        assert!(pending.is_empty());
+    }
+
+    /// AC: Unknown message type is silently ignored.
+    #[test]
+    fn test_process_buffer_ignores_unknown_message_type() {
+        let unknown_type: u16 = 9999;
+        let msg_len = NLMSG_HDR_LEN + IFINFOMSG_LEN;
+        let mut buf = vec![0u8; msg_len];
+        buf[0..4].copy_from_slice(&(msg_len as u32).to_ne_bytes());
+        buf[4..6].copy_from_slice(&unknown_type.to_ne_bytes());
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert!(!has_pending, "unknown message type must not set has_pending");
+        assert!(pending.is_empty());
+    }
+
+    // ── AC: Monitor detects link attribute changes (RTM_NEWLINK) ──────────────
+
+    /// AC: RTM_NEWLINK sets has_pending.
+    #[test]
+    fn test_process_buffer_rtm_newlink_sets_has_pending() {
+        let buf = build_link_msg(RTM_NEWLINK, 5, "eth0");
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert!(has_pending, "RTM_NEWLINK must set has_pending = true");
+    }
+
+    /// AC: RTM_NEWLINK correctly extracts ifindex and ifname.
+    #[test]
+    fn test_process_buffer_rtm_newlink_extracts_ifindex_and_ifname() {
+        let buf = build_link_msg(RTM_NEWLINK, 5, "eth0");
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(pending.contains_key(&5), "pending must contain ifindex 5");
+        let (ifname, kinds) = &pending[&5];
+        assert_eq!(ifname.as_deref(), Some("eth0"), "ifname must be eth0");
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::LinkChanged)),
+            "kind must be LinkChanged"
+        );
+    }
+
+    /// AC: RTM_DELLINK also produces LinkChanged (link deletion is a link change).
+    #[test]
+    fn test_process_buffer_rtm_dellink_produces_link_changed() {
+        let buf = build_link_msg(RTM_DELLINK, 3, "eth0");
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending);
+        assert!(pending.contains_key(&3));
+        let (_, kinds) = &pending[&3];
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::LinkChanged)));
+    }
+
+    // ── AC: Monitor detects address additions (RTM_NEWADDR) ───────────────────
+
+    /// AC: RTM_NEWADDR produces AddressAdded kind.
+    #[test]
+    fn test_process_buffer_rtm_newaddr_produces_address_added() {
+        let buf = build_addr_msg(RTM_NEWADDR, 7);
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending);
+        assert!(pending.contains_key(&7));
+        let (_, kinds) = &pending[&7];
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::AddressAdded)),
+            "RTM_NEWADDR must produce AddressAdded"
+        );
+    }
+
+    // ── AC: Monitor detects address removals (RTM_DELADDR) ────────────────────
+
+    /// AC: RTM_DELADDR produces AddressRemoved kind.
+    #[test]
+    fn test_process_buffer_rtm_deladdr_produces_address_removed() {
+        let buf = build_addr_msg(RTM_DELADDR, 8);
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending);
+        assert!(pending.contains_key(&8));
+        let (_, kinds) = &pending[&8];
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::AddressRemoved)),
+            "RTM_DELADDR must produce AddressRemoved"
+        );
+    }
+
+    // ── AC: Name cache resolves ifname for address messages ───────────────────
+
+    /// AC: RTM_NEWLINK populates the name cache.
+    #[test]
+    fn test_rtm_newlink_populates_name_cache() {
+        let buf = build_link_msg(RTM_NEWLINK, 9, "eth1");
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert_eq!(
+            cache.get(&9).map(String::as_str),
+            Some("eth1"),
+            "name cache must map ifindex 9 → eth1"
+        );
+    }
+
+    /// AC: The name cache resolves ifname for RTM_NEWADDR messages that lack IFLA_IFNAME.
+    #[test]
+    fn test_name_cache_resolves_ifname_for_subsequent_addr_messages() {
+        // NEWLINK populates cache, then NEWADDR uses it.
+        let mut buf = build_link_msg(RTM_NEWLINK, 9, "eth1");
+        buf.extend(build_addr_msg(RTM_NEWADDR, 9));
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        let (ifname, _) = &pending[&9];
+        assert_eq!(
+            ifname.as_deref(),
+            Some("eth1"),
+            "addr message ifname must be resolved from name cache"
+        );
+    }
+
+    // ── AC: Burst changes are coalesced ───────────────────────────────────────
+
+    /// AC: Multiple RTM_NEWLINK messages for the same ifindex accumulate in one pending entry.
+    #[test]
+    fn test_process_buffer_coalesces_multiple_newlink_for_same_ifindex() {
+        let msg1 = build_link_msg(RTM_NEWLINK, 3, "veth0");
+        let msg2 = build_link_msg(RTM_NEWLINK, 3, "veth0");
+        let mut buf = msg1;
+        buf.extend(msg2);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert_eq!(pending.len(), 1, "two events for the same ifindex must produce 1 pending entry");
+        assert!(pending.contains_key(&3));
+    }
+
+    /// AC: Events for different ifindexes produce separate pending entries.
+    #[test]
+    fn test_process_buffer_accumulates_different_ifindexes_separately() {
+        let msg1 = build_link_msg(RTM_NEWLINK, 1, "veth0");
+        let msg2 = build_link_msg(RTM_NEWLINK, 2, "veth1");
+        let mut buf = msg1;
+        buf.extend(msg2);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert_eq!(pending.len(), 2, "events for distinct ifindexes must produce separate pending entries");
+        assert!(pending.contains_key(&1));
+        assert!(pending.contains_key(&2));
+    }
+
+    /// AC: An addr message and a link message for the same ifindex accumulate in one entry.
+    #[test]
+    fn test_process_buffer_link_and_addr_same_ifindex_single_pending_entry() {
+        let link_msg = build_link_msg(RTM_NEWLINK, 4, "veth0");
+        let addr_msg = build_addr_msg(RTM_NEWADDR, 4);
+        let mut buf = link_msg;
+        buf.extend(addr_msg);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert_eq!(pending.len(), 1, "link and addr for same ifindex must share one pending entry");
+        let (_, kinds) = &pending[&4];
+        // Both LinkChanged and AddressAdded should be present
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::LinkChanged)));
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::AddressAdded)));
+    }
+
+    // ── AC: Debounce deadline is set when events arrive ────────────────────────
+
+    /// AC: process_buffer resets the debounce deadline to ~500ms from now on receipt.
+    #[test]
+    fn test_process_buffer_sets_debounce_deadline_when_event_arrives() {
+        let buf = build_link_msg(RTM_NEWLINK, 5, "eth0");
+        let (mut pending, mut cache, mut has_pending, mut _old_deadline) = empty_state();
+        let far = far_future();
+        let mut deadline = far;
+
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(
+            deadline < far,
+            "debounce deadline must be reset to ~DEBOUNCE_MS from now, not far future"
+        );
+        // The deadline should be within ~600ms from now (DEBOUNCE_MS + small margin).
+        assert!(
+            deadline <= Instant::now() + Duration::from_millis(DEBOUNCE_MS + 100),
+            "debounce deadline should be within ~600ms from now"
+        );
+    }
+
+    /// AC: Debounce deadline is NOT changed for an empty or unrecognized buffer.
+    #[test]
+    fn test_process_buffer_does_not_reset_deadline_for_unrecognized_messages() {
+        let far = far_future();
+        let mut deadline = far;
+        let (mut pending, mut cache, mut has_pending, _) = empty_state();
+
+        process_buffer(&[], &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert_eq!(deadline, far, "unrecognized buffer must not change the debounce deadline");
+    }
+}

@@ -1018,6 +1018,7 @@ dependencies = [
  "netfyr-test-utils",
  "netfyr-varlink",
  "netlink-packet-route",
+ "netlink-sys",
  "rtnetlink",
  "sd-notify",
  "serde",

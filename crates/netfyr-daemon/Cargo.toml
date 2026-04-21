@@ -32,6 +32,11 @@ sd-notify = "0.4"
 # tracing-subscriber: formats tracing events to stderr/stdout for the daemon process
 tracing-subscriber = "0.3"
 
+# netlink-sys: raw netlink socket with multicast group subscription (RTNLGRP_LINK,
+# RTNLGRP_IPV4_IFADDR) for the external change monitor. Already in the lockfile
+# as a transitive dep of rtnetlink 0.20; pinning here makes it a direct dep.
+netlink-sys = "0.8"
+
 [dev-dependencies]
 # tempfile: creates temporary directories for unit tests
 tempfile = "3"

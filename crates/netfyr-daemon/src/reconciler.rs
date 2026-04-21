@@ -5,13 +5,14 @@
 //! the Varlink request handler and the factory event handler without locking.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use netfyr_backend::{ApplyReport, BackendRegistry, NetlinkBackend};
 use netfyr_journal::{
-    summarize_policies, ApplyOutcome, Journal, JournalEntry, SerializableDiff, SerializableStateSet,
-    Trigger,
+    summarize_policies, ApplyOutcome, Journal, JournalEntry, SerializableDiff,
+    SerializableDiffOp, SerializableFieldChange, SerializableState, SerializableStateSet, Trigger,
 };
 use netfyr_policy::{FactoryType, StaticFactory, StateFactory};
 use netfyr_reconcile::{
@@ -39,6 +40,9 @@ pub struct Reconciler {
     backend_registry: BackendRegistry,
     schema_registry: SchemaRegistry,
     journal: Mutex<Option<Journal>>,
+    /// Set to `true` while `reconcile_and_apply` is running so the netlink
+    /// monitor can suppress self-generated change notifications.
+    is_applying: Arc<AtomicBool>,
 }
 
 impl Reconciler {
@@ -65,7 +69,174 @@ impl Reconciler {
             backend_registry: registry,
             schema_registry: SchemaRegistry::default(),
             journal: Mutex::new(journal),
+            is_applying: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Signal that a reconcile-and-apply cycle is in progress.
+    ///
+    /// The netlink monitor checks this flag to discard self-generated events.
+    pub fn set_applying(&self, applying: bool) {
+        self.is_applying.store(applying, Ordering::SeqCst);
+    }
+
+    /// Returns `true` while a reconcile-and-apply cycle is in progress.
+    pub fn is_applying(&self) -> bool {
+        self.is_applying.load(Ordering::SeqCst)
+    }
+
+    /// Return the set of entity selector keys (interface names) covered by the
+    /// current effective policy set. Used by the netlink monitor to filter
+    /// events for unmanaged interfaces.
+    pub fn managed_entity_names(
+        &self,
+        policy_store: &PolicyStore,
+        factory_manager: &FactoryManager,
+    ) -> HashSet<String> {
+        self.build_policy_inputs(policy_store, factory_manager)
+            .into_iter()
+            .flat_map(|input| {
+                input
+                    .state_set
+                    .entities()
+                    .into_iter()
+                    .map(|(_entity_type, selector_key)| selector_key)
+            })
+            .collect()
+    }
+
+    /// Query the backend for each named entity, compare against the last known
+    /// journal snapshot, and append an `ExternalChange` journal entry if any
+    /// fields actually differ.
+    ///
+    /// Returns immediately (no-op) when the journal is unavailable.
+    pub async fn record_external_change(
+        &self,
+        changed_entity_names: Vec<String>,
+        policy_store: &PolicyStore,
+    ) -> anyhow::Result<()> {
+        // Query current state for each entity before locking the journal.
+        // The backend queries are async and must not hold the journal mutex.
+        let mut current_states: std::collections::HashMap<String, netfyr_state::State> =
+            std::collections::HashMap::new();
+
+        for entity_name in &changed_entity_names {
+            let selector = Selector::with_name(entity_name);
+            match self
+                .backend_registry
+                .query(&"ethernet".to_string(), Some(&selector))
+                .await
+            {
+                Ok(state_set) => {
+                    if let Some(state) = state_set.get("ethernet", entity_name) {
+                        current_states.insert(entity_name.clone(), state.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entity = %entity_name,
+                        error = %e,
+                        "Failed to query current state for external change detection"
+                    );
+                }
+            }
+        }
+
+        if current_states.is_empty() {
+            return Ok(());
+        }
+
+        // Lock journal and compute per-entity diffs.
+        let mut guard = match self.journal.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Journal mutex poisoned: {}", e);
+                return Ok(());
+            }
+        };
+
+        let journal = match guard.as_mut() {
+            Some(j) => j,
+            None => return Ok(()),
+        };
+
+        let mut diff_ops: Vec<SerializableDiffOp> = Vec::new();
+        let mut state_after_entities: Vec<SerializableState> = Vec::new();
+        let mut changed: Vec<String> = Vec::new();
+
+        for (entity_name, current_state) in &current_states {
+            let last_state = match journal.latest_state_for(entity_name) {
+                Ok(Some(s)) => s,
+                Ok(None) => continue, // No prior snapshot; entity may be unmanaged
+                Err(e) => {
+                    tracing::warn!(
+                        entity = %entity_name,
+                        error = %e,
+                        "Failed to read journal snapshot for external change"
+                    );
+                    continue;
+                }
+            };
+
+            let field_changes = compute_external_field_changes(&last_state, current_state);
+            if field_changes.is_empty() {
+                continue; // State matches journal snapshot; spurious event
+            }
+
+            // Build state_after entry for this entity.
+            let mut obj = serde_json::Map::new();
+            for (k, fv) in &current_state.fields {
+                let json_val =
+                    serde_json::to_value(&fv.value).unwrap_or(serde_json::Value::Null);
+                obj.insert(k.clone(), json_val);
+            }
+            state_after_entities.push(SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: entity_name.clone(),
+                fields: serde_json::Value::Object(obj),
+            });
+
+            diff_ops.push(SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: entity_name.clone(),
+                field_changes,
+            });
+
+            changed.push(entity_name.clone());
+        }
+
+        if changed.is_empty() {
+            return Ok(());
+        }
+
+        let entry = JournalEntry {
+            seq: 0,
+            timestamp: chrono::Utc::now(),
+            trigger: Trigger::ExternalChange {
+                changed_entities: changed.clone(),
+            },
+            active_policies: summarize_policies(policy_store.policies()),
+            diff: SerializableDiff { operations: diff_ops },
+            state_after: SerializableStateSet {
+                entities: state_after_entities,
+            },
+            outcome: ApplyOutcome::Observed,
+        };
+
+        if let Err(e) = journal.append(entry) {
+            tracing::warn!(
+                error = %e,
+                "Failed to write external change journal entry"
+            );
+        } else {
+            tracing::info!(
+                entities = %changed.join(", "),
+                "External change detected"
+            );
+        }
+
+        Ok(())
     }
 
     /// Run full reconciliation and apply the resulting diff to the system.
@@ -286,6 +457,61 @@ impl Reconciler {
     }
 }
 
+// ── External diff helpers ─────────────────────────────────────────────────────
+
+/// Compare a journal snapshot against the current queried state and produce a
+/// list of field-level changes. Fields that match are omitted; fields that
+/// differ, were added, or were removed each produce one entry.
+fn compute_external_field_changes(
+    last: &SerializableState,
+    current: &netfyr_state::State,
+) -> Vec<SerializableFieldChange> {
+    let mut changes = Vec::new();
+
+    // Fields present in the current (live) state.
+    for (field_name, fv) in &current.fields {
+        let current_json = serde_json::to_value(&fv.value).unwrap_or(serde_json::Value::Null);
+        match last.fields.get(field_name) {
+            Some(last_val) if last_val == &current_json => {
+                // Unchanged — skip.
+            }
+            Some(last_val) => {
+                changes.push(SerializableFieldChange {
+                    field_name: field_name.clone(),
+                    change_kind: "set".to_string(),
+                    current: Some(last_val.clone()), // old value (from journal)
+                    desired: Some(current_json),     // new value (from system)
+                });
+            }
+            None => {
+                // Field appeared since the last snapshot.
+                changes.push(SerializableFieldChange {
+                    field_name: field_name.clone(),
+                    change_kind: "set".to_string(),
+                    current: None,
+                    desired: Some(current_json),
+                });
+            }
+        }
+    }
+
+    // Fields present in the last snapshot but absent from the current state.
+    if let Some(last_obj) = last.fields.as_object() {
+        for (field_name, last_val) in last_obj {
+            if !current.fields.contains_key(field_name) {
+                changes.push(SerializableFieldChange {
+                    field_name: field_name.clone(),
+                    change_kind: "unset".to_string(),
+                    current: Some(last_val.clone()),
+                    desired: None,
+                });
+            }
+        }
+    }
+
+    changes
+}
+
 // ── Reconciler tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -458,6 +684,170 @@ mod tests {
             before.len(),
             after.len(),
             "dry_run must not change the number of system entities"
+        );
+    }
+
+    // ── Feature: is_applying flag (AC: Self-changes are excluded) ─────────────
+
+    /// AC: is_applying defaults to false — the flag must start in a clean state.
+    #[test]
+    fn test_is_applying_defaults_to_false() {
+        let reconciler = Reconciler::new();
+        assert!(!reconciler.is_applying(), "is_applying must be false on initialization");
+    }
+
+    /// AC: set_applying(true) makes is_applying return true.
+    #[test]
+    fn test_set_applying_true_makes_is_applying_return_true() {
+        let reconciler = Reconciler::new();
+        reconciler.set_applying(true);
+        assert!(
+            reconciler.is_applying(),
+            "is_applying must be true after set_applying(true)"
+        );
+    }
+
+    /// AC: set_applying(false) after set_applying(true) resets the flag.
+    #[test]
+    fn test_set_applying_false_resets_is_applying_to_false() {
+        let reconciler = Reconciler::new();
+        reconciler.set_applying(true);
+        reconciler.set_applying(false);
+        assert!(
+            !reconciler.is_applying(),
+            "is_applying must be false after set_applying(false)"
+        );
+    }
+
+    /// AC: The applying flag can be toggled repeatedly without corruption.
+    #[test]
+    fn test_set_applying_flag_can_be_toggled_repeatedly() {
+        let reconciler = Reconciler::new();
+        for _ in 0..5 {
+            reconciler.set_applying(true);
+            assert!(reconciler.is_applying());
+            reconciler.set_applying(false);
+            assert!(!reconciler.is_applying());
+        }
+    }
+
+    // ── Feature: managed_entity_names (AC: Monitor ignores unmanaged) ─────────
+
+    /// AC: No policies → managed_entity_names returns empty set.
+    #[test]
+    fn test_managed_entity_names_returns_empty_for_no_policies() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let fm = FactoryManager::new();
+        let names = reconciler.managed_entity_names(&store, &fm);
+        assert!(
+            names.is_empty(),
+            "no policies → managed entity names must be empty"
+        );
+    }
+
+    /// AC: A static policy for an interface → that interface appears in managed names.
+    #[test]
+    fn test_managed_entity_names_includes_policy_target_interface() {
+        use netfyr_policy::parse_policy_yaml;
+        let reconciler = Reconciler::new();
+        let yaml = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
+                    state:\n  type: ethernet\n  name: managed-iface0\n  mtu: 1400\n";
+        let policies = parse_policy_yaml(yaml).unwrap();
+        let store = PolicyStore::ephemeral(policies);
+        let fm = FactoryManager::new();
+        let names = reconciler.managed_entity_names(&store, &fm);
+        assert!(
+            names.contains("managed-iface0"),
+            "managed entity names must include the policy target interface"
+        );
+    }
+
+    /// AC: Interfaces not covered by any policy are absent from managed names.
+    #[test]
+    fn test_managed_entity_names_excludes_non_policy_interfaces() {
+        use netfyr_policy::parse_policy_yaml;
+        let reconciler = Reconciler::new();
+        let yaml = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
+                    state:\n  type: ethernet\n  name: managed-iface0\n  mtu: 1400\n";
+        let policies = parse_policy_yaml(yaml).unwrap();
+        let store = PolicyStore::ephemeral(policies);
+        let fm = FactoryManager::new();
+        let names = reconciler.managed_entity_names(&store, &fm);
+        assert!(
+            !names.contains("unmanaged-iface1"),
+            "unmanaged-iface1 must not appear in managed entity names"
+        );
+    }
+
+    /// AC: Multiple policies → all their targets appear in managed names.
+    #[test]
+    fn test_managed_entity_names_includes_all_policy_targets() {
+        use netfyr_policy::parse_policy_yaml;
+        let reconciler = Reconciler::new();
+        let yaml = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
+                    state:\n  type: ethernet\n  name: iface-a\n  mtu: 1400\n\
+                    ---\nkind: policy\nname: p2\nfactory: static\npriority: 100\n\
+                    state:\n  type: ethernet\n  name: iface-b\n  mtu: 1500\n";
+        let policies = parse_policy_yaml(yaml).unwrap();
+        let store = PolicyStore::ephemeral(policies);
+        let fm = FactoryManager::new();
+        let names = reconciler.managed_entity_names(&store, &fm);
+        assert!(names.contains("iface-a"), "iface-a must be in managed names");
+        assert!(names.contains("iface-b"), "iface-b must be in managed names");
+    }
+
+    // ── Feature: record_external_change ───────────────────────────────────────
+
+    /// AC: record_external_change with an empty entity list returns Ok immediately.
+    #[tokio::test]
+    async fn test_record_external_change_with_empty_entity_list_returns_ok() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let result = reconciler.record_external_change(vec![], &store).await;
+        assert!(
+            result.is_ok(),
+            "record_external_change with empty list must return Ok: {:?}",
+            result.err()
+        );
+    }
+
+    /// AC: record_external_change for a nonexistent interface returns Ok without panicking.
+    ///
+    /// When the backend cannot find the interface, no journal entry is written and
+    /// the function returns Ok (graceful degradation).
+    #[tokio::test]
+    async fn test_record_external_change_for_nonexistent_interface_returns_ok() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        // The backend query for "nonexistent-eth99999" returns no state.
+        let result = reconciler
+            .record_external_change(vec!["nonexistent-eth99999".to_string()], &store)
+            .await;
+        assert!(
+            result.is_ok(),
+            "record_external_change for a nonexistent interface must return Ok"
+        );
+    }
+
+    /// AC: record_external_change for multiple nonexistent interfaces returns Ok.
+    #[tokio::test]
+    async fn test_record_external_change_for_multiple_nonexistent_interfaces_returns_ok() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let result = reconciler
+            .record_external_change(
+                vec![
+                    "nonexistent-0".to_string(),
+                    "nonexistent-1".to_string(),
+                    "nonexistent-2".to_string(),
+                ],
+                &store,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "record_external_change for multiple nonexistent interfaces must return Ok"
         );
     }
 }
