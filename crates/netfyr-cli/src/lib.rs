@@ -14,7 +14,7 @@ pub use history::run_history;
 pub use query::run_query;
 pub use revert::run_revert;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Unix socket path for the netfyr daemon's Varlink API.
 /// Override with `NETFYR_SOCKET_PATH` environment variable (used in tests and
@@ -22,6 +22,34 @@ use clap::{Parser, Subcommand};
 pub(crate) fn daemon_socket_path() -> String {
     std::env::var("NETFYR_SOCKET_PATH")
         .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
+}
+
+/// Controls whether terminal output uses ANSI color codes.
+#[derive(Clone, ValueEnum)]
+pub enum ColorMode {
+    /// Enable colors when stdout is a TTY (default).
+    Auto,
+    /// Always enable colors, even when piped.
+    Always,
+    /// Disable colors.
+    Never,
+}
+
+/// Resolve the requested color mode and configure the `colored` crate accordingly.
+///
+/// `NO_COLOR` (https://no-color.org/) always wins — if set, colors are disabled
+/// regardless of `--color`.  For `Auto`, colored's built-in TTY detection is
+/// used without calling `set_override`.
+pub fn resolve_color_mode(mode: &ColorMode) {
+    if std::env::var_os("NO_COLOR").is_some() {
+        colored::control::set_override(false);
+        return;
+    }
+    match mode {
+        ColorMode::Always => colored::control::set_override(true),
+        ColorMode::Never => colored::control::set_override(false),
+        ColorMode::Auto => {}
+    }
 }
 
 /// Declarative Linux network configuration.
@@ -48,8 +76,113 @@ pub(crate) fn daemon_socket_path() -> String {
 #[command(name = "netfyr", about = "Declarative Linux network configuration")]
 #[command(subcommand_required = true, arg_required_else_help = true)]
 pub struct Cli {
+    /// Control color output: auto (default), always, never.
+    #[arg(long, global = true, default_value = "auto")]
+    pub color: ColorMode,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_color_mode, ColorMode};
+
+    /// AC: Color mode "never" must not panic (smoke test for global override).
+    #[test]
+    fn test_resolve_color_mode_never_does_not_panic() {
+        resolve_color_mode(&ColorMode::Never);
+        // Undo the global override so this test does not affect others.
+        colored::control::unset_override();
+    }
+
+    /// AC: Color mode "always" must not panic.
+    #[test]
+    fn test_resolve_color_mode_always_does_not_panic() {
+        resolve_color_mode(&ColorMode::Always);
+        colored::control::unset_override();
+    }
+
+    /// AC: Color mode "auto" must not panic (uses TTY auto-detection, no override).
+    #[test]
+    fn test_resolve_color_mode_auto_does_not_panic() {
+        resolve_color_mode(&ColorMode::Auto);
+        // Auto does not set an override, so nothing to undo.
+    }
+
+    /// AC: "If the NO_COLOR environment variable is set (any value), colors are
+    /// disabled regardless of the --color flag."
+    /// Even with --color=always, NO_COLOR must force colors off.
+    #[test]
+    fn test_resolve_color_mode_no_color_env_var_disables_colors_even_with_always_flag() {
+        // Ensure NO_COLOR is absent initially.
+        // SAFETY: single-threaded env manipulation guarded by test isolation.
+        unsafe { std::env::remove_var("NO_COLOR") };
+        colored::control::set_override(true); // start with colors explicitly on
+
+        // Set NO_COLOR to any value.
+        unsafe { std::env::set_var("NO_COLOR", "1") };
+        resolve_color_mode(&ColorMode::Always);
+
+        // After resolve_color_mode with NO_COLOR set, colored string must NOT
+        // contain ANSI escape sequences.
+        use colored::Colorize;
+        let colored_output = "test".red().to_string();
+        assert_eq!(
+            colored_output, "test",
+            "NO_COLOR env var must disable colors even when --color=always; \
+             got: {:?}",
+            colored_output
+        );
+
+        // Cleanup.
+        unsafe { std::env::remove_var("NO_COLOR") };
+        colored::control::unset_override();
+    }
+
+    /// AC: --color=never disables colors (colored string has no ANSI codes).
+    #[test]
+    fn test_resolve_color_mode_never_disables_colored_output() {
+        // Ensure NO_COLOR is absent so it does not interfere.
+        unsafe { std::env::remove_var("NO_COLOR") };
+        // Start with colors explicitly on so the test is meaningful.
+        colored::control::set_override(true);
+
+        resolve_color_mode(&ColorMode::Never);
+
+        use colored::Colorize;
+        let colored_output = "test".red().to_string();
+        assert_eq!(
+            colored_output, "test",
+            "--color=never must disable ANSI codes; got: {:?}",
+            colored_output
+        );
+
+        // Cleanup.
+        colored::control::unset_override();
+    }
+
+    /// AC: --color=always enables colors (colored string has ANSI codes).
+    #[test]
+    fn test_resolve_color_mode_always_enables_colored_output() {
+        // Ensure NO_COLOR is absent so it does not interfere.
+        unsafe { std::env::remove_var("NO_COLOR") };
+        // Start with colors explicitly off so the test is meaningful.
+        colored::control::set_override(false);
+
+        resolve_color_mode(&ColorMode::Always);
+
+        use colored::Colorize;
+        let colored_output = "test".red().to_string();
+        assert_ne!(
+            colored_output, "test",
+            "--color=always must produce ANSI-coded output; got: {:?}",
+            colored_output
+        );
+
+        // Cleanup.
+        colored::control::unset_override();
+    }
 }
 
 #[derive(Subcommand)]

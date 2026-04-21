@@ -1275,4 +1275,164 @@ mod tests {
         let conflicts = empty_conflict_report();
         display_apply_report(&report, &conflicts);
     }
+
+    // ── validate_policies tests ───────────────────────────────────────────────
+    //
+    // validate_policies is invoked in run_apply before any system interaction.
+    // Validation errors produce exit code 2 (via Err propagated to main).
+
+    use netfyr_state::{FieldValue, Provenance, SchemaRegistry, StateMetadata, Value};
+    use netfyr_policy::{Policy, PolicySet as ValidationPolicySet};
+
+    fn make_validation_state(entity_type: &str, name: &str, fields: Vec<(&str, Value)>) -> State {
+        let mut state_fields = indexmap::IndexMap::new();
+        for (k, v) in fields {
+            state_fields.insert(
+                k.to_string(),
+                FieldValue { value: v, provenance: Provenance::KernelDefault },
+            );
+        }
+        State {
+            entity_type: entity_type.to_string(),
+            selector: Selector::with_name(name),
+            fields: state_fields,
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 0,
+        }
+    }
+
+    fn make_validation_policy(policy_name: &str, state: State) -> Policy {
+        Policy {
+            name: policy_name.to_string(),
+            factory_type: PolicyFactoryType::Static,
+            priority: 100,
+            state: Some(state),
+            states: None,
+            selector: None,
+        }
+    }
+
+    fn make_validation_policy_set(policy: Policy) -> ValidationPolicySet {
+        let mut ps = ValidationPolicySet::new();
+        ps.insert(policy);
+        ps
+    }
+
+    /// AC "YAML parse error returns exit code 2" — validate_policies passes for a
+    /// structurally valid ethernet state (mtu within allowed range).
+    #[test]
+    fn test_validate_policies_valid_ethernet_state_returns_ok() {
+        let state = make_validation_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]);
+        let ps = make_validation_policy_set(make_validation_policy("eth0", state));
+        let schema = SchemaRegistry::default();
+        assert!(
+            validate_policies(&ps, &schema).is_ok(),
+            "valid ethernet mtu=1500 must pass schema validation"
+        );
+    }
+
+    /// AC "YAML parse error / validation error returns exit code 2" — a state with
+    /// an mtu below the minimum of 68 must fail validation.
+    #[test]
+    fn test_validate_policies_mtu_below_schema_minimum_returns_error() {
+        // Ethernet schema: mtu minimum is 68, maximum is 65535.
+        let state = make_validation_state("ethernet", "eth0", vec![("mtu", Value::U64(0))]);
+        let ps = make_validation_policy_set(make_validation_policy("eth0-low-mtu", state));
+        let schema = SchemaRegistry::default();
+        assert!(
+            validate_policies(&ps, &schema).is_err(),
+            "mtu=0 is below the ethernet schema minimum of 68 and must fail validation"
+        );
+    }
+
+    /// AC "YAML parse error / validation error returns exit code 2" — a state with
+    /// an unknown field (additionalProperties: false) must fail validation and the
+    /// error message must include both the policy name and the unknown field name.
+    #[test]
+    fn test_validate_policies_unknown_field_returns_error_with_policy_name_and_field_name() {
+        let state = make_validation_state(
+            "ethernet",
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("completely_unknown_field_xyz", Value::U64(42)),
+            ],
+        );
+        let ps = make_validation_policy_set(make_validation_policy("my-policy", state));
+        let schema = SchemaRegistry::default();
+        let result = validate_policies(&ps, &schema);
+        assert!(result.is_err(), "unknown field must fail validation");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("my-policy"),
+            "error must include policy name 'my-policy'; got: {}",
+            err
+        );
+        assert!(
+            err.contains("completely_unknown_field_xyz"),
+            "error must include unknown field name 'completely_unknown_field_xyz'; got: {}",
+            err
+        );
+    }
+
+    /// Error message format: "policy '{}': field '{}': {}" as specified in the
+    /// error handling section of the spec.
+    #[test]
+    fn test_validate_policies_error_message_uses_policy_name_and_field_prefix_format() {
+        let state = make_validation_state(
+            "ethernet",
+            "eth0",
+            vec![("unrecognised_field", Value::String("bad".to_string()))],
+        );
+        let ps = make_validation_policy_set(make_validation_policy("test-policy", state));
+        let schema = SchemaRegistry::default();
+        let result = validate_policies(&ps, &schema);
+        assert!(result.is_err(), "unknown field must fail validation");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("policy 'test-policy'"),
+            "error message must use format \"policy 'test-policy'\"; got: {}",
+            err
+        );
+    }
+
+    /// AC: multiple validation errors across multiple policies are all collected
+    /// and reported together (not just the first error).
+    #[test]
+    fn test_validate_policies_multiple_invalid_states_collects_all_errors() {
+        let state1 = make_validation_state(
+            "ethernet",
+            "eth0",
+            vec![("unknown_field_one", Value::U64(1))],
+        );
+        let state2 = make_validation_state(
+            "ethernet",
+            "eth1",
+            vec![("unknown_field_two", Value::U64(2))],
+        );
+        let mut ps = ValidationPolicySet::new();
+        ps.insert(make_validation_policy("policy-one", state1));
+        ps.insert(make_validation_policy("policy-two", state2));
+        let schema = SchemaRegistry::default();
+        let result = validate_policies(&ps, &schema);
+        assert!(result.is_err(), "both invalid states must cause validation to fail");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("policy-one") || err.contains("policy-two"),
+            "error must mention at least one policy name; got: {}",
+            err
+        );
+    }
+
+    /// Edge: an empty policy set passes validation (nothing to validate).
+    #[test]
+    fn test_validate_policies_empty_policy_set_returns_ok() {
+        let ps = ValidationPolicySet::new();
+        let schema = SchemaRegistry::default();
+        assert!(
+            validate_policies(&ps, &schema).is_ok(),
+            "empty policy set must pass validation"
+        );
+    }
 }

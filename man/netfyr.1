@@ -4,7 +4,7 @@
 .SH NAME
 netfyr \- Declarative Linux network configuration
 .SH SYNOPSIS
-\fBnetfyr\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBnetfyr\fR [\fB\-\-color\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
 Declarative Linux network configuration.
 .PP
@@ -20,6 +20,21 @@ query    Query current network state from the kernel or daemon.
 .PP
 history  Show journal history of state changes.
 .SH OPTIONS
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+Control color output: auto (default), always, never
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto: Enable colors when stdout is a TTY (default)
+.IP \(bu 2
+always: Always enable colors, even when piped
+.IP \(bu 2
+never: Disable colors
+.RE
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

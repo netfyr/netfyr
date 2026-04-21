@@ -1,4 +1,4 @@
-use netfyr_cli::{run_apply, run_history, run_query, run_revert, Cli, Commands};
+use netfyr_cli::{resolve_color_mode, run_apply, run_history, run_query, run_revert, Cli, Commands};
 
 use clap::Parser;
 use std::process::ExitCode;
@@ -6,6 +6,7 @@ use std::process::ExitCode;
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    resolve_color_mode(&cli.color);
 
     match cli.command {
         Commands::Apply(args) => match run_apply(args).await {
