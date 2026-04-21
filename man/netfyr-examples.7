@@ -153,10 +153,127 @@ If the diff looks correct, apply for real:
 $ netfyr apply /etc/netfyr/policies/
 .fi
 .RE
+.SH "INVESTIGATING CHANGES WITH HISTORY"
+List recent state changes from the journal:
+.PP
+.RS 4
+.nf
+$ netfyr history
+SEQ  TIMESTAMP             TRIGGER         ENTITIES   OUTCOME        CHANGES
+145  2026\-04\-20 15:10:05   external        eth0       observed       ~mtu
+144  2026\-04\-20 15:00:00   policy\-apply    eth0       applied (1 ok) ~mtu
+.fi
+.RE
+.PP
+Show full details for a specific entry:
+.PP
+.RS 4
+.nf
+$ netfyr history \-\-show 145
+Entry #145 at 2026\-04\-20 15:10:05 UTC
+Trigger: external\-change
+  Changed entities: eth0
+Diff:
+  ~ ethernet eth0
+      mtu: 9000 \-> 1500
+Outcome: observed (no action taken)
+.fi
+.RE
+.PP
+Filter by entity and output as JSON for scripting:
+.PP
+.RS 4
+.nf
+$ netfyr history \-s name=eth0 \-\-since 1h \-o json | jq '.[].trigger'
+.fi
+.RE
+.SH "EXTERNAL CHANGE DETECTION"
+The daemon automatically monitors managed interfaces for changes made
+by other tools.
+To use this feature:
+.PP
+1. Create a policy for the interface you want to monitor:
+.PP
+File:
+.I /etc/netfyr/policies/eth0.yaml
+.PP
+.RS 4
+.nf
+type: ethernet
+name: eth0
+mtu: 9000
+.fi
+.RE
+.PP
+2. Apply the policy and start the daemon:
+.PP
+.RS 4
+.nf
+$ netfyr apply /etc/netfyr/policies/
+$ sudo systemctl start netfyr
+.fi
+.RE
+.PP
+3. When an external tool changes the interface, the daemon records it
+in the journal:
+.PP
+.RS 4
+.nf
+$ ip link set eth0 mtu 1500
+$ netfyr history \-n 1
+SEQ  TIMESTAMP             TRIGGER    ENTITIES  OUTCOME   CHANGES
+146  2026\-04\-20 15:15:00   external   eth0      observed  ~mtu
+.fi
+.RE
+.PP
+.B Important:
+only interfaces targeted by at least one active policy are monitored.
+If you want to track changes to an interface, you must have a policy
+for it \(em even a minimal one that only declares the type and name.
+See
+.BR netfyr\-daemon (8)
+for full details on limitations.
+.SH "REVERTING TO A PREVIOUS STATE"
+After investigating changes with
+.BR "netfyr history" ,
+revert to a known good state:
+.PP
+.RS 4
+.nf
+$ netfyr history \-n 3
+SEQ  TIMESTAMP             TRIGGER         ENTITIES   OUTCOME        CHANGES
+146  2026\-04\-20 15:15:00   external        eth0       observed       ~mtu
+145  2026\-04\-20 15:10:05   policy\-apply    eth0       applied (1 ok) ~mtu
+144  2026\-04\-20 15:00:00   policy\-apply    eth0       applied (2 ok) ~mtu, addr(+1)
+.fi
+.RE
+.PP
+.RS 4
+.nf
+$ netfyr revert 145 \-\-dry\-run
+Reverting to state from entry #145 (2026\-04\-20 15:10:05 UTC)
+Changes that would be applied:
+  ~ ethernet eth0
+      mtu: 1500 \-> 9000
+.fi
+.RE
+.PP
+.RS 4
+.nf
+$ netfyr revert 145
+Reverting to state from entry #145 (2026\-04\-20 15:10:05 UTC)
+Applied 1 change (1 entity modified).
+.fi
+.RE
+.PP
+In daemon mode, a warning is printed because the active policies are
+not changed.
+The next reconciliation cycle may re\-apply the current desired state.
 .SH "SEE ALSO"
 .BR netfyr (1),
 .BR netfyr\-apply (1),
 .BR netfyr\-query (1),
 .BR netfyr\-history (1),
 .BR netfyr\-revert (1),
+.BR netfyr\-daemon (8),
 .BR netfyr.yaml (5)

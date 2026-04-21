@@ -634,6 +634,429 @@ fn test_query_1_options_match_cli_flags() {
     );
 }
 
+// ── Scenario: Generate all man pages — history and revert ────────────────────
+
+/// AC: man/netfyr-history.1 is created after running xtask man.
+#[test]
+fn test_xtask_man_creates_netfyr_history_1() {
+    run_xtask_man();
+    assert!(
+        man_dir().join("netfyr-history.1").exists(),
+        "man/netfyr-history.1 must exist after `cargo xtask man`"
+    );
+}
+
+/// AC: man/netfyr-revert.1 is created after running xtask man.
+#[test]
+fn test_xtask_man_creates_netfyr_revert_1() {
+    run_xtask_man();
+    assert!(
+        man_dir().join("netfyr-revert.1").exists(),
+        "man/netfyr-revert.1 must exist after `cargo xtask man`"
+    );
+}
+
+/// AC: man/netfyr-daemon.8 is NOT overwritten (maintained by hand).
+#[test]
+fn test_xtask_man_does_not_overwrite_hand_written_daemon_page() {
+    let content_before = read_man_page("netfyr-daemon.8");
+    run_xtask_man();
+    let content_after = read_man_page("netfyr-daemon.8");
+    assert_eq!(
+        content_before, content_after,
+        "`cargo xtask man` must not modify man/netfyr-daemon.8 (hand-written file)"
+    );
+    assert!(
+        content_after.contains("maintained by hand"),
+        "man/netfyr-daemon.8 must retain its hand-written maintainer comment"
+    );
+}
+
+// ── Scenario: netfyr-history.1 and netfyr-revert.1 content ───────────────────
+
+/// AC: netfyr-history.1 EXAMPLES has at least two usage examples.
+#[test]
+fn test_history_1_examples_has_at_least_two_usage_examples() {
+    let content = read_man_page("netfyr-history.1");
+    let nf_count = content.matches(".nf").count();
+    assert!(
+        nf_count >= 2,
+        "man/netfyr-history.1 EXAMPLES must contain ≥ 2 code examples (.nf blocks); found {nf_count}"
+    );
+}
+
+/// AC: netfyr-history.1 OPTIONS documents --since.
+#[test]
+fn test_history_1_options_lists_since_flag() {
+    let content = read_man_page("netfyr-history.1");
+    assert!(
+        content.contains("since"),
+        "man/netfyr-history.1 OPTIONS must document --since"
+    );
+}
+
+/// AC: netfyr-revert.1 EXAMPLES has at least two usage examples.
+#[test]
+fn test_revert_1_examples_has_at_least_two_usage_examples() {
+    let content = read_man_page("netfyr-revert.1");
+    let nf_count = content.matches(".nf").count();
+    assert!(
+        nf_count >= 2,
+        "man/netfyr-revert.1 EXAMPLES must contain ≥ 2 code examples (.nf blocks); found {nf_count}"
+    );
+}
+
+/// AC: netfyr-revert.1 OPTIONS documents --dry-run.
+#[test]
+fn test_revert_1_options_lists_dry_run_flag() {
+    let content = read_man_page("netfyr-revert.1");
+    let has_dry_run = content.contains("dry\\-run") || content.contains("dry-run");
+    assert!(
+        has_dry_run,
+        "man/netfyr-revert.1 OPTIONS must document --dry-run"
+    );
+}
+
+// ── Scenario: Examples man page covers all required scenarios ─────────────────
+
+/// AC: examples page covers "Investigating changes with history".
+#[test]
+fn test_examples_7_covers_investigating_changes_with_history() {
+    let content = read_man_page("netfyr-examples.7");
+    let upper = content.to_uppercase();
+    assert!(
+        upper.contains("INVESTIGATING") || upper.contains("HISTORY"),
+        "netfyr-examples.7 must cover 'Investigating changes with history'"
+    );
+    // The section must show `netfyr history` command usage
+    assert!(
+        content.contains("netfyr history"),
+        "investigating-history scenario must demonstrate `netfyr history` command"
+    );
+}
+
+/// AC: examples page covers "External change detection".
+#[test]
+fn test_examples_7_covers_external_change_detection() {
+    let content = read_man_page("netfyr-examples.7");
+    let upper = content.to_uppercase();
+    assert!(
+        upper.contains("EXTERNAL CHANGE"),
+        "netfyr-examples.7 must cover 'External change detection'"
+    );
+}
+
+/// AC: external change detection scenario shows that a policy must exist first.
+#[test]
+fn test_examples_7_external_change_requires_policy_first() {
+    let content = read_man_page("netfyr-examples.7");
+    let ext_start = content
+        .to_uppercase()
+        .find("EXTERNAL CHANGE")
+        .expect("EXTERNAL CHANGE section must exist in netfyr-examples.7");
+    // From the start of the section, a policy definition must appear before apply/start.
+    let section = &content[ext_start..];
+    assert!(
+        section.contains("type: ethernet") || section.contains("kind: policy"),
+        "EXTERNAL CHANGE DETECTION section must show creating a policy for the interface first"
+    );
+    assert!(
+        section.contains("netfyr apply"),
+        "EXTERNAL CHANGE DETECTION section must show applying the policy before monitoring"
+    );
+}
+
+/// AC: external change detection scenario shows the complete workflow.
+///
+/// The workflow is: create policy → apply → external tool makes change → history shows it.
+#[test]
+fn test_examples_7_external_change_shows_complete_workflow() {
+    let content = read_man_page("netfyr-examples.7");
+    let ext_start = content
+        .to_uppercase()
+        .find("EXTERNAL CHANGE")
+        .expect("EXTERNAL CHANGE section must exist in netfyr-examples.7");
+    let section = &content[ext_start..];
+    // External tool making a change (e.g., ip link set)
+    assert!(
+        section.contains("ip link") || section.contains("ip "),
+        "EXTERNAL CHANGE DETECTION must show an external tool (e.g., `ip`) modifying the interface"
+    );
+    // netfyr history to observe the recorded change
+    assert!(
+        section.contains("netfyr history"),
+        "EXTERNAL CHANGE DETECTION must show `netfyr history` to observe the recorded change"
+    );
+}
+
+/// AC: examples page covers "Reverting to a previous state".
+#[test]
+fn test_examples_7_covers_reverting_to_previous_state() {
+    let content = read_man_page("netfyr-examples.7");
+    let upper = content.to_uppercase();
+    assert!(
+        upper.contains("REVERT"),
+        "netfyr-examples.7 must cover 'Reverting to a previous state'"
+    );
+    assert!(
+        content.contains("netfyr revert"),
+        "reverting scenario must demonstrate `netfyr revert` command"
+    );
+}
+
+/// AC: reverting scenario shows --dry-run before the actual revert.
+#[test]
+fn test_examples_7_reverting_scenario_shows_dry_run() {
+    let content = read_man_page("netfyr-examples.7");
+    let revert_start = content
+        .to_uppercase()
+        .find("REVERT")
+        .expect("REVERTING section must exist in netfyr-examples.7");
+    let section = &content[revert_start..];
+    let has_dry_run = section.contains("dry\\-run") || section.contains("dry-run");
+    assert!(
+        has_dry_run,
+        "reverting scenario must show `--dry-run` before executing the actual revert"
+    );
+}
+
+// ── Scenario: Daemon man page exists and renders ──────────────────────────────
+
+/// AC: man/netfyr-daemon.8 must exist as a hand-written file.
+#[test]
+fn test_daemon_8_file_exists() {
+    assert!(
+        man_dir().join("netfyr-daemon.8").exists(),
+        "man/netfyr-daemon.8 must exist as a hand-written file"
+    );
+}
+
+/// AC: NAME section of netfyr-daemon.8 contains "netfyr-daemon".
+#[test]
+fn test_daemon_8_name_section_contains_netfyr_daemon() {
+    let content = read_man_page("netfyr-daemon.8");
+    assert!(
+        content.contains(".SH NAME"),
+        "man/netfyr-daemon.8 must have a NAME section"
+    );
+    assert!(
+        content.contains("netfyr") && content.contains("daemon"),
+        "man/netfyr-daemon.8 NAME section must identify the page as 'netfyr-daemon'"
+    );
+}
+
+/// AC: netfyr-daemon.8 TH header declares section 8.
+#[test]
+fn test_daemon_8_header_is_section_8() {
+    let content = read_man_page("netfyr-daemon.8");
+    assert!(
+        content.contains(".TH") && content.contains(" 8 "),
+        "man/netfyr-daemon.8 .TH header must declare section 8"
+    );
+}
+
+/// AC: man/netfyr-daemon.8 renders through groff without errors or warnings.
+#[test]
+fn test_daemon_8_renders_without_troff_errors() {
+    if let Some((ok, stderr)) = try_groff_render("netfyr-daemon.8") {
+        assert!(
+            ok,
+            "man/netfyr-daemon.8 must render without fatal groff errors; stderr:\n{stderr}"
+        );
+        let has_warning = stderr.lines().any(|l| l.to_lowercase().contains("warning:"));
+        assert!(
+            !has_warning,
+            "man/netfyr-daemon.8 must render without troff warnings; groff stderr:\n{stderr}"
+        );
+    }
+}
+
+// ── Scenario: Daemon man page documents external change detection ─────────────
+
+/// AC: netfyr-daemon.8 has an EXTERNAL CHANGE DETECTION section.
+#[test]
+fn test_daemon_8_has_external_change_detection_section() {
+    let content = read_man_page("netfyr-daemon.8");
+    assert!(
+        content.contains("EXTERNAL CHANGE DETECTION"),
+        "man/netfyr-daemon.8 must have an 'EXTERNAL CHANGE DETECTION' section"
+    );
+}
+
+/// AC: EXTERNAL CHANGE DETECTION section explains managed-only monitoring.
+#[test]
+fn test_daemon_8_external_change_detection_explains_managed_only() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content
+        .find("EXTERNAL CHANGE DETECTION")
+        .expect("EXTERNAL CHANGE DETECTION section must exist");
+    let section = &content[start..];
+    let lower = section.to_lowercase();
+    assert!(
+        lower.contains("managed"),
+        "EXTERNAL CHANGE DETECTION must explain that only managed interfaces are monitored"
+    );
+}
+
+/// AC: EXTERNAL CHANGE DETECTION section documents monitored properties.
+#[test]
+fn test_daemon_8_external_change_detection_documents_monitored_properties() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content
+        .find("EXTERNAL CHANGE DETECTION")
+        .expect("EXTERNAL CHANGE DETECTION section must exist");
+    let section = &content[start..];
+    assert!(section.contains("mtu"), "EXTERNAL CHANGE DETECTION must mention mtu");
+    assert!(section.contains("state"), "EXTERNAL CHANGE DETECTION must mention state");
+    assert!(section.contains("flags"), "EXTERNAL CHANGE DETECTION must mention flags");
+    let lower = section.to_lowercase();
+    assert!(
+        lower.contains("ipv4") || lower.contains("address"),
+        "EXTERNAL CHANGE DETECTION must mention IPv4 addresses"
+    );
+}
+
+/// AC: EXTERNAL CHANGE DETECTION section documents the 500ms debounce window.
+#[test]
+fn test_daemon_8_external_change_detection_documents_debounce_window() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content
+        .find("EXTERNAL CHANGE DETECTION")
+        .expect("EXTERNAL CHANGE DETECTION section must exist");
+    let section = &content[start..];
+    assert!(
+        section.contains("500"),
+        "EXTERNAL CHANGE DETECTION must mention the 500ms debounce window"
+    );
+}
+
+/// AC: EXTERNAL CHANGE DETECTION section documents no automatic re-reconciliation.
+#[test]
+fn test_daemon_8_external_change_detection_documents_no_auto_reconciliation() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content
+        .find("EXTERNAL CHANGE DETECTION")
+        .expect("EXTERNAL CHANGE DETECTION section must exist");
+    let section = &content[start..];
+    let lower = section.to_lowercase();
+    assert!(
+        lower.contains("does not") || lower.contains("no automatic"),
+        "EXTERNAL CHANGE DETECTION must state that the daemon does not automatically re-apply state"
+    );
+}
+
+// ── Scenario: Daemon man page documents the journal ───────────────────────────
+
+/// AC: netfyr-daemon.8 has a JOURNAL section.
+#[test]
+fn test_daemon_8_has_journal_section() {
+    let content = read_man_page("netfyr-daemon.8");
+    assert!(
+        content.contains("JOURNAL"),
+        "man/netfyr-daemon.8 must have a JOURNAL section"
+    );
+}
+
+/// AC: JOURNAL section describes the NDJSON format.
+#[test]
+fn test_daemon_8_journal_describes_ndjson_format() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content.find("JOURNAL").expect("JOURNAL section must exist");
+    let section = &content[start..];
+    assert!(
+        section.contains("NDJSON") || section.contains("ndjson"),
+        "JOURNAL section must describe the NDJSON append-only format"
+    );
+}
+
+/// AC: JOURNAL section documents rotation thresholds (entries and size).
+#[test]
+fn test_daemon_8_journal_documents_rotation_and_retention() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content.find("JOURNAL").expect("JOURNAL section must exist");
+    let section = &content[start..];
+    assert!(
+        section.contains("10,000") || section.contains("10000"),
+        "JOURNAL section must document the 10,000-entry rotation threshold"
+    );
+    assert!(
+        section.contains("50") && (section.contains("MB") || section.contains("52428800")),
+        "JOURNAL section must document the 50 MB size rotation threshold"
+    );
+    assert!(
+        section.contains("90") && (section.contains("day") || section.contains("retain")),
+        "JOURNAL section must document the 90-day retention policy"
+    );
+}
+
+/// AC: JOURNAL section references netfyr-history(1) for inspecting entries.
+#[test]
+fn test_daemon_8_journal_references_netfyr_history() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content.find("JOURNAL").expect("JOURNAL section must exist");
+    let section = &content[start..];
+    assert!(
+        section.contains("netfyr history") || section.contains("netfyr-history"),
+        "JOURNAL section must reference netfyr-history for reading journal entries"
+    );
+}
+
+/// AC: JOURNAL section references netfyr-revert(1) for restoring state.
+#[test]
+fn test_daemon_8_journal_references_netfyr_revert() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content.find("JOURNAL").expect("JOURNAL section must exist");
+    let section = &content[start..];
+    assert!(
+        section.contains("netfyr revert") || section.contains("netfyr-revert"),
+        "JOURNAL section must reference netfyr-revert for restoring previous state"
+    );
+}
+
+// ── Scenario: Daemon man page documents environment variables ─────────────────
+
+/// AC: netfyr-daemon.8 has an ENVIRONMENT section.
+#[test]
+fn test_daemon_8_has_environment_section() {
+    let content = read_man_page("netfyr-daemon.8");
+    assert!(
+        content.contains("ENVIRONMENT"),
+        "man/netfyr-daemon.8 must have an ENVIRONMENT section"
+    );
+}
+
+/// AC: ENVIRONMENT section lists all six required environment variables.
+#[test]
+fn test_daemon_8_environment_lists_all_six_variables() {
+    let content = read_man_page("netfyr-daemon.8");
+    let start = content.find("ENVIRONMENT").expect("ENVIRONMENT section must exist");
+    let section = &content[start..];
+    assert!(
+        section.contains("NETFYR_SOCKET_PATH"),
+        "ENVIRONMENT section must list NETFYR_SOCKET_PATH"
+    );
+    assert!(
+        section.contains("NETFYR_POLICY_DIR"),
+        "ENVIRONMENT section must list NETFYR_POLICY_DIR"
+    );
+    assert!(
+        section.contains("NETFYR_JOURNAL_DIR"),
+        "ENVIRONMENT section must list NETFYR_JOURNAL_DIR"
+    );
+    assert!(
+        section.contains("NETFYR_JOURNAL_MAX_ENTRIES"),
+        "ENVIRONMENT section must list NETFYR_JOURNAL_MAX_ENTRIES"
+    );
+    assert!(
+        section.contains("NETFYR_JOURNAL_MAX_SIZE"),
+        "ENVIRONMENT section must list NETFYR_JOURNAL_MAX_SIZE"
+    );
+    assert!(
+        section.contains("NETFYR_JOURNAL_RETENTION_DAYS"),
+        "ENVIRONMENT section must list NETFYR_JOURNAL_RETENTION_DAYS"
+    );
+}
+
 // ── Scenario: Regeneration is idempotent ──────────────────────────────────────
 
 /// AC: running `cargo xtask man` twice produces byte-for-byte identical files.

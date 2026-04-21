@@ -1,0 +1,136 @@
+.\" This file is maintained by hand. Do not edit with cargo xtask man.
+.TH NETFYR\-DAEMON 8 "" "" "System Manager's Manual"
+.SH NAME
+netfyr\-daemon \- netfyr network configuration daemon
+.SH SYNOPSIS
+.B netfyr\-daemon
+.SH DESCRIPTION
+The netfyr daemon is a long\-running process that manages network
+configuration.
+It listens on a Varlink socket for policy submissions from the
+.BR netfyr (1)
+CLI, manages DHCPv4 client lifecycles, monitors for external network
+changes, and records all state transitions in a journal.
+.PP
+The daemon is typically started via systemd:
+.PP
+.RS 4
+.nf
+systemctl start netfyr
+.fi
+.RE
+.SH "EXTERNAL CHANGE DETECTION"
+The daemon monitors the kernel for network state changes made by other
+tools (e.g.,
+.BR ip (8),
+NetworkManager) or by the kernel itself (e.g., carrier loss).
+When an external change is detected on a managed interface, the daemon
+records a journal entry with trigger type
+.I external_change
+but does not re\-apply the current desired state.
+.PP
+Important limitations:
+.PP
+.B "Only managed interfaces are monitored."
+.PP
+An interface is
+.I managed
+when at least one active policy targets it.
+If no policies are active, no external changes are detected.
+The daemon does not monitor interfaces that have never been the target
+of a policy.
+.PP
+.B "Monitored properties."
+.PP
+The daemon subscribes to netlink notifications for link attribute
+changes (mtu, state, flags) and IPv4 address additions and removals.
+Only properties that netfyr manages on ethernet interfaces are tracked.
+Changes to properties outside netfyr's scope (e.g., IPv6 addresses,
+routing tables, qdiscs) are not detected.
+.PP
+.B "Debounce window."
+.PP
+Network changes often arrive in bursts.
+The daemon coalesces notifications within a 500ms window into a single
+journal entry.
+This means there may be a short delay before a change appears in the
+journal.
+.PP
+.B "No automatic re\-reconciliation."
+.PP
+The daemon records external changes but does not fight back.
+To restore the desired state, run
+.B "netfyr apply"
+or submit policies again.
+The next reconciliation cycle (e.g., a DHCP event or policy submission)
+will re\-apply the current desired state, which may differ from the
+externally modified state.
+.SH JOURNAL
+The daemon writes all state transitions to an append\-only journal in
+NDJSON format.
+This includes policy applications, DHCP events, daemon startup,
+external changes, and reverts.
+.PP
+The journal is stored at
+.I /var/lib/netfyr/journal/
+by default (configurable via
+.BR NETFYR_JOURNAL_DIR ).
+Use
+.BR "netfyr history" (1)
+to inspect journal entries and
+.BR "netfyr revert" (1)
+to restore a previous state.
+.PP
+Journal files are rotated at 10,000 entries or 50\ MB (configurable via
+.B NETFYR_JOURNAL_MAX_ENTRIES
+and
+.BR NETFYR_JOURNAL_MAX_SIZE ).
+Rotated files are gzip\-compressed and retained for 90 days by default
+(configurable via
+.BR NETFYR_JOURNAL_RETENTION_DAYS ).
+.SH ENVIRONMENT
+.TP
+.B NETFYR_SOCKET_PATH
+Path to the Varlink socket (default:
+.IR /run/netfyr/netfyr.sock ).
+.TP
+.B NETFYR_POLICY_DIR
+Directory for persisted policies (default:
+.IR /var/lib/netfyr/policies/ ).
+.TP
+.B NETFYR_JOURNAL_DIR
+Directory for journal files (default:
+.IR /var/lib/netfyr/journal/ ).
+.TP
+.B NETFYR_JOURNAL_MAX_ENTRIES
+Maximum entries per journal file before rotation (default: 10000).
+.TP
+.B NETFYR_JOURNAL_MAX_SIZE
+Maximum journal file size in bytes before rotation (default: 52428800).
+.TP
+.B NETFYR_JOURNAL_RETENTION_DAYS
+Days to retain rotated journal archives (default: 90).
+.SH FILES
+.TP
+.I /run/netfyr/netfyr.sock
+Varlink socket for CLI\-to\-daemon communication.
+.TP
+.I /var/lib/netfyr/policies/
+Persisted policies that survive daemon restarts.
+.TP
+.I /var/lib/netfyr/journal/
+Journal directory containing
+.I current.ndjson
+and archived entries.
+.TP
+.I /etc/netfyr/policies/
+User\-provided policy files loaded at startup.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr\-apply (1),
+.BR netfyr\-query (1),
+.BR netfyr\-history (1),
+.BR netfyr\-revert (1),
+.BR netfyr.yaml (5),
+.BR netfyr\-examples (7),
+.BR systemd (1)
