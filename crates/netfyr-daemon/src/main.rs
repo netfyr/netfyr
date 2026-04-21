@@ -21,6 +21,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 
+use netfyr_journal::Trigger;
+
 use crate::factory_manager::FactoryManager;
 use crate::policy_store::PolicyStore;
 use crate::reconciler::Reconciler;
@@ -90,7 +92,7 @@ async fn main() -> Result<()> {
     //    should still be available so the user can submit corrected policies.
     let reconciler = Reconciler::new();
     if let Err(e) = reconciler
-        .reconcile_and_apply(&policy_store, &factory_manager)
+        .reconcile_and_apply(&policy_store, &factory_manager, Trigger::DaemonStartup)
         .await
     {
         tracing::error!("Initial reconciliation failed: {}", e);

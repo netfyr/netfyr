@@ -8,6 +8,7 @@ name = "netfyr-daemon"
 path = "src/main.rs"
 
 [dependencies]
+netfyr-journal = { path = "../netfyr-journal" }
 netfyr-policy = { path = "../netfyr-policy" }
 netfyr-state = { path = "../netfyr-state" }
 netfyr-backend = { path = "../netfyr-backend" }
@@ -19,6 +20,8 @@ serde_yaml = "0.9"
 anyhow = "1"
 # tracing: structured logging for warnings on skipped/malformed files
 tracing = "0.1"
+# chrono: UTC timestamps for journal entries
+chrono = { version = "0.4", features = ["serde"] }
 # tokio: async runtime with signal handling, Unix sockets, channels, timers
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "io-util"] }
 # serde / serde_json: Varlink JSON wire protocol

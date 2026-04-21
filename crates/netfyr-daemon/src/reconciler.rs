@@ -5,16 +5,20 @@
 //! the Varlink request handler and the factory event handler without locking.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use netfyr_backend::{ApplyReport, BackendRegistry, NetlinkBackend};
+use netfyr_journal::{
+    summarize_policies, ApplyOutcome, Journal, JournalEntry, SerializableDiff, SerializableStateSet,
+    Trigger,
+};
 use netfyr_policy::{FactoryType, StaticFactory, StateFactory};
 use netfyr_reconcile::{
     generate_diff, merge, ConflictReport, EntityKey, PolicyId, PolicyInput,
     StateDiff as ReconcileStateDiff,
 };
-use netfyr_state::{Selector, SchemaRegistry, StateSet};
+use netfyr_state::{SchemaRegistry, Selector, StateSet};
 
 use crate::factory_manager::FactoryManager;
 use crate::policy_store::PolicyStore;
@@ -34,6 +38,7 @@ pub struct ApplyResult {
 pub struct Reconciler {
     backend_registry: BackendRegistry,
     schema_registry: SchemaRegistry,
+    journal: Mutex<Option<Journal>>,
 }
 
 impl Reconciler {
@@ -44,9 +49,22 @@ impl Reconciler {
         if let Err(e) = registry.register(netlink) {
             tracing::error!("Failed to register NetlinkBackend: {}", e);
         }
+
+        let journal = match Journal::open_default() {
+            Ok(j) => {
+                tracing::debug!("Journal opened successfully");
+                Some(j)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open journal (journal writes disabled): {}", e);
+                None
+            }
+        };
+
         Self {
             backend_registry: registry,
             schema_registry: SchemaRegistry::default(),
+            journal: Mutex::new(journal),
         }
     }
 
@@ -56,30 +74,40 @@ impl Reconciler {
     /// 1. Build `PolicyInput` list from static policies and factory states.
     /// 2. Run `merge()` to produce the effective desired state.
     /// 3. Query actual system state via the backend registry.
-    /// 4. Compute `netfyr_state::StateDiff` (the apply-level diff).
-    /// 5. If the diff is empty, short-circuit and return an empty report.
-    /// 6. Apply the diff; return the report and any conflicts.
+    /// 4. Compute rich diff for journal and lean `netfyr_state::StateDiff` for apply.
+    /// 5. If the diff is empty, write a journal entry and return an empty report.
+    /// 6. Apply the diff; write journal entry; return the report and any conflicts.
     pub async fn reconcile_and_apply(
         &self,
         policy_store: &PolicyStore,
         factory_manager: &FactoryManager,
+        trigger: Trigger,
     ) -> Result<ApplyResult> {
         let inputs = self.build_policy_inputs(policy_store, factory_manager);
+
+        // Compute managed_entities before merge() consumes the inputs.
+        let managed_entities: HashSet<EntityKey> = inputs
+            .iter()
+            .flat_map(|input| input.state_set.entities())
+            .collect();
+
         let merged = merge(inputs);
         let effective_state = merged.effective_state;
         let conflicts = merged.conflicts;
 
         let actual_state = self.backend_registry.query_all().await?;
 
+        // Compute the rich diff for journal recording.
+        let reconcile_diff = generate_diff(
+            &effective_state,
+            &actual_state,
+            &managed_entities,
+            &self.schema_registry,
+        );
+
         // Restrict the actual state to only the entities present in the effective
         // desired state before computing the diff. This prevents the daemon from
-        // generating Remove operations for interfaces not covered by any policy —
-        // the daemon must not tear down or bring down unmanaged interfaces.
-        //
-        // Consequence: when a policy is removed entirely, the previously-configured
-        // fields (e.g., addresses from a DHCP lease) will linger on the interface
-        // until the lease expires or the interface is reconfigured. Individual field
-        // removal within a still-managed entity is handled correctly via Modify ops.
+        // generating Remove operations for interfaces not covered by any policy.
         let mut managed_actual = StateSet::new();
         for (entity_type, selector_key) in effective_state.entities() {
             if let Some(state) = actual_state.get(&entity_type, &selector_key) {
@@ -87,13 +115,21 @@ impl Reconciler {
             }
         }
 
-        // Use netfyr_state::diff::diff (the apply-level diff, not the rich display diff).
-        // diff(from=managed_actual, to=desired) produces Add/Modify operations for the
-        // managed entities only — no Remove ops are generated for unmanaged interfaces.
         let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state);
 
         if state_diff.is_empty() {
             tracing::debug!("Reconciliation: no changes needed");
+            self.append_journal_entry(
+                policy_store,
+                &trigger,
+                &reconcile_diff,
+                &effective_state,
+                ApplyOutcome::Applied {
+                    succeeded: 0,
+                    failed: 0,
+                    skipped: 0,
+                },
+            );
             return Ok(ApplyResult {
                 report: ApplyReport::new(),
                 conflicts,
@@ -101,6 +137,19 @@ impl Reconciler {
         }
 
         let report = self.backend_registry.apply(&state_diff).await?;
+
+        self.append_journal_entry(
+            policy_store,
+            &trigger,
+            &reconcile_diff,
+            &effective_state,
+            ApplyOutcome::Applied {
+                succeeded: report.succeeded.len() as u32,
+                failed: report.failed.len() as u32,
+                skipped: report.skipped.len() as u32,
+            },
+        );
+
         Ok(ApplyResult { report, conflicts })
     }
 
@@ -115,8 +164,6 @@ impl Reconciler {
     ) -> Result<(ReconcileStateDiff, ConflictReport)> {
         let inputs = self.build_policy_inputs(policy_store, factory_manager);
         // Compute managed_entities before merge() consumes the inputs.
-        // Only entities with produced state are counted; factory policies that have
-        // not yet produced state cannot be removed anyway (nothing to remove).
         let managed_entities: HashSet<EntityKey> = inputs
             .iter()
             .flat_map(|input| input.state_set.entities())
@@ -127,8 +174,6 @@ impl Reconciler {
 
         let actual_state = self.backend_registry.query_all().await?;
 
-        // Use generate_diff for the rich display diff (with per-field change details).
-        // Note argument order: generate_diff(desired, actual, managed_entities, schema).
         let reconcile_diff =
             generate_diff(&effective_state, &actual_state, &managed_entities, &self.schema_registry);
 
@@ -136,9 +181,6 @@ impl Reconciler {
     }
 
     /// Query current system state via the backend registry.
-    ///
-    /// If `entity_type` is `Some`, only that backend is queried.
-    /// If `None`, all backends are queried and their results merged.
     pub async fn query(
         &self,
         entity_type: Option<&str>,
@@ -158,16 +200,38 @@ impl Reconciler {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    fn append_journal_entry(
+        &self,
+        policy_store: &PolicyStore,
+        trigger: &Trigger,
+        reconcile_diff: &ReconcileStateDiff,
+        effective_state: &StateSet,
+        outcome: ApplyOutcome,
+    ) {
+        let mut guard = match self.journal.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Journal mutex poisoned: {}", e);
+                return;
+            }
+        };
+        if let Some(ref mut journal) = *guard {
+            let entry = JournalEntry {
+                seq: 0,
+                timestamp: chrono::Utc::now(),
+                trigger: trigger.clone(),
+                active_policies: summarize_policies(policy_store.policies()),
+                diff: SerializableDiff::from(reconcile_diff),
+                state_after: SerializableStateSet::from(effective_state),
+                outcome,
+            };
+            if let Err(e) = journal.append(entry) {
+                tracing::warn!("Failed to write journal entry: {}", e);
+            }
+        }
+    }
+
     /// Build the `Vec<PolicyInput>` fed into `merge()`.
-    ///
-    /// - For each **static** policy: call `StaticFactory.produce(policy)` to
-    ///   get its `StateSet`, then wrap in `PolicyInput`.
-    /// - For each **factory-produced** state: wrap the single state in a
-    ///   `StateSet` and create a `PolicyInput` using the policy's priority
-    ///   (falling back to 100 if the policy is no longer in the store).
-    ///
-    /// Policies whose `StaticFactory.produce()` call fails are logged and
-    /// skipped rather than aborting the entire reconciliation.
     fn build_policy_inputs(
         &self,
         policy_store: &PolicyStore,
@@ -280,7 +344,6 @@ mod tests {
 
         let (diff1, _) = reconciler.dry_run(&store, &factory_manager).await.unwrap();
         let (diff2, _) = reconciler.dry_run(&store, &factory_manager).await.unwrap();
-        // Both dry-runs should see the same number of operations (system unchanged).
         assert_eq!(
             diff1.len(),
             diff2.len(),
@@ -307,25 +370,20 @@ mod tests {
     async fn test_reconciler_query_returns_state_set() {
         let reconciler = Reconciler::new();
         let state_set = reconciler.query(None, None).await.unwrap();
-        // In any environment the query must succeed. The returned set may be empty
-        // (in minimal test environments) or non-empty (host with real interfaces).
-        // We only verify the call succeeds and the result is a valid StateSet.
-        let _len = state_set.len(); // just verify it's usable
+        let _len = state_set.len();
     }
 
     // ── Feature: Full reconcile_and_apply ─────────────────────────────────────
 
     /// Scenario: reconcile_and_apply with empty store is a no-op and returns Ok.
-    ///
-    /// With an empty desired state the diff is empty, so nothing is applied.
-    /// This smoke-tests the full reconcile_and_apply path without needing
-    /// a real interface or write permissions.
     #[tokio::test]
     async fn test_reconciler_reconcile_and_apply_empty_store_returns_ok() {
         let reconciler = Reconciler::new();
         let store = PolicyStore::ephemeral(vec![]);
         let factory_manager = FactoryManager::new();
-        let result = reconciler.reconcile_and_apply(&store, &factory_manager).await;
+        let result = reconciler
+            .reconcile_and_apply(&store, &factory_manager, Trigger::DaemonStartup)
+            .await;
         assert!(
             result.is_ok(),
             "reconcile_and_apply with empty store must succeed: {:?}",
@@ -340,7 +398,7 @@ mod tests {
         let store = PolicyStore::ephemeral(vec![]);
         let factory_manager = FactoryManager::new();
         let apply_result = reconciler
-            .reconcile_and_apply(&store, &factory_manager)
+            .reconcile_and_apply(&store, &factory_manager, Trigger::DaemonStartup)
             .await
             .unwrap();
         assert!(
@@ -349,15 +407,14 @@ mod tests {
         );
     }
 
-    /// Scenario: reconcile_and_apply with empty store produces a successful report
-    /// (no failures — the empty-diff short-circuit returns a fresh ApplyReport).
+    /// Scenario: reconcile_and_apply with empty store produces a successful report.
     #[tokio::test]
     async fn test_reconciler_reconcile_and_apply_empty_store_report_has_no_failures() {
         let reconciler = Reconciler::new();
         let store = PolicyStore::ephemeral(vec![]);
         let factory_manager = FactoryManager::new();
         let apply_result = reconciler
-            .reconcile_and_apply(&store, &factory_manager)
+            .reconcile_and_apply(&store, &factory_manager, Trigger::DaemonStartup)
             .await
             .unwrap();
         assert!(
@@ -369,9 +426,6 @@ mod tests {
     // ── Feature: Dry-run with policy ──────────────────────────────────────────
 
     /// Scenario: Dry-run with a static policy for a nonexistent interface returns Ok.
-    ///
-    /// The dry-run path only reads system state and generates a diff — it does not
-    /// apply anything. So it must succeed even when the target interface is absent.
     #[tokio::test]
     async fn test_reconciler_dry_run_with_static_policy_returns_ok() {
         use netfyr_policy::parse_policy_yaml;
@@ -389,20 +443,15 @@ mod tests {
         );
     }
 
-    /// Scenario: Dry-run does not alter state — calling reconcile_and_apply
-    /// before and after dry_run produces identical results, confirming dry_run
-    /// is truly read-only.
+    /// Scenario: Dry-run does not alter state.
     #[tokio::test]
     async fn test_reconciler_dry_run_does_not_alter_system_state() {
         let reconciler = Reconciler::new();
         let store = PolicyStore::ephemeral(vec![]);
         let factory_manager = FactoryManager::new();
 
-        // Take a snapshot of system state before dry_run.
         let before = reconciler.query(None, None).await.unwrap();
-        // Run dry_run (which must be a no-op for the system).
         let _ = reconciler.dry_run(&store, &factory_manager).await.unwrap();
-        // Snapshot after.
         let after = reconciler.query(None, None).await.unwrap();
 
         assert_eq!(

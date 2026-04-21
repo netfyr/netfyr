@@ -6,6 +6,7 @@ members = [
     "crates/netfyr-backend",
     "crates/netfyr-policy",
     "crates/netfyr-varlink",
+    "crates/netfyr-journal",
     "crates/netfyr-cli",
     "crates/netfyr-daemon",
     "crates/netfyr-test-utils",

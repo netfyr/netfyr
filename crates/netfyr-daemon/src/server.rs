@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use netfyr_backend::FactoryEvent;
+use netfyr_journal::Trigger;
 use netfyr_varlink::{
     convert_apply_report_with_conflicts, VarlinkDaemonStatus, VarlinkFactoryStatus, VarlinkPolicy,
     VarlinkSelector, VarlinkState, VarlinkStateDiff,
@@ -142,7 +143,11 @@ async fn handle_submit_policies(
 
     // Reconcile and apply.
     let apply_result = match reconciler
-        .reconcile_and_apply(policy_store, factory_manager)
+        .reconcile_and_apply(
+            policy_store,
+            factory_manager,
+            Trigger::PolicyApply { source: "daemon".into() },
+        )
         .await
     {
         Ok(r) => r,
@@ -414,7 +419,14 @@ pub async fn serve_varlink(
                     FactoryEvent::LeaseAcquired { ref policy_name, .. } => {
                         info!(policy = %policy_name, "DHCP lease acquired; re-reconciling");
                         if let Err(e) = reconciler
-                            .reconcile_and_apply(&policy_store, &factory_manager)
+                            .reconcile_and_apply(
+                                &policy_store,
+                                &factory_manager,
+                                Trigger::DhcpEvent {
+                                    policy_name: policy_name.to_string(),
+                                    event_kind: "lease_acquired".into(),
+                                },
+                            )
                             .await
                         {
                             error!("Reconciliation after lease acquisition failed: {}", e);
@@ -423,7 +435,14 @@ pub async fn serve_varlink(
                     FactoryEvent::LeaseRenewed { ref policy_name, .. } => {
                         debug!(policy = %policy_name, "DHCP lease renewed; re-reconciling");
                         if let Err(e) = reconciler
-                            .reconcile_and_apply(&policy_store, &factory_manager)
+                            .reconcile_and_apply(
+                                &policy_store,
+                                &factory_manager,
+                                Trigger::DhcpEvent {
+                                    policy_name: policy_name.to_string(),
+                                    event_kind: "lease_renewed".into(),
+                                },
+                            )
                             .await
                         {
                             error!("Reconciliation after lease renewal failed: {}", e);
@@ -432,7 +451,14 @@ pub async fn serve_varlink(
                     FactoryEvent::LeaseExpired { ref policy_name } => {
                         info!(policy = %policy_name, "DHCP lease expired; re-reconciling");
                         if let Err(e) = reconciler
-                            .reconcile_and_apply(&policy_store, &factory_manager)
+                            .reconcile_and_apply(
+                                &policy_store,
+                                &factory_manager,
+                                Trigger::DhcpEvent {
+                                    policy_name: policy_name.to_string(),
+                                    event_kind: "lease_expired".into(),
+                                },
+                            )
                             .await
                         {
                             error!("Reconciliation after lease expiry failed: {}", e);

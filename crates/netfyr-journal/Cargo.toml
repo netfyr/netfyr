@@ -1,0 +1,22 @@
+[package]
+name = "netfyr-journal"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "netfyr_journal"
+path = "src/lib.rs"
+
+[dependencies]
+netfyr-state = { path = "../netfyr-state" }
+netfyr-reconcile = { path = "../netfyr-reconcile" }
+netfyr-policy = { path = "../netfyr-policy" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+# Gzip compression for archive rotation; std has no compression support
+flate2 = "1"
+thiserror = "1"
+# fcntl advisory file locking for concurrent standalone applies; Linux-only project
+libc = "0.2"
+tracing = "0.1"

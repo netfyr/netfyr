@@ -94,8 +94,8 @@ fn test_workspace_members_listed_exactly() {
         .count();
 
     assert_eq!(
-        member_line_count, 8,
-        "expected exactly 8 workspace member entries, found {member_line_count}"
+        member_line_count, 9,
+        "expected exactly 9 workspace member entries, found {member_line_count}"
     );
 }
 

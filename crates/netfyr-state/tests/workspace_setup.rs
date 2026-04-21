@@ -96,7 +96,7 @@ fn test_workspace_members_count_is_seven() {
         .count();
 
     assert!(
-        crates_member_count == 7 || crates_member_count == 8,
+        (7..=9).contains(&crates_member_count),
         "Expected 7 or 8 crates/* workspace members, found {}",
         crates_member_count
     );

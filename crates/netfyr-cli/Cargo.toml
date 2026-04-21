@@ -24,6 +24,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 # Terminal colors — spec explicitly requires colored; auto-detects TTY and NO_COLOR
 colored = "2"
+# chrono: UTC timestamps for journal entries
+chrono = { version = "0.4", features = ["serde"] }
+# tracing: warn on journal write failure
+tracing = "0.1"
 # JSON value type and serialization — needed for flat map output in query
 serde_json = "1"
 # YAML serialization — needed for default output format in query
@@ -32,6 +36,7 @@ serde_yaml = "0.9"
 # (serde_json::Map is backed by BTreeMap which sorts keys alphabetically)
 indexmap = { version = "2", features = ["serde"] }
 # Internal crates
+netfyr-journal = { path = "../netfyr-journal" }
 netfyr-policy = { path = "../netfyr-policy" }
 netfyr-reconcile = { path = "../netfyr-reconcile" }
 netfyr-backend = { path = "../netfyr-backend" }

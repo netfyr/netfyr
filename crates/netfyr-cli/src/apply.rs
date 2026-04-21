@@ -13,6 +13,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use colored::Colorize;
+use netfyr_journal::{
+    summarize_policies, ApplyOutcome, Journal, JournalEntry, SerializableDiff,
+    SerializableStateSet, Trigger,
+};
 
 use netfyr_backend::{ApplyReport, BackendRegistry, DiffOpKind, NetlinkBackend};
 use netfyr_policy::{
@@ -171,6 +175,40 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
         .apply(&state_diff)
         .await
         .context("failed to apply changes via netlink")?;
+
+    // 10a. Write journal entry (non-fatal on failure).
+    {
+        let source = args
+            .paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let policies_vec: Vec<netfyr_policy::Policy> = policy_set.iter().cloned().collect();
+        match Journal::open_default() {
+            Ok(mut journal) => {
+                let entry = JournalEntry {
+                    seq: 0,
+                    timestamp: chrono::Utc::now(),
+                    trigger: Trigger::PolicyApply { source },
+                    active_policies: summarize_policies(&policies_vec),
+                    diff: SerializableDiff::from(&reconcile_diff),
+                    state_after: SerializableStateSet::from(effective_state),
+                    outcome: ApplyOutcome::Applied {
+                        succeeded: apply_report.succeeded.len() as u32,
+                        failed: apply_report.failed.len() as u32,
+                        skipped: apply_report.skipped.len() as u32,
+                    },
+                };
+                if let Err(e) = journal.append(entry) {
+                    tracing::warn!("Failed to write journal entry: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open journal: {}", e);
+            }
+        }
+    }
 
     // 11. Display results.
     display_apply_report(&apply_report, &reconciliation.conflicts);
