@@ -13,6 +13,8 @@ netfyr-reconcile = { path = "../netfyr-reconcile" }
 netfyr-policy = { path = "../netfyr-policy" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# IndexMap required to construct State.fields when converting snapshots back to StateSet
+indexmap = "2"
 chrono = { version = "0.4", features = ["serde"] }
 # Gzip compression for archive rotation; std has no compression support
 flate2 = "1"

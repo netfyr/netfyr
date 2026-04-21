@@ -1,5 +1,6 @@
+use indexmap::IndexMap;
 use netfyr_reconcile::{DiffKind, FieldChangeKind, StateDiff as ReconcileStateDiff};
-use netfyr_state::StateSet;
+use netfyr_state::{FieldValue, Provenance, Selector, State, StateMetadata, StateSet, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,8 +36,59 @@ pub struct SerializableState {
     pub fields: serde_json::Value,
 }
 
-fn value_to_json(v: &netfyr_state::Value) -> serde_json::Value {
+fn value_to_json(v: &Value) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+}
+
+impl SerializableStateSet {
+    /// Convert back to a `StateSet` for diff computation during revert.
+    ///
+    /// Field values are deserialized from JSON using `Value`'s untagged serde
+    /// implementation, which correctly round-trips IpAddr, IpNetwork, numbers,
+    /// booleans, strings, lists, and maps. All fields are tagged with
+    /// `Provenance::UserConfigured { policy_ref: "revert" }`.
+    pub fn to_state_set(&self) -> Result<StateSet, String> {
+        let mut state_set = StateSet::new();
+
+        for entity in &self.entities {
+            let selector = Selector::with_name(&entity.selector_name);
+
+            let fields_obj = entity.fields.as_object().ok_or_else(|| {
+                format!(
+                    "entity '{}' fields must be a JSON object",
+                    entity.selector_name
+                )
+            })?;
+
+            let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
+            for (field_name, json_val) in fields_obj {
+                let value: Value = serde_json::from_value(json_val.clone())
+                    .map_err(|e| format!("entity '{}' field '{}': {}", entity.selector_name, field_name, e))?;
+                fields.insert(
+                    field_name.clone(),
+                    FieldValue {
+                        value,
+                        provenance: Provenance::UserConfigured {
+                            policy_ref: "revert".into(),
+                        },
+                    },
+                );
+            }
+
+            let state = State {
+                entity_type: entity.entity_type.clone(),
+                selector,
+                fields,
+                metadata: StateMetadata::new(),
+                policy_ref: Some("revert".into()),
+                priority: 100,
+            };
+
+            state_set.insert(state);
+        }
+
+        Ok(state_set)
+    }
 }
 
 impl From<&ReconcileStateDiff> for SerializableDiff {
@@ -330,5 +382,229 @@ mod tests {
 
         let serializable = SerializableDiff::from(&diff);
         assert_eq!(serializable.operations[0].entity_name, "bond0");
+    }
+
+    // ── Feature: SerializableStateSet::to_state_set ───────────────────────────
+
+    /// AC: Snapshot round-trips through serialization — StateSet with 3 entities
+    /// → SerializableStateSet → to_state_set() → same entities and field values.
+    #[test]
+    fn test_to_state_set_round_trip_preserves_all_entities_and_fields() {
+        let mut original = StateSet::new();
+        original.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("mtu", Value::U64(1500)), ("speed", Value::U64(1000))],
+        ));
+        original.insert(make_state(
+            "ethernet",
+            "eth1",
+            vec![("mtu", Value::U64(9000))],
+        ));
+        original.insert(make_state(
+            "ethernet",
+            "eth2",
+            vec![("enabled", Value::Bool(true))],
+        ));
+
+        let serializable = SerializableStateSet::from(&original);
+        let restored = serializable.to_state_set().expect("to_state_set must succeed");
+
+        assert_eq!(restored.len(), 3, "all 3 entities must be present after round-trip");
+
+        let eth0 = restored.get("ethernet", "eth0").expect("eth0 must be in restored set");
+        assert_eq!(
+            eth0.fields["mtu"].value,
+            Value::U64(1500),
+            "eth0 mtu must be 1500 after round-trip"
+        );
+        assert_eq!(
+            eth0.fields["speed"].value,
+            Value::U64(1000),
+            "eth0 speed must be 1000 after round-trip"
+        );
+
+        let eth1 = restored.get("ethernet", "eth1").expect("eth1 must be in restored set");
+        assert_eq!(
+            eth1.fields["mtu"].value,
+            Value::U64(9000),
+            "eth1 mtu must be 9000 after round-trip"
+        );
+
+        let eth2 = restored.get("ethernet", "eth2").expect("eth2 must be in restored set");
+        assert_eq!(
+            eth2.fields["enabled"].value,
+            Value::Bool(true),
+            "eth2 enabled must be true after round-trip"
+        );
+    }
+
+    /// AC: All fields in the restored StateSet have Provenance::UserConfigured { policy_ref: "revert" }.
+    #[test]
+    fn test_to_state_set_sets_provenance_to_user_configured_revert() {
+        let serializable = SerializableStateSet {
+            entities: vec![super::SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                fields: serde_json::json!({ "mtu": 1500u64, "speed": 1000u64 }),
+            }],
+        };
+
+        let restored = serializable.to_state_set().expect("to_state_set must succeed");
+        let eth0 = restored.get("ethernet", "eth0").expect("eth0 must be present");
+
+        for (field_name, fv) in &eth0.fields {
+            match &fv.provenance {
+                Provenance::UserConfigured { policy_ref } => {
+                    assert_eq!(
+                        policy_ref, "revert",
+                        "field '{}' must have policy_ref=\"revert\", got \"{}\"",
+                        field_name, policy_ref
+                    );
+                }
+                other => panic!(
+                    "field '{}' must have UserConfigured provenance, got {:?}",
+                    field_name, other
+                ),
+            }
+        }
+    }
+
+    /// AC: entity_type and selector name are preserved through to_state_set().
+    #[test]
+    fn test_to_state_set_preserves_entity_type_and_selector_name() {
+        let serializable = SerializableStateSet {
+            entities: vec![super::SerializableState {
+                entity_type: "bond".to_string(),
+                selector_name: "bond0".to_string(),
+                fields: serde_json::json!({ "mtu": 9000u64 }),
+            }],
+        };
+
+        let restored = serializable.to_state_set().expect("to_state_set must succeed");
+        let bond0 = restored.get("bond", "bond0").expect("bond0 must be in restored set");
+        assert_eq!(bond0.entity_type, "bond", "entity_type must be 'bond'");
+        assert_eq!(
+            bond0.selector.key(),
+            "bond0",
+            "selector key must be 'bond0'"
+        );
+    }
+
+    /// AC: IP network addresses (CIDR notation) round-trip through to_state_set.
+    #[test]
+    fn test_to_state_set_round_trip_with_ip_network_fields() {
+        // Use canonical network addresses (no host bits set) to avoid canonicalization
+        // changing e.g. "10.99.0.1/24" → "10.99.0.0/24".
+        let serializable = SerializableStateSet {
+            entities: vec![super::SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                fields: serde_json::json!({ "gateway": "10.0.0.0/24" }),
+            }],
+        };
+
+        let restored = serializable.to_state_set().expect("to_state_set must succeed");
+        let eth0 = restored.get("ethernet", "eth0").expect("eth0 must be present");
+
+        let gateway = eth0.fields.get("gateway").expect("gateway field must be present");
+        assert!(
+            gateway.value.as_ip_network().is_some(),
+            "IP CIDR field must deserialize to Value::IpNetwork, not String"
+        );
+        assert_eq!(
+            gateway.value.as_ip_network().unwrap().to_string(),
+            "10.0.0.0/24",
+            "IP network must round-trip with correct CIDR notation"
+        );
+    }
+
+    /// AC: A list of IP networks (addresses field) round-trips through to_state_set.
+    #[test]
+    fn test_to_state_set_round_trip_with_list_of_ip_networks() {
+        let serializable = SerializableStateSet {
+            entities: vec![super::SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                // Use canonical network addresses (no host bits).
+                fields: serde_json::json!({
+                    "addresses": ["192.168.0.0/24", "172.16.0.0/16"]
+                }),
+            }],
+        };
+
+        let restored = serializable.to_state_set().expect("to_state_set must succeed");
+        let eth0 = restored.get("ethernet", "eth0").expect("eth0 must be present");
+
+        let addresses = eth0.fields.get("addresses").expect("addresses field must be present");
+        let list = addresses.value.as_list().expect("addresses must be a Value::List");
+        assert_eq!(list.len(), 2, "addresses list must have 2 entries");
+        assert!(
+            list[0].as_ip_network().is_some(),
+            "first address must be Value::IpNetwork"
+        );
+        assert!(
+            list[1].as_ip_network().is_some(),
+            "second address must be Value::IpNetwork"
+        );
+        assert_eq!(
+            list[0].as_ip_network().unwrap().to_string(),
+            "192.168.0.0/24"
+        );
+        assert_eq!(
+            list[1].as_ip_network().unwrap().to_string(),
+            "172.16.0.0/16"
+        );
+    }
+
+    /// AC: to_state_set returns Err when fields is not a JSON object.
+    #[test]
+    fn test_to_state_set_returns_error_when_fields_is_not_an_object() {
+        let bad_state_set = SerializableStateSet {
+            entities: vec![super::SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                fields: serde_json::json!("this is a string, not an object"),
+            }],
+        };
+
+        let result = bad_state_set.to_state_set();
+        assert!(
+            result.is_err(),
+            "to_state_set must return Err when fields is not a JSON object"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("eth0") || err.contains("fields must be a JSON object"),
+            "error message must identify the entity; got: {err}"
+        );
+    }
+
+    /// AC: Empty SerializableStateSet round-trips to an empty StateSet.
+    #[test]
+    fn test_to_state_set_empty_round_trips_to_empty_state_set() {
+        let empty = SerializableStateSet { entities: vec![] };
+        let restored = empty.to_state_set().expect("empty to_state_set must succeed");
+        assert!(restored.is_empty(), "empty SerializableStateSet must produce empty StateSet");
+    }
+
+    /// AC: String fields round-trip through to_state_set.
+    #[test]
+    fn test_to_state_set_round_trip_with_string_field() {
+        let serializable = SerializableStateSet {
+            entities: vec![super::SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                fields: serde_json::json!({ "label": "primary-uplink" }),
+            }],
+        };
+
+        let restored = serializable.to_state_set().expect("to_state_set must succeed");
+        let eth0 = restored.get("ethernet", "eth0").expect("eth0 must be present");
+        assert_eq!(
+            eth0.fields["label"].value,
+            Value::String("primary-uplink".to_string()),
+            "string field must round-trip as Value::String"
+        );
     }
 }

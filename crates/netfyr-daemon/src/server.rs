@@ -15,9 +15,10 @@ use std::time::Instant;
 use anyhow::Result;
 use netfyr_backend::FactoryEvent;
 use netfyr_journal::Trigger;
+use netfyr_reconcile::DiffKind;
 use netfyr_varlink::{
-    convert_apply_report_with_conflicts, VarlinkDaemonStatus, VarlinkFactoryStatus, VarlinkPolicy,
-    VarlinkSelector, VarlinkState, VarlinkStateDiff,
+    convert_apply_report_with_conflicts, VarlinkApplyReport, VarlinkChangeEntry, VarlinkDaemonStatus,
+    VarlinkFactoryStatus, VarlinkPolicy, VarlinkSelector, VarlinkState, VarlinkStateDiff,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -398,6 +399,135 @@ async fn handle_get_journal_entry(
     write_success(stream, serde_json::json!({ "entry": entry_value })).await
 }
 
+/// `io.netfyr.Revert` — revert system state to match a historical journal snapshot.
+async fn handle_revert(
+    stream: &mut UnixStream,
+    params: &serde_json::Value,
+    policy_store: &PolicyStore,
+    reconciler: &Reconciler,
+) -> Result<()> {
+    let target_seq = match params.get("target_seq").and_then(|v| v.as_u64()) {
+        Some(s) => s,
+        None => {
+            return write_error(
+                stream,
+                "InternalError",
+                "missing or invalid 'target_seq' parameter",
+            )
+            .await;
+        }
+    };
+    let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let journal = match netfyr_journal::Journal::open_default() {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to open journal: {}", e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    let entry = match journal.read_entry(target_seq) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return write_error(
+                stream,
+                "EntryNotFound",
+                &format!("Entry #{} not found", target_seq),
+            )
+            .await;
+        }
+        Err(e) => {
+            error!("Failed to read journal entry #{}: {}", target_seq, e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    let entry_timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let target_state = match entry.state_after.to_state_set() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to convert journal snapshot to StateSet: {}", e);
+            return write_error(stream, "InternalError", &e).await;
+        }
+    };
+
+    let result = match reconciler
+        .revert(&target_state, target_seq, policy_store.policies(), dry_run)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Revert failed: {}", e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    let varlink_report = match result.report {
+        Some(report) => VarlinkApplyReport::from(report),
+        None => {
+            // dry_run: build a planned report from the reconcile diff
+            let changes: Vec<VarlinkChangeEntry> = result
+                .reconcile_diff
+                .operations
+                .iter()
+                .map(|op| {
+                    let kind = match op.kind {
+                        DiffKind::Add => "add",
+                        DiffKind::Modify => "modify",
+                        DiffKind::Remove => "remove",
+                    }
+                    .to_string();
+                    let desc = op
+                        .field_changes
+                        .iter()
+                        .filter_map(|fc| {
+                            use netfyr_reconcile::FieldChangeKind;
+                            match &fc.change {
+                                FieldChangeKind::Set { current: Some(cur), desired } => {
+                                    Some(format!("{}: {} -> {}", fc.field_name, cur.value, desired.value))
+                                }
+                                FieldChangeKind::Set { current: None, desired } => {
+                                    Some(format!("{}: {}", fc.field_name, desired.value))
+                                }
+                                FieldChangeKind::Unset { current } => {
+                                    Some(format!("{}: {} (removed)", fc.field_name, current.value))
+                                }
+                                FieldChangeKind::Unchanged { .. } => None,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    VarlinkChangeEntry {
+                        kind,
+                        entity_type: op.entity_type.clone(),
+                        entity_name: op.selector.key(),
+                        description: desc,
+                        status: "planned".to_string(),
+                    }
+                })
+                .collect();
+            VarlinkApplyReport {
+                succeeded: 0,
+                failed: 0,
+                skipped: 0,
+                changes,
+                conflicts: vec![],
+            }
+        }
+    };
+
+    write_success(
+        stream,
+        serde_json::json!({
+            "report": varlink_report,
+            "entry_timestamp": entry_timestamp,
+        }),
+    )
+    .await
+}
+
 fn server_trigger_type_str(trigger: &netfyr_journal::Trigger) -> &'static str {
     match trigger {
         netfyr_journal::Trigger::PolicyApply { .. } => "policy_apply",
@@ -508,6 +638,9 @@ async fn handle_connection(
             }
             "io.netfyr.GetHistory" => handle_get_history(stream, &params).await,
             "io.netfyr.GetJournalEntry" => handle_get_journal_entry(stream, &params).await,
+            "io.netfyr.Revert" => {
+                handle_revert(stream, &params, policy_store, reconciler).await
+            }
             other => {
                 write_error(
                     stream,

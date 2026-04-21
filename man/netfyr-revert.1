@@ -1,0 +1,52 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-revert 1  "netfyr-revert " 
+.SH NAME
+netfyr\-revert \- Revert system state to match a journal snapshot
+.SH SYNOPSIS
+\fBnetfyr\-revert\fR [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fITARGET\fR> 
+.SH DESCRIPTION
+Revert system state to match a journal snapshot
+.PP
+Reads the target entry\*(Aqs state_after snapshot, computes the diff from the current system state to the target state, and applies it.
+.PP
+If the netfyr daemon is running, the revert is executed via Varlink. Otherwise, changes are applied directly.
+.PP
+Use \-\-dry\-run to preview changes without applying them.
+.SH OPTIONS
+.TP
+\fB\-\-dry\-run\fR
+Preview the changes without applying
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fITARGET\fR>
+Sequence ID of the journal entry to revert to. System state will be restored to match this entry\*(Aqs state_after snapshot
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+See
+.BR netfyr-revert (1)
+for usage details.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-apply (1),
+.BR netfyr-query (1),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

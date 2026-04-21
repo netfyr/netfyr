@@ -1,4 +1,4 @@
-use netfyr_cli::{run_apply, run_history, run_query, Cli, Commands};
+use netfyr_cli::{run_apply, run_history, run_query, run_revert, Cli, Commands};
 
 use clap::Parser;
 use std::process::ExitCode;
@@ -28,6 +28,13 @@ async fn main() -> ExitCode {
             }
         },
         Commands::History(args) => match run_history(args).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("Error: {:#}", e);
+                ExitCode::from(2u8)
+            }
+        },
+        Commands::Revert(args) => match run_revert(args).await {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("Error: {:#}", e);

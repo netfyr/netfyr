@@ -7,10 +7,12 @@
 pub mod apply;
 pub mod history;
 pub mod query;
+pub mod revert;
 
 pub use apply::run_apply;
 pub use history::run_history;
 pub use query::run_query;
+pub use revert::run_revert;
 
 use clap::{Parser, Subcommand};
 
@@ -84,4 +86,15 @@ pub enum Commands {
     /// If the netfyr daemon is running, history is retrieved via Varlink.
     /// Otherwise, journal files are read directly.
     History(history::HistoryArgs),
+
+    /// Revert system state to match a journal snapshot
+    ///
+    /// Reads the target entry's state_after snapshot, computes the diff from
+    /// the current system state to the target state, and applies it.
+    ///
+    /// If the netfyr daemon is running, the revert is executed via Varlink.
+    /// Otherwise, changes are applied directly.
+    ///
+    /// Use --dry-run to preview changes without applying them.
+    Revert(revert::RevertArgs),
 }

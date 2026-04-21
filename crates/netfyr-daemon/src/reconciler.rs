@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use netfyr_backend::{ApplyReport, BackendRegistry, NetlinkBackend};
 use netfyr_journal::{
-    summarize_policies, ApplyOutcome, Journal, JournalEntry, SerializableDiff,
+    summarize_policies, ApplyOutcome, Journal, JournalEntry, SequenceId, SerializableDiff,
     SerializableDiffOp, SerializableFieldChange, SerializableState, SerializableStateSet, Trigger,
 };
-use netfyr_policy::{FactoryType, StaticFactory, StateFactory};
+use netfyr_policy::{FactoryType, Policy, StaticFactory, StateFactory};
 use netfyr_reconcile::{
     generate_diff, merge, ConflictReport, EntityKey, PolicyId, PolicyInput,
     StateDiff as ReconcileStateDiff,
@@ -30,6 +30,16 @@ use crate::policy_store::PolicyStore;
 pub struct ApplyResult {
     pub report: ApplyReport,
     pub conflicts: ConflictReport,
+}
+
+// ── RevertResult ──────────────────────────────────────────────────────────────
+
+/// The result of a revert operation.
+pub struct RevertResult {
+    /// Rich diff for display and journal recording.
+    pub reconcile_diff: ReconcileStateDiff,
+    /// Apply report; `None` if this was a dry-run.
+    pub report: Option<ApplyReport>,
 }
 
 // ── Reconciler ────────────────────────────────────────────────────────────────
@@ -351,6 +361,87 @@ impl Reconciler {
         Ok((reconcile_diff, conflicts))
     }
 
+    /// Revert the system to match a historical journal snapshot.
+    ///
+    /// Computes the diff from the current system state to `target_state`, then
+    /// applies it (unless `dry_run` is true). Records a journal entry on apply.
+    pub async fn revert(
+        &self,
+        target_state: &StateSet,
+        target_seq: SequenceId,
+        policies: &[Policy],
+        dry_run: bool,
+    ) -> Result<RevertResult> {
+        let actual_state = self.backend_registry.query_all().await?;
+
+        let managed_entities: HashSet<EntityKey> = target_state.entities().into_iter().collect();
+
+        let reconcile_diff = generate_diff(
+            target_state,
+            &actual_state,
+            &managed_entities,
+            &self.schema_registry,
+        );
+
+        // Restrict actual state to only entities present in the target snapshot.
+        let mut managed_actual = StateSet::new();
+        for (entity_type, selector_key) in target_state.entities() {
+            if let Some(state) = actual_state.get(&entity_type, &selector_key) {
+                managed_actual.insert(state.clone());
+            }
+        }
+
+        let state_diff = netfyr_state::diff::diff(&managed_actual, target_state);
+
+        if dry_run {
+            return Ok(RevertResult {
+                reconcile_diff,
+                report: None,
+            });
+        }
+
+        if state_diff.is_empty() {
+            self.append_revert_journal_entry(
+                policies,
+                target_seq,
+                &reconcile_diff,
+                target_state,
+                ApplyOutcome::Applied { succeeded: 0, failed: 0, skipped: 0 },
+            );
+            return Ok(RevertResult {
+                reconcile_diff,
+                report: Some(ApplyReport::new()),
+            });
+        }
+
+        self.set_applying(true);
+        let apply_report = match self.backend_registry.apply(&state_diff).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_applying(false);
+                return Err(e.into());
+            }
+        };
+        self.set_applying(false);
+
+        self.append_revert_journal_entry(
+            policies,
+            target_seq,
+            &reconcile_diff,
+            target_state,
+            ApplyOutcome::Applied {
+                succeeded: apply_report.succeeded.len() as u32,
+                failed: apply_report.failed.len() as u32,
+                skipped: apply_report.skipped.len() as u32,
+            },
+        );
+
+        Ok(RevertResult {
+            reconcile_diff,
+            report: Some(apply_report),
+        })
+    }
+
     /// Query current system state via the backend registry.
     pub async fn query(
         &self,
@@ -398,6 +489,37 @@ impl Reconciler {
             };
             if let Err(e) = journal.append(entry) {
                 tracing::warn!("Failed to write journal entry: {}", e);
+            }
+        }
+    }
+
+    fn append_revert_journal_entry(
+        &self,
+        policies: &[Policy],
+        target_seq: SequenceId,
+        reconcile_diff: &ReconcileStateDiff,
+        target_state: &StateSet,
+        outcome: ApplyOutcome,
+    ) {
+        let mut guard = match self.journal.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("Journal mutex poisoned: {}", e);
+                return;
+            }
+        };
+        if let Some(ref mut journal) = *guard {
+            let entry = JournalEntry {
+                seq: 0,
+                timestamp: chrono::Utc::now(),
+                trigger: Trigger::Revert { target_seq },
+                active_policies: summarize_policies(policies),
+                diff: SerializableDiff::from(reconcile_diff),
+                state_after: SerializableStateSet::from(target_state),
+                outcome,
+            };
+            if let Err(e) = journal.append(entry) {
+                tracing::warn!("Failed to write revert journal entry: {}", e);
             }
         }
     }

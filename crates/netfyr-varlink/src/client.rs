@@ -53,6 +53,11 @@ pub enum VarlinkError {
     /// The server returned `io.netfyr.InternalError` — an unexpected daemon error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// The server returned `io.netfyr.EntryNotFound` — the requested journal entry
+    /// does not exist.
+    #[error("entry not found: {0}")]
+    EntryNotFound(String),
 }
 
 // ── VarlinkClient ─────────────────────────────────────────────────────────────
@@ -194,6 +199,27 @@ impl VarlinkClient {
         })
     }
 
+    /// Revert the system to match a historical journal snapshot.
+    ///
+    /// If `dry_run` is true, computes and returns the diff without applying.
+    /// Returns the apply report and the ISO 8601 timestamp of the target entry.
+    pub async fn revert(
+        &mut self,
+        target_seq: u64,
+        dry_run: bool,
+    ) -> Result<(VarlinkApplyReport, String), VarlinkError> {
+        let params = serde_json::json!({ "target_seq": target_seq, "dry_run": dry_run });
+        let response = self.call("io.netfyr.Revert", params).await?;
+        let report = serde_json::from_value(response["report"].clone()).map_err(|e| {
+            VarlinkError::Protocol(format!("failed to decode ApplyReport: {e}"))
+        })?;
+        let entry_timestamp = response["entry_timestamp"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        Ok((report, entry_timestamp))
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Send a Varlink request and return the `parameters` object from the response.
@@ -236,6 +262,7 @@ impl VarlinkClient {
                 "io.netfyr.InvalidPolicy" => VarlinkError::InvalidPolicy(reason),
                 "io.netfyr.BackendError" => VarlinkError::Backend(reason),
                 "io.netfyr.InternalError" => VarlinkError::Internal(reason),
+                "io.netfyr.EntryNotFound" => VarlinkError::EntryNotFound(reason),
                 other => VarlinkError::Protocol(format!("unknown error '{other}': {reason}")),
             });
         }
@@ -716,6 +743,170 @@ mod tests {
         assert!(
             matches!(result, Err(VarlinkError::Protocol(_))),
             "expected Protocol error for unknown error name, got {result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    // ── Scenario: Revert ──────────────────────────────────────────────────────
+
+    /// AC: revert sends io.netfyr.Revert with target_seq and dry_run=false.
+    #[tokio::test]
+    async fn test_revert_sends_correct_method_and_parameters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let response_params = serde_json::json!({
+            "report": {
+                "succeeded": 1,
+                "failed": 0,
+                "skipped": 0,
+                "changes": [],
+                "conflicts": []
+            },
+            "entry_timestamp": "2026-04-20T14:30:00Z"
+        });
+        let server = spawn_mock_server(path.clone(), response_params);
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.revert(143, false).await;
+        assert!(result.is_ok(), "revert must succeed, got {result:?}");
+
+        let req = server.await.unwrap();
+        assert_eq!(
+            req["method"].as_str(),
+            Some("io.netfyr.Revert"),
+            "method must be io.netfyr.Revert"
+        );
+        assert_eq!(
+            req["parameters"]["target_seq"].as_u64(),
+            Some(143),
+            "target_seq must be 143"
+        );
+        assert_eq!(
+            req["parameters"]["dry_run"].as_bool(),
+            Some(false),
+            "dry_run must be false"
+        );
+    }
+
+    /// AC: revert returns the ApplyReport and entry_timestamp from the server response.
+    #[tokio::test]
+    async fn test_revert_returns_apply_report_and_entry_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let response_params = serde_json::json!({
+            "report": {
+                "succeeded": 2,
+                "failed": 0,
+                "skipped": 1,
+                "changes": [],
+                "conflicts": []
+            },
+            "entry_timestamp": "2026-04-20T15:00:00Z"
+        });
+        let server = spawn_mock_server(path.clone(), response_params);
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let (report, timestamp) = client.revert(143, false).await.unwrap();
+
+        assert_eq!(report.succeeded, 2, "report.succeeded must be 2");
+        assert_eq!(report.failed, 0, "report.failed must be 0");
+        assert_eq!(report.skipped, 1, "report.skipped must be 1");
+        assert_eq!(
+            timestamp, "2026-04-20T15:00:00Z",
+            "entry_timestamp must be the ISO 8601 timestamp"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// AC: revert with dry_run=true sends dry_run=true in the request.
+    #[tokio::test]
+    async fn test_revert_dry_run_sends_dry_run_true() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let response_params = serde_json::json!({
+            "report": {
+                "succeeded": 0,
+                "failed": 0,
+                "skipped": 0,
+                "changes": [],
+                "conflicts": []
+            },
+            "entry_timestamp": "2026-04-20T14:30:00Z"
+        });
+        let server = spawn_mock_server(path.clone(), response_params);
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        client.revert(5, true).await.unwrap();
+
+        let req = server.await.unwrap();
+        assert_eq!(
+            req["parameters"]["dry_run"].as_bool(),
+            Some(true),
+            "dry_run must be true when called with dry_run=true"
+        );
+        assert_eq!(
+            req["parameters"]["target_seq"].as_u64(),
+            Some(5),
+            "target_seq must be forwarded correctly"
+        );
+    }
+
+    /// AC: revert with EntryNotFound server error returns VarlinkError::EntryNotFound.
+    #[tokio::test]
+    async fn test_revert_entry_not_found_returns_entry_not_found_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_error_server(
+            path.clone(),
+            "io.netfyr.EntryNotFound",
+            "entry #9999 not found in journal",
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.revert(9999, false).await;
+
+        assert!(
+            matches!(result, Err(VarlinkError::EntryNotFound(_))),
+            "expected EntryNotFound error, got {result:?}"
+        );
+        if let Err(VarlinkError::EntryNotFound(msg)) = result {
+            assert!(
+                msg.contains("9999") || msg.contains("not found"),
+                "error reason must identify the missing entry; got: {msg}"
+            );
+        }
+        server.await.unwrap();
+    }
+
+    /// AC: when entry_timestamp is missing from response, it falls back to "unknown".
+    #[tokio::test]
+    async fn test_revert_missing_entry_timestamp_falls_back_to_unknown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        // Response has report but no entry_timestamp field.
+        let response_params = serde_json::json!({
+            "report": {
+                "succeeded": 0,
+                "failed": 0,
+                "skipped": 0,
+                "changes": [],
+                "conflicts": []
+            }
+        });
+        let server = spawn_mock_server(path.clone(), response_params);
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let (_, timestamp) = client.revert(1, false).await.unwrap();
+
+        assert_eq!(
+            timestamp, "unknown",
+            "missing entry_timestamp must fall back to \"unknown\""
         );
         server.await.unwrap();
     }

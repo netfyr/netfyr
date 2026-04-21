@@ -344,7 +344,7 @@ fn policies_to_inputs(policy_set: &PolicySet) -> Result<Vec<PolicyInput>> {
 
 // ── Backend registry ──────────────────────────────────────────────────────────
 
-fn create_backend_registry() -> BackendRegistry {
+pub(crate) fn create_backend_registry() -> BackendRegistry {
     let mut registry = BackendRegistry::new();
     // NetlinkBackend is the only backend; registration cannot fail for a single backend.
     registry
@@ -360,7 +360,7 @@ fn create_backend_registry() -> BackendRegistry {
 /// - `2`: total failure (no operations succeeded, at least one failed)
 /// - `1`: partial failure or conflicts detected
 /// - `0`: all operations succeeded, no conflicts
-fn determine_exit_code(report: &ApplyReport, conflicts: &ConflictReport) -> ExitCode {
+pub(crate) fn determine_exit_code(report: &ApplyReport, conflicts: &ConflictReport) -> ExitCode {
     if report.is_total_failure() {
         ExitCode::from(2u8)
     } else if report.is_partial() || !conflicts.is_empty() {
