@@ -1,11 +1,12 @@
 //! Netlink monitor for external network state change detection.
 //!
-//! Subscribes to RTNLGRP_LINK (link attribute changes) and
-//! RTNLGRP_IPV4_IFADDR (address additions/removals) multicast groups and
+//! Subscribes to RTNLGRP_LINK (link attribute changes),
+//! RTNLGRP_IPV4_IFADDR (address additions/removals), and
+//! RTNLGRP_IPV4_ROUTE (route additions/removals) multicast groups and
 //! emits debounced change notifications to the daemon's event loop.
 //!
 //! Message parsing uses raw byte offsets against the fixed-size Linux kernel
-//! structs (nlmsghdr, ifinfomsg, ifaddrmsg, nlattr) rather than importing an
+//! structs (nlmsghdr, ifinfomsg, ifaddrmsg, rtmsg, nlattr) rather than importing an
 //! additional parsing crate. These layouts are stable ABI and documented in
 //! linux/netlink.h and linux/rtnetlink.h.
 
@@ -24,6 +25,7 @@ use tracing::{debug, error, warn};
 
 const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_IPV4_IFADDR: u32 = 5;
+const RTNLGRP_IPV4_ROUTE: u32 = 6;
 
 // ── RTnetlink message types (from linux/rtnetlink.h) ─────────────────────────
 
@@ -32,6 +34,8 @@ const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 
 // ── Netlink control message types (linux/netlink.h) ───────────────────────────
 
@@ -49,12 +53,19 @@ const NLM_F_DUMP: u16 = 0x300; // NLM_F_ROOT | NLM_F_MATCH
 // ── Attribute types ───────────────────────────────────────────────────────────
 
 const IFLA_IFNAME: u16 = 3;
+/// Route output interface attribute (RTA_OIF) — carries the ifindex of the
+/// output interface for a route.
+const RTA_OIF: u16 = 7;
 
 // ── Fixed-size struct layouts (bytes) ────────────────────────────────────────
 
 const NLMSG_HDR_LEN: usize = 16; // sizeof(struct nlmsghdr)
 const IFINFOMSG_LEN: usize = 16; // sizeof(struct ifinfomsg)
 const IFADDRMSG_LEN: usize = 8; // sizeof(struct ifaddrmsg)
+/// sizeof(struct rtmsg): rtm_family(1)+rtm_dst_len(1)+rtm_src_len(1)+rtm_tos(1)
+///   +rtm_table(1)+rtm_protocol(1)+rtm_scope(1)+rtm_type(1)+rtm_flags(4) = 12 bytes.
+/// Stable Linux ABI since kernel 2.2.
+const RTMSG_LEN: usize = 12;
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 
@@ -72,6 +83,10 @@ pub enum ChangeKind {
     AddressAdded,
     /// An IPv4 address was removed from an interface.
     AddressRemoved,
+    /// An IPv4 route was added via an interface.
+    RouteAdded,
+    /// An IPv4 route was removed via an interface.
+    RouteRemoved,
 }
 
 /// A single parsed netlink change notification.
@@ -127,6 +142,9 @@ impl NetlinkMonitor {
         socket
             .add_membership(RTNLGRP_IPV4_IFADDR)
             .map_err(|e| anyhow::anyhow!("Failed to join RTNLGRP_IPV4_IFADDR: {}", e))?;
+        socket
+            .add_membership(RTNLGRP_IPV4_ROUTE)
+            .map_err(|e| anyhow::anyhow!("Failed to join RTNLGRP_IPV4_ROUTE: {}", e))?;
 
         // Larger receive buffer reduces risk of ENOBUFS under heavy event load.
         let _ = socket.set_rx_buf_sz(1024u32 * 1024);
@@ -367,6 +385,8 @@ fn kind_eq(a: &ChangeKind, b: &ChangeKind) -> bool {
         (ChangeKind::LinkChanged, ChangeKind::LinkChanged)
             | (ChangeKind::AddressAdded, ChangeKind::AddressAdded)
             | (ChangeKind::AddressRemoved, ChangeKind::AddressRemoved)
+            | (ChangeKind::RouteAdded, ChangeKind::RouteAdded)
+            | (ChangeKind::RouteRemoved, ChangeKind::RouteRemoved)
     )
 }
 
@@ -438,6 +458,14 @@ fn parse_message(nlmsg_type: u16, buf: &[u8]) -> Option<(u32, Option<String>, Ch
             let ifindex = parse_addr_message(buf)?;
             Some((ifindex, None, ChangeKind::AddressRemoved))
         }
+        RTM_NEWROUTE => {
+            let ifindex = parse_route_message(buf)?;
+            Some((ifindex, None, ChangeKind::RouteAdded))
+        }
+        RTM_DELROUTE => {
+            let ifindex = parse_route_message(buf)?;
+            Some((ifindex, None, ChangeKind::RouteRemoved))
+        }
         _ => {
             debug!(nlmsg_type, "ignoring netlink message type");
             None
@@ -495,6 +523,52 @@ fn parse_addr_message(buf: &[u8]) -> Option<u32> {
         buf[index_off + 2],
         buf[index_off + 3],
     ]))
+}
+
+/// Extract the output interface index (RTA_OIF) from an RTM_NEWROUTE or RTM_DELROUTE message.
+///
+/// struct rtmsg layout (12 bytes):
+///   rtm_family(u8) rtm_dst_len(u8) rtm_src_len(u8) rtm_tos(u8)
+///   rtm_table(u8) rtm_protocol(u8) rtm_scope(u8) rtm_type(u8)
+///   rtm_flags(u32)
+///
+/// Returns `None` if the buffer is too short or if RTA_OIF is absent (e.g.,
+/// blackhole/unreachable routes that have no output interface).
+fn parse_route_message(buf: &[u8]) -> Option<u32> {
+    if buf.len() < NLMSG_HDR_LEN + RTMSG_LEN {
+        return None;
+    }
+    parse_nlattr_u32(buf, NLMSG_HDR_LEN + RTMSG_LEN, RTA_OIF)
+}
+
+/// Scan netlink attributes starting at `start`, returning the value of the
+/// first attribute with `target_type` as a native-endian u32.
+///
+/// struct nlattr: nla_len(u16) nla_type(u16) data[nla_len - 4]
+/// Attributes are 4-byte aligned.
+fn parse_nlattr_u32(buf: &[u8], start: usize, target_type: u16) -> Option<u32> {
+    let mut pos = start;
+    while pos + 4 <= buf.len() {
+        let nla_len = u16::from_ne_bytes([buf[pos], buf[pos + 1]]) as usize;
+        let nla_type = u16::from_ne_bytes([buf[pos + 2], buf[pos + 3]]);
+        if nla_len < 4 {
+            break;
+        }
+        let data_end = pos + nla_len;
+        if data_end > buf.len() {
+            break;
+        }
+        if nla_type == target_type {
+            let data = &buf[pos + 4..data_end];
+            if data.len() < 4 {
+                return None;
+            }
+            return Some(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]));
+        }
+        let aligned = (nla_len + 3) & !3;
+        pos += aligned.max(4);
+    }
+    None
 }
 
 /// Scan netlink attributes starting at `start`, returning the value of the
@@ -966,5 +1040,164 @@ mod tests {
             ifname.is_none(),
             "ifname must be None when no link message has been seen for this ifindex"
         );
+    }
+
+    // ── Route message test helpers ────────────────────────────────────────────
+
+    /// Build an RTM_NEWROUTE or RTM_DELROUTE buffer with an RTA_OIF attribute.
+    ///
+    /// Layout: nlmsghdr(16) + rtmsg(12) + RTA_OIF nlattr(8: nla_len=8,nla_type=7,ifindex u32)
+    fn build_route_msg(msg_type: u16, oif_ifindex: u32) -> Vec<u8> {
+        let attr_len: usize = 8; // nla_len(2) + nla_type(2) + u32(4)
+        let msg_len = NLMSG_HDR_LEN + RTMSG_LEN + attr_len;
+        let mut buf = vec![0u8; msg_len];
+
+        // nlmsghdr
+        buf[0..4].copy_from_slice(&(msg_len as u32).to_ne_bytes());
+        buf[4..6].copy_from_slice(&msg_type.to_ne_bytes());
+
+        // rtmsg is all zeros (family=AF_UNSPEC, etc.) — valid for testing
+
+        // RTA_OIF nlattr at offset NLMSG_HDR_LEN + RTMSG_LEN
+        let attr_off = NLMSG_HDR_LEN + RTMSG_LEN;
+        buf[attr_off..attr_off + 2].copy_from_slice(&(attr_len as u16).to_ne_bytes()); // nla_len
+        buf[attr_off + 2..attr_off + 4].copy_from_slice(&RTA_OIF.to_ne_bytes()); // nla_type
+        buf[attr_off + 4..attr_off + 8].copy_from_slice(&oif_ifindex.to_ne_bytes()); // ifindex
+
+        buf
+    }
+
+    // ── AC: ChangeKind route variants ────────────────────────────────────────
+
+    #[test]
+    fn test_change_kind_route_added_variant_exists() {
+        assert!(matches!(ChangeKind::RouteAdded, ChangeKind::RouteAdded));
+    }
+
+    #[test]
+    fn test_change_kind_route_removed_variant_exists() {
+        assert!(matches!(ChangeKind::RouteRemoved, ChangeKind::RouteRemoved));
+    }
+
+    // ── AC: kind_eq for route variants ────────────────────────────────────────
+
+    #[test]
+    fn test_kind_eq_route_added_equals_route_added() {
+        assert!(kind_eq(&ChangeKind::RouteAdded, &ChangeKind::RouteAdded));
+    }
+
+    #[test]
+    fn test_kind_eq_route_removed_equals_route_removed() {
+        assert!(kind_eq(&ChangeKind::RouteRemoved, &ChangeKind::RouteRemoved));
+    }
+
+    #[test]
+    fn test_kind_eq_route_added_not_equal_to_route_removed() {
+        assert!(!kind_eq(&ChangeKind::RouteAdded, &ChangeKind::RouteRemoved));
+        assert!(!kind_eq(&ChangeKind::RouteRemoved, &ChangeKind::RouteAdded));
+    }
+
+    #[test]
+    fn test_kind_eq_route_variants_not_equal_to_link_or_address() {
+        assert!(!kind_eq(&ChangeKind::RouteAdded, &ChangeKind::LinkChanged));
+        assert!(!kind_eq(&ChangeKind::RouteAdded, &ChangeKind::AddressAdded));
+        assert!(!kind_eq(&ChangeKind::RouteAdded, &ChangeKind::AddressRemoved));
+        assert!(!kind_eq(&ChangeKind::RouteRemoved, &ChangeKind::LinkChanged));
+        assert!(!kind_eq(&ChangeKind::RouteRemoved, &ChangeKind::AddressAdded));
+        assert!(!kind_eq(&ChangeKind::RouteRemoved, &ChangeKind::AddressRemoved));
+    }
+
+    // ── AC: process_buffer handles RTM_NEWROUTE ───────────────────────────────
+
+    #[test]
+    fn test_process_buffer_rtm_newroute_produces_route_added() {
+        let buf = build_route_msg(RTM_NEWROUTE, 5);
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending, "RTM_NEWROUTE must set has_pending");
+        assert!(pending.contains_key(&5), "pending must contain oif ifindex 5");
+        let (_, kinds) = &pending[&5];
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::RouteAdded)),
+            "RTM_NEWROUTE must produce RouteAdded"
+        );
+    }
+
+    // ── AC: process_buffer handles RTM_DELROUTE ───────────────────────────────
+
+    #[test]
+    fn test_process_buffer_rtm_delroute_produces_route_removed() {
+        let buf = build_route_msg(RTM_DELROUTE, 5);
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending, "RTM_DELROUTE must set has_pending");
+        assert!(pending.contains_key(&5));
+        let (_, kinds) = &pending[&5];
+        assert!(
+            kinds.iter().any(|k| matches!(k, ChangeKind::RouteRemoved)),
+            "RTM_DELROUTE must produce RouteRemoved"
+        );
+    }
+
+    // ── AC: Route message without RTA_OIF is ignored ──────────────────────────
+
+    #[test]
+    fn test_process_buffer_route_message_without_rta_oif_is_ignored() {
+        // Build a route message with no attributes (just nlmsghdr + rtmsg).
+        let msg_len = NLMSG_HDR_LEN + RTMSG_LEN;
+        let mut buf = vec![0u8; msg_len];
+        buf[0..4].copy_from_slice(&(msg_len as u32).to_ne_bytes());
+        buf[4..6].copy_from_slice(&RTM_NEWROUTE.to_ne_bytes());
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(!has_pending, "route message without RTA_OIF must be ignored");
+        assert!(pending.is_empty());
+    }
+
+    // ── AC: Name cache resolves ifname for route messages ────────────────────
+
+    #[test]
+    fn test_name_cache_resolves_ifname_for_route_message() {
+        // RTM_NEWLINK for ifindex=5 → populates name cache with "eth5"
+        let link_msg = build_link_msg(RTM_NEWLINK, 5, "eth5");
+        // RTM_NEWROUTE with RTA_OIF=5 → should resolve ifname from cache
+        let route_msg = build_route_msg(RTM_NEWROUTE, 5);
+        let mut buf = link_msg;
+        buf.extend(route_msg);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending);
+        assert!(pending.contains_key(&5));
+        let (ifname, kinds) = &pending[&5];
+        assert_eq!(
+            ifname.as_deref(),
+            Some("eth5"),
+            "route message ifname must be resolved from name cache"
+        );
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::RouteAdded)));
+    }
+
+    // ── AC: Route and link changes coalesce into one pending entry ────────────
+
+    #[test]
+    fn test_route_and_link_changes_coalesce_into_one_pending_entry() {
+        let link_msg = build_link_msg(RTM_NEWLINK, 7, "eth7");
+        let route_msg = build_route_msg(RTM_NEWROUTE, 7);
+        let mut buf = link_msg;
+        buf.extend(route_msg);
+
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+        process_buffer(&buf, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert_eq!(pending.len(), 1, "link and route for same ifindex must share one pending entry");
+        let (_, kinds) = &pending[&7];
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::LinkChanged)));
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::RouteAdded)));
     }
 }
