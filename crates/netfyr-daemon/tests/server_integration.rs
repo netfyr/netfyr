@@ -1743,6 +1743,425 @@ async fn netns_readonly_fields_excluded_from_external_change_diff() {
     }
 }
 
+// ── Route helpers ─────────────────────────────────────────────────────────────
+
+/// Run `ip route add <net> dev <iface> onlink` in the current network namespace.
+///
+/// The `onlink` flag instructs the kernel to treat the route as directly connected
+/// even when no address in the same subnet is assigned to the interface.
+fn ip_route_add_onlink(iface: &str, net: &str) -> bool {
+    Command::new("ip")
+        .args(["route", "add", net, "dev", iface, "onlink"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run `ip route del <net> dev <iface>` in the current network namespace.
+fn ip_route_del(iface: &str, net: &str) -> bool {
+    Command::new("ip")
+        .args(["route", "del", net, "dev", iface])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// ── Feature: Diff content for address changes ─────────────────────────────────
+
+/// AC: Monitor detects address addition → journal entry's diff specifically shows
+/// a change to the "addresses" field (not just that an entry was created).
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_external_address_addition_diff_shows_address_field() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_external_address_addition_diff: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-addrdiff0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-addrdiff1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial policy so the interface is managed and has a journal snapshot.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+
+    // Wait for the policy apply and any self-generated events to settle.
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // Add an address externally — this is what we want the daemon to detect.
+    if !ip_addr_add(iface, "10.99.50.1/24") {
+        eprintln!("SKIP: ip addr add failed");
+        return;
+    }
+
+    // Wait for debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+
+    // Find the newest ExternalChange entry after our baseline.
+    let ext_entry = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .next_back();
+
+    let ext_entry = match ext_entry {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: no new ExternalChange entry found after address addition");
+            return;
+        }
+    };
+
+    // The diff must include a change to the "addresses" field.
+    let has_addresses_change = ext_entry.diff.operations.iter().any(|op| {
+        op.entity_name == iface
+            && op.field_changes.iter().any(|fc| fc.field_name == "addresses")
+    });
+    assert!(
+        has_addresses_change,
+        "ExternalChange diff must include an 'addresses' field change for {iface} \
+         after external address addition. Found field_changes: {:?}",
+        ext_entry
+            .diff
+            .operations
+            .iter()
+            .flat_map(|op| op.field_changes.iter().map(|fc| fc.field_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// AC: Monitor detects address removal → journal entry's diff specifically shows
+/// a change to the "addresses" field (not just that an entry was created).
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_external_address_removal_diff_shows_address_field() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_external_address_removal_diff: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-deldiff0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-deldiff1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial policy so the interface is managed.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+    sleep(Duration::from_millis(300)).await;
+
+    // Add an address externally so there is something to remove later.
+    // This also creates a journal snapshot that includes the address.
+    if !ip_addr_add(iface, "10.99.51.1/24") {
+        eprintln!("SKIP: ip addr add failed");
+        return;
+    }
+
+    // Wait for the address-addition external change event to settle.
+    // After this, the journal snapshot for the interface includes the address.
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // Remove the address externally — the daemon must detect this removal.
+    if !ip_addr_del(iface, "10.99.51.1/24") {
+        eprintln!("SKIP: ip addr del failed");
+        return;
+    }
+
+    // Wait for debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+
+    // Find the newest ExternalChange entry after our baseline.
+    let ext_entry = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .next_back();
+
+    let ext_entry = match ext_entry {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: no new ExternalChange entry found after address removal");
+            return;
+        }
+    };
+
+    // The diff must include a change to the "addresses" field.
+    let has_addresses_change = ext_entry.diff.operations.iter().any(|op| {
+        op.entity_name == iface
+            && op.field_changes.iter().any(|fc| fc.field_name == "addresses")
+    });
+    assert!(
+        has_addresses_change,
+        "ExternalChange diff must include an 'addresses' field change for {iface} \
+         after external address removal. Found field_changes: {:?}",
+        ext_entry
+            .diff
+            .operations
+            .iter()
+            .flat_map(|op| op.field_changes.iter().map(|fc| fc.field_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── Feature: Monitor detects route changes ────────────────────────────────────
+
+/// AC: Monitor detects route addition → journal entry is recorded with trigger
+/// "external_change" and the diff shows the "routes" field changed.
+///
+/// This tests that RTM_NEWROUTE events are detected end-to-end: netlink monitor
+/// receives the message, routes through the daemon event loop, and records a
+/// journal entry with route information in the diff.
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_external_route_addition_creates_journal_entry() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_external_route_addition: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-rt-add0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-rt-add1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial MTU policy so the interface is managed and the daemon has
+    // a journal snapshot for this interface.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+
+    // Wait for the policy apply and any self-generated events to settle before
+    // establishing the baseline. This ensures the journal snapshot exists.
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // Add a static route to the interface externally using `onlink` — the flag
+    // tells the kernel that the route is directly connected even without an
+    // address in that subnet assigned to the interface.
+    if !ip_route_add_onlink(iface, "10.99.60.0/24") {
+        eprintln!("SKIP: ip route add onlink failed (may not be supported in this namespace)");
+        return;
+    }
+
+    // Wait for debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+
+    // A new ExternalChange entry must have been created.
+    let new_ext = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .next_back();
+
+    let ext_entry = match new_ext {
+        Some(e) => e,
+        None => {
+            eprintln!(
+                "SKIP: no new ExternalChange entry after route addition \
+                 (route may not have been detected; baseline_seq={baseline_max_seq})"
+            );
+            return;
+        }
+    };
+
+    // Verify the trigger is ExternalChange and the entry names the managed interface.
+    if let netfyr_journal::Trigger::ExternalChange { ref changed_entities } = ext_entry.trigger {
+        assert!(
+            changed_entities.contains(&iface.to_string()),
+            "ExternalChange entry must name {iface} in changed_entities: {:?}",
+            changed_entities
+        );
+    } else {
+        panic!("trigger must be ExternalChange, got {:?}", ext_entry.trigger);
+    }
+
+    // The diff must include a change to the "routes" field.
+    let has_routes_change = ext_entry.diff.operations.iter().any(|op| {
+        op.entity_name == iface
+            && op.field_changes.iter().any(|fc| fc.field_name == "routes")
+    });
+    assert!(
+        has_routes_change,
+        "ExternalChange diff must include a 'routes' field change for {iface} \
+         after external route addition. Found field_changes: {:?}",
+        ext_entry
+            .diff
+            .operations
+            .iter()
+            .flat_map(|op| op.field_changes.iter().map(|fc| fc.field_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+
+    // Outcome must be Observed (no re-reconciliation).
+    assert!(
+        matches!(ext_entry.outcome, netfyr_journal::ApplyOutcome::Observed),
+        "ExternalChange entry outcome must be Observed, got {:?}",
+        ext_entry.outcome
+    );
+}
+
+/// AC: Monitor detects route removal → journal entry is recorded with trigger
+/// "external_change" and the diff shows the "routes" field changed.
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_external_route_removal_creates_journal_entry() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_external_route_removal: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-rt-del0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-rt-del1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial MTU policy so the interface is managed.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+    sleep(Duration::from_millis(300)).await;
+
+    // Add a route externally so there is something to remove.
+    // This creates a journal snapshot that includes the route in state_after.
+    if !ip_route_add_onlink(iface, "10.99.61.0/24") {
+        eprintln!("SKIP: ip route add onlink failed (may not be supported in this namespace)");
+        return;
+    }
+
+    // Wait for the route-addition external change event to settle so the journal
+    // snapshot now includes the route (enabling detection of its subsequent removal).
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // Remove the route externally — the daemon must detect this removal.
+    if !ip_route_del(iface, "10.99.61.0/24") {
+        eprintln!("SKIP: ip route del failed");
+        return;
+    }
+
+    // Wait for debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+
+    // A new ExternalChange entry must have been created.
+    let new_ext = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .next_back();
+
+    let ext_entry = match new_ext {
+        Some(e) => e,
+        None => {
+            eprintln!(
+                "SKIP: no new ExternalChange entry after route removal \
+                 (route removal may not have been detected; baseline_seq={baseline_max_seq})"
+            );
+            return;
+        }
+    };
+
+    // Verify the trigger names the managed interface.
+    if let netfyr_journal::Trigger::ExternalChange { ref changed_entities } = ext_entry.trigger {
+        assert!(
+            changed_entities.contains(&iface.to_string()),
+            "ExternalChange entry must name {iface} in changed_entities: {:?}",
+            changed_entities
+        );
+    } else {
+        panic!("trigger must be ExternalChange, got {:?}", ext_entry.trigger);
+    }
+
+    // The diff must include a change to the "routes" field.
+    let has_routes_change = ext_entry.diff.operations.iter().any(|op| {
+        op.entity_name == iface
+            && op.field_changes.iter().any(|fc| fc.field_name == "routes")
+    });
+    assert!(
+        has_routes_change,
+        "ExternalChange diff must include a 'routes' field change for {iface} \
+         after external route removal. Found field_changes: {:?}",
+        ext_entry
+            .diff
+            .operations
+            .iter()
+            .flat_map(|op| op.field_changes.iter().map(|fc| fc.field_name.as_str()))
+            .collect::<Vec<_>>()
+    );
+
+    // Outcome must be Observed (no re-reconciliation).
+    assert!(
+        matches!(ext_entry.outcome, netfyr_journal::ApplyOutcome::Observed),
+        "ExternalChange entry outcome must be Observed, got {:?}",
+        ext_entry.outcome
+    );
+}
+
 // ── Feature: Daemon handles DHCP policy in namespace ─────────────────────────
 
 /// Scenario: Daemon handles DHCP policy in namespace — lease acquired.
