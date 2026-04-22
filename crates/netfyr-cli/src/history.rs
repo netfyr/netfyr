@@ -407,8 +407,8 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
                 if fc.change_kind == "unchanged" {
                     continue;
                 }
-                let is_list = fc.current.as_ref().map_or(false, |v| v.is_array())
-                    || fc.desired.as_ref().map_or(false, |v| v.is_array());
+                let is_list = fc.current.as_ref().is_some_and(|v| v.is_array())
+                    || fc.desired.as_ref().is_some_and(|v| v.is_array());
                 if is_list {
                     format_list_field_diff(&mut out, fc);
                 } else {

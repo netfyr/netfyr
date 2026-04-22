@@ -991,6 +991,112 @@ mod tests {
         );
     }
 
+    // ── Scenario: Read-only name field excluded from diff ────────────────────
+
+    #[test]
+    fn test_read_only_name_field_excluded_from_diff() {
+        // name is x-netfyr-writable: false in the ethernet schema.
+        // Desired: eth0 with mtu=1500; Actual: eth0 with mtu=1500 + name="eth0".
+        // name is read-only, so it must not generate a Modify operation.
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("name", Value::String("eth0".to_string())),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "name is read-only (x-netfyr-writable: false) and must not generate a Modify \
+             operation; diff had {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Scenario: Read-only driver field excluded from diff ───────────────────
+
+    #[test]
+    fn test_read_only_driver_field_excluded_from_diff() {
+        // BUG: "driver" is absent from ethernet.json — it has no x-netfyr-writable annotation.
+        // generate_diff() conservatively treats fields absent from the schema as writable,
+        // so this test currently fails with a spurious Modify operation.
+        // Fix: add "driver": {"type":"string","x-netfyr-writable":false} to ethernet.json.
+        // Criterion 16 requires driver to be excluded just like carrier/speed/mac/name.
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("driver", Value::String("virtio_net".to_string())),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "driver is a read-only hardware property and must not generate a Modify \
+             operation; diff had {} operation(s) — see BUG comment above",
+            diff.len()
+        );
+    }
+
+    // ── Scenario: All read-only fields from actual state are excluded (criterion 16) ─
+
+    #[test]
+    fn test_all_read_only_fields_excluded_from_diff_criterion_16() {
+        // Criterion 16: desired=eth0(mtu=1500), actual=eth0(mtu=1500, carrier=true,
+        // speed=1000, mac="aa:bb:cc:dd:ee:ff", driver="virtio_net", name="eth0").
+        // All five read-only fields must be excluded — StateDiff must be empty.
+        //
+        // BUG: "driver" is absent from ethernet.json so it is treated as writable,
+        // causing this test to fail with a spurious Modify. Fix is to add "driver"
+        // with x-netfyr-writable: false to the ethernet schema (see criterion 17).
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("carrier", Value::Bool(true)),
+                ("speed", Value::U64(1000)),
+                ("mac", Value::String("aa:bb:cc:dd:ee:ff".to_string())),
+                ("driver", Value::String("virtio_net".to_string())),
+                ("name", Value::String("eth0".to_string())),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "carrier, speed, mac, driver, and name are all read-only — StateDiff must be \
+             empty; diff had {} operation(s) — see BUG comment above",
+            diff.len()
+        );
+    }
+
     // ── Edge case: writable field in unknown entity type is always diffed ─────
 
     #[test]

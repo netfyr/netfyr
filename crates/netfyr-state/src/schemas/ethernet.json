@@ -70,6 +70,11 @@
       "description": "Interface name (kernel-assigned, not settable via policy)",
       "x-netfyr-writable": false
     },
+    "driver": {
+      "type": "string",
+      "description": "Kernel driver name",
+      "x-netfyr-writable": false
+    },
     "operstate": {
       "type": "string",
       "description": "Operational state of the interface (up/down/unknown)",

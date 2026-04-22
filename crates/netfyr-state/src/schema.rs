@@ -1349,6 +1349,63 @@ mod tests {
         );
     }
 
+    // ── Criterion 17: schema declares all read-only fields ────────────────────
+
+    /// name field is read-only (x-netfyr-writable: false)
+    #[test]
+    fn test_field_info_name_is_not_writable() {
+        let registry = SchemaRegistry::new();
+        let info = registry.field_info("ethernet", "name").expect("name should have field info");
+        assert!(!info.writable, "name should be read-only (x-netfyr-writable: false)");
+    }
+
+    /// driver field must be in the ethernet schema and be read-only.
+    ///
+    /// BUG: "driver" is currently absent from ethernet.json.
+    /// Criterion 17 requires every read-only hardware property — including driver — to be
+    /// declared in the schema with x-netfyr-writable: false. Until "driver" is added to
+    /// ethernet.json the test will fail at the .expect() call because field_info returns None.
+    /// Fix: add the following to ethernet.json's "properties" object:
+    ///   "driver": {"type":"string","description":"Kernel driver name","x-netfyr-writable":false}
+    #[test]
+    fn test_ethernet_schema_driver_field_is_read_only() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("ethernet", "driver")
+            .expect(
+                "driver must be present in the ethernet schema with x-netfyr-writable: false \
+                 (criterion 17); BUG: driver is currently absent from ethernet.json",
+            );
+        assert!(!info.writable, "driver should be read-only (x-netfyr-writable: false)");
+    }
+
+    /// Criterion 17: every field known to be read-only (carrier, speed, mac, driver, name)
+    /// must be present in the ethernet schema with x-netfyr-writable: false.
+    ///
+    /// BUG: "driver" is currently absent from ethernet.json so this test fails.
+    #[test]
+    fn test_ethernet_schema_declares_all_spec_read_only_fields_criterion_17() {
+        let registry = SchemaRegistry::new();
+        let required_read_only = ["carrier", "speed", "mac", "driver", "name"];
+
+        for &field in &required_read_only {
+            let info = registry.field_info("ethernet", field).unwrap_or_else(|| {
+                panic!(
+                    "field '{}' must be present in the ethernet schema (criterion 17: all \
+                     read-only hardware fields must be declared with x-netfyr-writable: false); \
+                     BUG: 'driver' is missing from ethernet.json",
+                    field
+                )
+            });
+            assert!(
+                !info.writable,
+                "field '{}' must have x-netfyr-writable: false in the ethernet schema \
+                 (criterion 17)",
+                field
+            );
+        }
+    }
+
     /// Unknown field error should reference the field name in the error's field path
     #[test]
     fn test_unknown_field_error_references_field_name() {
