@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use netfyr_state::StateSet;
+use netfyr_state::{StateSet, Value};
 use serde::Serialize;
 
 use crate::diff::{DiffKind, DiffOperation, FieldChangeKind, StateDiff};
@@ -74,7 +74,8 @@ impl DiffReport {
     /// - `+` — entity or field being added.
     /// - `-` — entity or field being removed.
     /// - `~` — entity being modified (header only).
-    /// - `~   field: old → new` — field value changed.
+    /// - `    -field: old` / `    +field: new` — scalar value changed.
+    /// - List fields show a header (`    field:`) then per-element `+`/`-` lines.
     /// - `+   field: value` — field being added to existing entity.
     /// - `-   field: value` — field being removed from existing entity.
     /// - (4 spaces) `field: value` — field unchanged (shown for context in Modify).
@@ -116,22 +117,20 @@ impl DiffReport {
                     for change in &op.field_changes {
                         match &change.change {
                             FieldChangeKind::Set { current: Some(old), desired: new } => {
-                                // Value changed: show old → new.
-                                lines.push(format!(
-                                    "~   {}: {} \u{2192} {}",
-                                    change.field_name, old.value, new.value
-                                ));
+                                if matches!(&old.value, Value::List(_)) || matches!(&new.value, Value::List(_)) {
+                                    format_value_list_diff(&mut lines, &change.field_name, &old.value, &new.value);
+                                } else {
+                                    lines.push(format!("    -{}: {}", change.field_name, old.value));
+                                    lines.push(format!("    +{}: {}", change.field_name, new.value));
+                                }
                             }
                             FieldChangeKind::Set { current: None, desired: new } => {
-                                // Field added to existing entity.
                                 lines.push(format!("+   {}: {}", change.field_name, new.value));
                             }
                             FieldChangeKind::Unset { current } => {
-                                // Field removed from existing entity.
                                 lines.push(format!("-   {}: {}", change.field_name, current.value));
                             }
                             FieldChangeKind::Unchanged { value } => {
-                                // Unchanged field shown for context (no prefix, 4 spaces).
                                 lines.push(format!("    {}: {}", change.field_name, value.value));
                             }
                         }
@@ -166,6 +165,43 @@ impl DiffReport {
     /// The full `FieldValue` (including provenance) is included.
     pub fn format_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+}
+
+fn format_value_list_diff(lines: &mut Vec<String>, field_name: &str, old: &Value, new: &Value) {
+    let empty = Vec::new();
+    let old_items = match old { Value::List(v) => v.as_slice(), _ => &empty };
+    let new_items = match new { Value::List(v) => v.as_slice(), _ => &empty };
+
+    lines.push(format!("    {}:", field_name));
+    for item in new_items {
+        if !old_items.contains(item) {
+            lines.push(format!("      +{}", format_value_element(item)));
+        }
+    }
+    for item in old_items {
+        if !new_items.contains(item) {
+            lines.push(format!("      -{}", format_value_element(item)));
+        }
+    }
+}
+
+fn format_value_element(v: &Value) -> String {
+    match v {
+        Value::Map(map) => {
+            if let Some(Value::IpNetwork(dest)) = map.get("destination") {
+                let metric = match map.get("metric") {
+                    Some(Value::U64(n)) => *n,
+                    _ => 0,
+                };
+                if metric == 0 {
+                    return format!("{}", dest);
+                }
+                return format!("{} metric {}", dest, metric);
+            }
+            format!("{}", v)
+        }
+        _ => format!("{}", v),
     }
 }
 
@@ -302,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_text_shows_field_change_with_arrow() {
+    fn test_format_text_shows_scalar_change_as_unified_diff_lines() {
         let mut desired = StateSet::new();
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))]));
         let mut actual = StateSet::new();
@@ -314,11 +350,13 @@ mod tests {
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
-        // The spec says: "~   mtu: 1500 → 9000"
-        let expected = "~   mtu: 1500 \u{2192} 9000".to_string();
         assert!(
-            text.contains(&expected),
-            "changed field must use '~   mtu: 1500 → 9000' format, got:\n{text}"
+            text.contains("    -mtu: 1500"),
+            "scalar change must show '    -mtu: 1500' line, got:\n{text}"
+        );
+        assert!(
+            text.contains("    +mtu: 9000"),
+            "scalar change must show '    +mtu: 9000' line, got:\n{text}"
         );
     }
 
@@ -398,6 +436,47 @@ mod tests {
         assert!(
             text.contains("    mtu: 1500"),
             "unchanged field must use 4-space indent with no prefix, got:\n{text}"
+        );
+    }
+
+    // ── Scenario: List field changes as per-element diff ────────────────────────
+
+    #[test]
+    fn test_format_text_shows_list_field_changes_as_per_element_diff() {
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("addresses", addr_list(&["10.0.1.50/24", "10.0.1.51/24"]))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("addresses", addr_list(&["10.0.1.50/24", "10.0.1.99/24"]))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+        let text = report.format_text();
+
+        assert!(
+            text.contains("    addresses:"),
+            "list field must show header line '    addresses:', got:\n{text}"
+        );
+        assert!(
+            text.contains("      +10.0.1.51/24"),
+            "added element must show '      +10.0.1.51/24', got:\n{text}"
+        );
+        assert!(
+            text.contains("      -10.0.1.99/24"),
+            "removed element must show '      -10.0.1.99/24', got:\n{text}"
+        );
+        assert!(
+            !text.contains("10.0.1.50/24"),
+            "unchanged element must not appear, got:\n{text}"
         );
     }
 

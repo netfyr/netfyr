@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use colored::Colorize;
 
-use netfyr_journal::{ApplyOutcome, Journal, JournalEntry, SerializableDiffOp, Trigger};
+use netfyr_journal::{ApplyOutcome, Journal, JournalEntry, SerializableDiffOp, SerializableFieldChange, Trigger};
 use netfyr_varlink::{VarlinkClient, VarlinkError};
 
 use crate::daemon_socket_path;
@@ -407,23 +407,13 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
                 if fc.change_kind == "unchanged" {
                     continue;
                 }
-                let line = match fc.change_kind.as_str() {
-                    "set" if fc.current.is_none() => {
-                        let desired = opt_json_compact(&fc.desired);
-                        format!("      {}{}: {}", "+".green(), fc.field_name, desired)
-                    }
-                    "set" => {
-                        let current = opt_json_compact(&fc.current);
-                        let desired = opt_json_compact(&fc.desired);
-                        format!("      {}{}: {} -> {}", "~".yellow(), fc.field_name, current, desired)
-                    }
-                    "unset" => {
-                        let current = opt_json_compact(&fc.current);
-                        format!("      {}{}: {}", "-".red(), fc.field_name, current)
-                    }
-                    _ => continue,
-                };
-                out.push_str(&format!("{}\n", line));
+                let is_list = fc.current.as_ref().map_or(false, |v| v.is_array())
+                    || fc.desired.as_ref().map_or(false, |v| v.is_array());
+                if is_list {
+                    format_list_field_diff(&mut out, fc);
+                } else {
+                    format_scalar_field_diff(&mut out, fc);
+                }
             }
         }
     }
@@ -693,6 +683,69 @@ fn colorize_change_token(token: &str) -> String {
     }
 }
 
+fn format_scalar_field_diff(out: &mut String, fc: &SerializableFieldChange) {
+    match fc.change_kind.as_str() {
+        "set" if fc.current.is_none() => {
+            let desired = opt_json_compact(&fc.desired);
+            out.push_str(&format!("      {}{}: {}\n", "+".green(), fc.field_name, desired));
+        }
+        "set" => {
+            let current = opt_json_compact(&fc.current);
+            let desired = opt_json_compact(&fc.desired);
+            out.push_str(&format!("      {}{}: {}\n", "-".red(), fc.field_name, current));
+            out.push_str(&format!("      {}{}: {}\n", "+".green(), fc.field_name, desired));
+        }
+        "unset" => {
+            let current = opt_json_compact(&fc.current);
+            out.push_str(&format!("      {}{}: {}\n", "-".red(), fc.field_name, current));
+        }
+        _ => {}
+    }
+}
+
+fn format_list_field_diff(out: &mut String, fc: &SerializableFieldChange) {
+    let empty = Vec::new();
+    let current_items = fc.current.as_ref()
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let desired_items = fc.desired.as_ref()
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    out.push_str(&format!("      {}:\n", fc.field_name));
+    for item in desired_items {
+        if !current_items.contains(item) {
+            out.push_str(&format!("        {}{}\n", "+".green(), format_list_element(item)));
+        }
+    }
+    for item in current_items {
+        if !desired_items.contains(item) {
+            out.push_str(&format!("        {}{}\n", "-".red(), format_list_element(item)));
+        }
+    }
+}
+
+fn format_list_element(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(dest)) = map.get("destination") {
+                let metric = map.get("metric")
+                    .and_then(|m| m.as_u64())
+                    .unwrap_or(0);
+                if metric == 0 {
+                    dest.clone()
+                } else {
+                    format!("{} metric {}", dest, metric)
+                }
+            } else {
+                json_compact(v)
+            }
+        }
+        _ => json_compact(v),
+    }
+}
+
 fn json_compact(v: &serde_json::Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "?".to_string())
 }
@@ -759,6 +812,23 @@ mod tests {
             }],
         };
         entry
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_escape = false;
+        for c in s.chars() {
+            if in_escape {
+                if c == 'm' {
+                    in_escape = false;
+                }
+            } else if c == '\x1b' {
+                in_escape = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     fn default_args() -> HistoryArgs {
@@ -1152,9 +1222,9 @@ mod tests {
         assert!(output.contains("100"), "detail output should show priority");
     }
 
-    /// AC: Detail output shows diff section with field changes.
+    /// AC: Detail diff shows scalar change as unified-diff lines.
     #[test]
-    fn test_format_text_detail_shows_diff_with_field_changes() {
+    fn test_format_text_detail_shows_scalar_change_as_unified_diff() {
         let mut entry = make_entry();
         entry.diff = SerializableDiff {
             operations: vec![SerializableDiffOp {
@@ -1174,7 +1244,79 @@ mod tests {
             output.contains("Diff:") && output.contains("ethernet") && output.contains("eth0"),
             "detail output should show diff section with entity type and name"
         );
-        assert!(output.contains("mtu"), "detail output should show the changed field name");
+        let plain = strip_ansi(&output);
+        assert!(
+            plain.contains("-mtu: 1500"),
+            "scalar change must show '-mtu: 1500' line, got:\n{plain}"
+        );
+        assert!(
+            plain.contains("+mtu: 9000"),
+            "scalar change must show '+mtu: 9000' line, got:\n{plain}"
+        );
+    }
+
+    /// AC: Detail diff shows list field additions as per-element lines.
+    #[test]
+    fn test_format_text_detail_shows_list_field_as_per_element_diff() {
+        let mut entry = make_entry();
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "enp7s0".to_string(),
+                field_changes: vec![SerializableFieldChange {
+                    field_name: "addresses".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!(["172.25.12.1/24"])),
+                    desired: Some(serde_json::json!(["172.25.12.1/24", "172.25.14.22/32"])),
+                }],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            plain.contains("addresses:"),
+            "list field must show header 'addresses:', got:\n{plain}"
+        );
+        assert!(
+            plain.contains("+172.25.14.22/32"),
+            "added element must show '+172.25.14.22/32', got:\n{plain}"
+        );
+        assert!(
+            !plain.contains("172.25.12.1/24"),
+            "unchanged element must not appear, got:\n{plain}"
+        );
+    }
+
+    /// AC: Detail diff shows route changes with readable format.
+    #[test]
+    fn test_format_text_detail_shows_route_element_readable_format() {
+        let mut entry = make_entry();
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![SerializableFieldChange {
+                    field_name: "routes".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!([])),
+                    desired: Some(serde_json::json!([
+                        {"destination": "10.0.0.0/8", "metric": 100}
+                    ])),
+                }],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            plain.contains("routes:"),
+            "route field must show header 'routes:', got:\n{plain}"
+        );
+        assert!(
+            plain.contains("+10.0.0.0/8 metric 100"),
+            "route must show '+10.0.0.0/8 metric 100', got:\n{plain}"
+        );
     }
 
     /// AC: Detail output shows outcome section.
