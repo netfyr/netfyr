@@ -37,8 +37,12 @@ async fn main() -> Result<()> {
 
     // 1. Initialize structured logging (write to stderr; stdout is reserved for
     //    the "netfyr" identity line printed above).
+    //    RUST_LOG overrides the default "info" level when set.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
         .init();
 
     // Paths — override via environment for testing / alternative deployments.

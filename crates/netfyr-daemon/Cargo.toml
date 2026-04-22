@@ -29,8 +29,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # sd-notify: systemd readiness notification (READY=1); no-op when $NOTIFY_SOCKET unset
 sd-notify = "0.4"
-# tracing-subscriber: formats tracing events to stderr/stdout for the daemon process
-tracing-subscriber = "0.3"
+# tracing-subscriber: formats tracing events to stderr/stdout for the daemon process;
+# env-filter feature enables EnvFilter which reads RUST_LOG at runtime.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # netlink-sys: raw netlink socket with multicast group subscription (RTNLGRP_LINK,
 # RTNLGRP_IPV4_IFADDR) for the external change monitor. Already in the lockfile
