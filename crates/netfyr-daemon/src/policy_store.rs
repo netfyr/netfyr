@@ -186,6 +186,8 @@ impl PolicyStore {
             }
         }
 
+        let count = policies.len();
+        tracing::debug!(count, "loaded policies from directory");
         Ok(PolicyStore {
             dir: Some(dir.to_path_buf()),
             policies,
@@ -262,17 +264,21 @@ impl PolicyStore {
         let new_filenames: HashSet<String> =
             sanitized_names.iter().map(|name| format!("{}.yaml", name)).collect();
 
+        let mut removed: usize = 0;
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let fname = entry.file_name();
                 let fname_str = fname.to_string_lossy();
                 if fname_str.ends_with(".yaml") && !new_filenames.contains(fname_str.as_ref()) {
-                    if let Err(e) = fs::remove_file(entry.path()) {
-                        tracing::warn!(
-                            "failed to remove stale policy file {}: {}",
-                            entry.path().display(),
-                            e
-                        );
+                    match fs::remove_file(entry.path()) {
+                        Ok(()) => removed += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to remove stale policy file {}: {}",
+                                entry.path().display(),
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -297,6 +303,8 @@ impl PolicyStore {
 
         // ── Step 5: Update in-memory state ────────────────────────────────────
         let old_policies = std::mem::replace(&mut self.policies, new_policies);
+        let written = sanitized_names.len();
+        tracing::debug!(written, removed, "policies persisted");
         Ok(old_policies)
     }
 

@@ -256,6 +256,9 @@ fn dump_link_names(socket: &Socket) -> HashMap<u32, String> {
         }
     }
 
+    let count = result.len();
+    let names: Vec<&String> = result.values().collect();
+    debug!("RTM_GETLINK dump: cached {} names: {:?}", count, names);
     result
 }
 
@@ -307,6 +310,8 @@ async fn monitor_task(
                     })
                     .collect();
 
+                let count = changes.len();
+                debug!(count, "debounce timer fired, emitting changes");
                 if !changes.is_empty()
                     && tx.send(changes).await.is_err()
                 {
@@ -404,6 +409,7 @@ fn process_buffer(
             if entry.0.is_none() {
                 entry.0 = resolved_name;
             }
+            debug!(ifindex, ifname = ?entry.0, ?kind, "netlink event parsed");
             entry.1.push(kind);
 
             // Reset debounce timer on every event (sliding-window debounce).
@@ -432,7 +438,10 @@ fn parse_message(nlmsg_type: u16, buf: &[u8]) -> Option<(u32, Option<String>, Ch
             let ifindex = parse_addr_message(buf)?;
             Some((ifindex, None, ChangeKind::AddressRemoved))
         }
-        _ => None,
+        _ => {
+            debug!(nlmsg_type, "ignoring netlink message type");
+            None
+        }
     }
 }
 
@@ -457,6 +466,7 @@ fn parse_link_message(buf: &[u8]) -> Option<(u32, Option<String>)> {
         buf[index_off + 3],
     ]);
     if ifi_index <= 0 {
+        debug!(ifindex = ifi_index, "rejecting link message: invalid ifindex");
         return None;
     }
     let ifname = parse_nlattr_string(buf, NLMSG_HDR_LEN + IFINFOMSG_LEN, IFLA_IFNAME);
@@ -473,6 +483,9 @@ fn parse_link_message(buf: &[u8]) -> Option<(u32, Option<String>)> {
 ///   ifa_index      u32
 fn parse_addr_message(buf: &[u8]) -> Option<u32> {
     if buf.len() < NLMSG_HDR_LEN + IFADDRMSG_LEN {
+        let len = buf.len();
+        let expected = NLMSG_HDR_LEN + IFADDRMSG_LEN;
+        debug!(len, expected, "rejecting addr message: buffer too small");
         return None;
     }
     let index_off = NLMSG_HDR_LEN + 4; // skip ifa_family(1) + ifa_prefixlen(1) + ifa_flags(1) + ifa_scope(1)

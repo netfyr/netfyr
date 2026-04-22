@@ -825,18 +825,33 @@ pub async fn serve_varlink(
                 }
             } => {
                 if let Some(changes) = result {
-                    // Discard notifications produced by our own apply cycles.
-                    if !reconciler.is_applying() {
-                        let changed_names: Vec<String> = {
-                            let mut seen: HashSet<String> = HashSet::new();
-                            changes
-                                .into_iter()
-                                .filter_map(|c| c.ifname)
-                                .filter(|name| managed_entities.contains(name))
-                                .filter(|name| seen.insert(name.clone()))
-                                .collect()
-                        };
-                        if !changed_names.is_empty() {
+                    if reconciler.is_applying() {
+                        let count = changes.len();
+                        debug!(count, "discarding netlink events during self-apply");
+                    } else {
+                        let mut changed_names: Vec<String> = Vec::new();
+                        let mut seen: HashSet<String> = HashSet::new();
+                        for change in changes {
+                            let ifname = match change.ifname {
+                                Some(name) => name,
+                                None => {
+                                    let ifindex = change.ifindex;
+                                    debug!(ifindex, "dropping change: ifname not resolved");
+                                    continue;
+                                }
+                            };
+                            if !managed_entities.contains(&ifname) {
+                                debug!(%ifname, "dropping change: interface not managed");
+                                continue;
+                            }
+                            if seen.insert(ifname.clone()) {
+                                changed_names.push(ifname);
+                            }
+                        }
+                        if changed_names.is_empty() {
+                            debug!("all netlink changes filtered, no journal entry");
+                        } else {
+                            debug!(?changed_names, "recording external changes");
                             if let Err(e) = reconciler
                                 .record_external_change(changed_names, &policy_store)
                                 .await

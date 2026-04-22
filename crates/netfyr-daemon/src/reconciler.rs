@@ -158,6 +158,7 @@ impl Reconciler {
         }
 
         if current_states.is_empty() {
+            tracing::debug!("no current states returned, skipping external change check");
             return Ok(());
         }
 
@@ -194,6 +195,9 @@ impl Reconciler {
             };
 
             let field_changes = compute_external_field_changes(&last_state, current_state);
+            let entity_changed = !field_changes.is_empty();
+            let field_count = field_changes.len();
+            tracing::debug!(entity = %entity_name, changed = entity_changed, field_count, "external change check");
             if field_changes.is_empty() {
                 continue; // State matches journal snapshot; spurious event
             }
@@ -222,6 +226,7 @@ impl Reconciler {
         }
 
         if changed.is_empty() {
+            tracing::debug!("no external field changes detected");
             return Ok(());
         }
 
@@ -277,6 +282,9 @@ impl Reconciler {
             .flat_map(|input| input.state_set.entities())
             .collect();
 
+        let policy_count = inputs.len();
+        let entity_count = managed_entities.len();
+        tracing::debug!(policy_count, entity_count, "starting reconciliation");
         let merged = merge(inputs);
         let effective_state = merged.effective_state;
         let conflicts = merged.conflicts;
@@ -290,6 +298,11 @@ impl Reconciler {
             &managed_entities,
             &self.schema_registry,
         );
+
+        let adds = reconcile_diff.additions().count();
+        let modifies = reconcile_diff.modifications().count();
+        let removes = reconcile_diff.removals().count();
+        tracing::debug!(adds, modifies, removes, "diff computed");
 
         // Restrict the actual state to only the entities present in the effective
         // desired state before computing the diff. This prevents the daemon from
@@ -323,6 +336,11 @@ impl Reconciler {
         }
 
         let report = self.backend_registry.apply(&state_diff).await?;
+
+        let succeeded = report.succeeded.len();
+        let failed = report.failed.len();
+        let skipped = report.skipped.len();
+        tracing::debug!(succeeded, failed, skipped, "apply completed");
 
         self.append_journal_entry(
             policy_store,
