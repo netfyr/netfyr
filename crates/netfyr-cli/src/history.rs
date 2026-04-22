@@ -334,14 +334,14 @@ fn print_detail(entry: &JournalEntry, format: &HistoryOutputFormat) -> Result<()
 // ── Text formatting ───────────────────────────────────────────────────────────
 
 pub fn format_text_list(entries: &[JournalEntry]) -> String {
-    // Fixed-width overhead: SEQ(5)+sp+TIMESTAMP(21)+sp+TRIGGER(15)+sp+ENTITIES(14)+sp+OUTCOME(16)+sp = 76
-    const FIXED_OVERHEAD: usize = 76;
+    // Fixed-width overhead: SEQ(5)+sp+TIMESTAMP(21)+sp+TRIGGER(15)+sp+ENTITIES(25)+sp+OUTCOME(17)+sp = 88
+    const FIXED_OVERHEAD: usize = 88;
     let terminal_width = get_terminal_width();
     let max_changes_width = terminal_width.saturating_sub(FIXED_OVERHEAD).max(10);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<5} {:<21} {:<15} {:<14} {:<16} {}\n",
+        "{:<5} {:<21} {:<15} {:<25} {:<17} {}\n",
         "SEQ", "TIMESTAMP", "TRIGGER", "ENTITIES", "OUTCOME", "CHANGES"
     ));
 
@@ -364,7 +364,7 @@ pub fn format_text_list(entries: &[JournalEntry]) -> String {
         let changes = colorize_changes(&changes_truncated);
 
         out.push_str(&format!(
-            "{:<5} {:<21} {:<15} {:<14} {:<16} {}\n",
+            "{:<5} {:<21} {:<15} {:<25} {:<17} {}\n",
             seq, ts, trigger, entities, outcome, changes
         ));
     }
@@ -428,7 +428,7 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
         }
     }
 
-    out.push_str(&format!("Outcome: {}\n", outcome_summary(&entry.outcome)));
+    out.push_str(&format!("Outcome: {}\n", outcome_detail(&entry.outcome)));
 
     if !entry.state_after.entities.is_empty() {
         out.push_str("State after:\n");
@@ -488,38 +488,47 @@ fn trigger_detail_str(trigger: &Trigger) -> String {
 
 pub fn outcome_summary(outcome: &ApplyOutcome) -> String {
     match outcome {
-        ApplyOutcome::Applied { succeeded, failed, skipped } => {
-            let mut parts: Vec<String> = Vec::new();
-            if *succeeded > 0 {
-                parts.push(format!("{} ok", succeeded));
-            }
+        ApplyOutcome::Applied { failed, .. } => {
             if *failed > 0 {
-                parts.push(format!("{} failed", failed));
-            }
-            if *skipped > 0 {
-                parts.push(format!("{} skipped", skipped));
-            }
-            if parts.is_empty() {
-                "applied".to_string()
+                format!("applied ({} fail)", failed)
             } else {
-                format!("applied ({})", parts.join(", "))
+                "applied".to_string()
             }
         }
         ApplyOutcome::Observed => "observed".to_string(),
     }
 }
 
+pub fn outcome_detail(outcome: &ApplyOutcome) -> String {
+    match outcome {
+        ApplyOutcome::Applied { succeeded, failed, skipped } => {
+            format!("applied ({} succeeded, {} failed, {} skipped)", succeeded, failed, skipped)
+        }
+        ApplyOutcome::Observed => "observed".to_string(),
+    }
+}
+
 pub fn entities_summary(ops: &[SerializableDiffOp]) -> String {
+    const MAX_WIDTH: usize = 25;
     if ops.is_empty() {
         return "(none)".to_string();
     }
     let names: Vec<&str> = ops.iter().map(|op| op.entity_name.as_str()).collect();
-    if names.len() <= 3 {
-        names.join(", ")
+    let full = names.join(", ");
+    if full.len() <= MAX_WIDTH {
+        return full;
+    }
+    let first = names[0];
+    let remaining = names.len() - 1;
+    let truncated = format!("{}, +{} more", first, remaining);
+    if truncated.len() <= MAX_WIDTH {
+        truncated
     } else {
-        let shown = &names[..2];
-        let remaining = names.len() - 2;
-        format!("{}, +{} more", shown.join(", "), remaining)
+        let mut trim_to = MAX_WIDTH.saturating_sub(1);
+        while trim_to > 0 && !truncated.is_char_boundary(trim_to) {
+            trim_to -= 1;
+        }
+        format!("{}…", &truncated[..trim_to])
     }
 }
 
@@ -1296,9 +1305,9 @@ mod tests {
         assert_eq!(entities_summary(&ops), "eth0, eth1");
     }
 
-    /// AC: More than 3 entities shows "+N more" truncation.
+    /// AC: Many entities truncated with "+N more" when exceeding 25-char width.
     #[test]
-    fn test_entities_summary_more_than_3_entities_truncated_with_plus_n_more() {
+    fn test_entities_summary_many_entities_truncated_with_plus_n_more() {
         let ops: Vec<SerializableDiffOp> = (0..5)
             .map(|i| SerializableDiffOp {
                 kind: "modify".to_string(),
@@ -1309,10 +1318,25 @@ mod tests {
             .collect();
         let result = entities_summary(&ops);
         assert!(
-            result.contains("+3 more"),
-            "5 entities should truncate with '+3 more', got: {}",
+            result.contains("+4 more"),
+            "5 entities should truncate to first + '+4 more', got: {}",
             result
         );
+        assert!(result.len() <= 25, "should fit in 25 chars, got: {}", result);
+    }
+
+    /// AC: Three short entities that fit within 25 chars are shown in full.
+    #[test]
+    fn test_entities_summary_three_short_entities_shown_in_full() {
+        let ops: Vec<SerializableDiffOp> = (0..3)
+            .map(|i| SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: format!("eth{}", i),
+                field_changes: vec![],
+            })
+            .collect();
+        assert_eq!(entities_summary(&ops), "eth0, eth1, eth2");
     }
 
     // ── changes_summary ───────────────────────────────────────────────────────
@@ -1417,31 +1441,42 @@ mod tests {
 
     // ── outcome_summary ───────────────────────────────────────────────────────
 
-    /// AC: Applied outcome with multiple counts shows "applied (N ok, N failed)".
+    /// AC: Applied outcome with failures shows "applied (N fail)".
     #[test]
-    fn test_outcome_summary_applied_with_mixed_counts_includes_all_nonzero() {
+    fn test_outcome_summary_applied_with_failures_shows_fail_count() {
         let outcome = ApplyOutcome::Applied { succeeded: 2, failed: 1, skipped: 0 };
         let result = outcome_summary(&outcome);
-        assert!(result.contains("applied"), "should say 'applied'");
-        assert!(result.contains("2 ok"), "should show '2 ok'");
-        assert!(result.contains("1 failed"), "should show '1 failed'");
-        assert!(!result.contains("skipped"), "should not show 'skipped' when skipped=0");
+        assert_eq!(result, "applied (1 fail)");
     }
 
-    /// AC: Applied with only successes shows "applied (N ok)" without failed/skipped.
+    /// AC: Applied with only successes shows "applied" without counts.
     #[test]
-    fn test_outcome_summary_applied_with_only_successes_omits_zero_counts() {
+    fn test_outcome_summary_applied_with_only_successes_shows_applied() {
         let outcome = ApplyOutcome::Applied { succeeded: 3, failed: 0, skipped: 0 };
         let result = outcome_summary(&outcome);
-        assert!(result.contains("3 ok"), "should show '3 ok'");
-        assert!(!result.contains("failed"), "should not show 'failed' when count is 0");
-        assert!(!result.contains("skipped"), "should not show 'skipped' when count is 0");
+        assert_eq!(result, "applied");
+    }
+
+    /// AC: Applied with skips but no failures shows "applied" without counts.
+    #[test]
+    fn test_outcome_summary_applied_with_skips_no_failures_shows_applied() {
+        let outcome = ApplyOutcome::Applied { succeeded: 1, failed: 0, skipped: 5 };
+        let result = outcome_summary(&outcome);
+        assert_eq!(result, "applied");
     }
 
     /// AC: Observed outcome produces "observed".
     #[test]
     fn test_outcome_summary_observed_returns_observed() {
         assert_eq!(outcome_summary(&ApplyOutcome::Observed), "observed");
+    }
+
+    /// AC: Detail view shows full breakdown with all counts.
+    #[test]
+    fn test_outcome_detail_shows_full_breakdown() {
+        let outcome = ApplyOutcome::Applied { succeeded: 2, failed: 1, skipped: 3 };
+        let result = outcome_detail(&outcome);
+        assert_eq!(result, "applied (2 succeeded, 1 failed, 3 skipped)");
     }
 
     // ── trigger_display_name ──────────────────────────────────────────────────
