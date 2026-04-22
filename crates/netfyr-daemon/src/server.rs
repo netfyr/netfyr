@@ -1358,6 +1358,129 @@ mod tests {
         );
     }
 
+    // ── GetHistory / GetJournalEntry handlers ─────────────────────────────────
+
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn make_test_journal_entry() -> netfyr_journal::JournalEntry {
+        netfyr_journal::JournalEntry {
+            seq: 0,
+            timestamp: chrono::Utc::now(),
+            trigger: netfyr_journal::Trigger::PolicyApply { source: "test".into() },
+            active_policies: vec![],
+            diff: netfyr_journal::SerializableDiff { operations: vec![] },
+            state_after: netfyr_journal::SerializableStateSet { entities: vec![] },
+            outcome: netfyr_journal::ApplyOutcome::Applied { succeeded: 1, failed: 0, skipped: 0 },
+        }
+    }
+
+    /// AC: handle_get_journal_entry with missing seq returns an error response.
+    #[tokio::test]
+    async fn test_handle_get_journal_entry_missing_seq_returns_error() {
+        let (mut server, mut client) = make_stream_pair().await;
+
+        handle_get_journal_entry(&mut server, &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_some(),
+            "missing seq must produce an error response, got: {msg:?}"
+        );
+    }
+
+    /// AC: handle_get_journal_entry returns entry when seq matches, null when not found.
+    #[tokio::test]
+    async fn test_handle_get_journal_entry_returns_entry_or_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+        journal.append(make_test_journal_entry()).unwrap(); // gets seq=1
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        // seq=1 must return a non-null entry
+        let (mut server, mut client) = make_stream_pair().await;
+        handle_get_journal_entry(&mut server, &serde_json::json!({"seq": 1}))
+            .await
+            .unwrap();
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            !msg["parameters"]["entry"].is_null(),
+            "seq=1 must return a non-null entry, got: {msg:?}"
+        );
+
+        // seq=9999 must return null (not found)
+        let (mut server2, mut client2) = make_stream_pair().await;
+        handle_get_journal_entry(&mut server2, &serde_json::json!({"seq": 9999}))
+            .await
+            .unwrap();
+        let msg2 = read_message(&mut client2).await.unwrap();
+        assert!(
+            msg2["parameters"]["entry"].is_null(),
+            "non-existent seq must return null entry, got: {msg2:?}"
+        );
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+    }
+
+    /// AC: handle_get_history returns all entries from the journal.
+    #[tokio::test]
+    async fn test_handle_get_history_returns_entries_array() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+        for _ in 0..3 {
+            journal.append(make_test_journal_entry()).unwrap();
+        }
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        let (mut server, mut client) = make_stream_pair().await;
+        handle_get_history(&mut server, &serde_json::json!({"count": 10}))
+            .await
+            .unwrap();
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let msg = read_message(&mut client).await.unwrap();
+        let entries = msg["parameters"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "must return all 3 appended entries");
+    }
+
+    /// AC: handle_get_history respects the count parameter.
+    #[tokio::test]
+    async fn test_handle_get_history_with_count_limits_results() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+        for _ in 0..5 {
+            journal.append(make_test_journal_entry()).unwrap();
+        }
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        let (mut server, mut client) = make_stream_pair().await;
+        handle_get_history(&mut server, &serde_json::json!({"count": 2}))
+            .await
+            .unwrap();
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let msg = read_message(&mut client).await.unwrap();
+        let entries = msg["parameters"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "count=2 must limit results to 2 entries");
+    }
+
     /// Scenario: Unknown method returns an error response.
     #[tokio::test]
     async fn test_handle_connection_unknown_method_returns_error() {

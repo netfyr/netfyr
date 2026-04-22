@@ -910,4 +910,176 @@ mod tests {
         );
         server.await.unwrap();
     }
+
+    // ── Scenario: GetHistory / GetJournalEntry ────────────────────────────────
+
+    /// AC: get_history sends io.netfyr.GetHistory with all provided parameters.
+    #[tokio::test]
+    async fn test_get_history_sends_correct_method_and_parameters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_mock_server(
+            path.clone(),
+            serde_json::json!({ "entries": [{"seq": 1}] }),
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client
+            .get_history(Some(10), Some("1h".into()), Some("apply".into()), Some("eth0".into()))
+            .await;
+        assert!(result.is_ok(), "get_history must succeed, got {result:?}");
+
+        let req = server.await.unwrap();
+        assert_eq!(
+            req["method"].as_str(),
+            Some("io.netfyr.GetHistory"),
+            "method must be io.netfyr.GetHistory"
+        );
+        assert_eq!(
+            req["parameters"]["count"].as_u64(),
+            Some(10),
+            "count parameter must be 10"
+        );
+        assert_eq!(
+            req["parameters"]["since"].as_str(),
+            Some("1h"),
+            "since parameter must be '1h'"
+        );
+        assert_eq!(
+            req["parameters"]["trigger"].as_str(),
+            Some("apply"),
+            "trigger parameter must be 'apply'"
+        );
+        assert_eq!(
+            req["parameters"]["selector_name"].as_str(),
+            Some("eth0"),
+            "selector_name parameter must be 'eth0'"
+        );
+    }
+
+    /// AC: get_history returns the entries array from the response.
+    #[tokio::test]
+    async fn test_get_history_returns_entries_array() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_mock_server(
+            path.clone(),
+            serde_json::json!({ "entries": [{"seq": 1}, {"seq": 2}] }),
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.get_history(None, None, None, None).await;
+        assert!(result.is_ok(), "get_history must succeed, got {result:?}");
+        assert_eq!(result.unwrap().len(), 2, "must receive 2 entries");
+
+        server.await.unwrap();
+    }
+
+    /// AC: get_history omits None parameters from the request.
+    #[tokio::test]
+    async fn test_get_history_omits_none_parameters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_mock_server(
+            path.clone(),
+            serde_json::json!({ "entries": [] }),
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        client.get_history(None, None, None, None).await.unwrap();
+
+        let req = server.await.unwrap();
+        let params = req["parameters"].as_object().unwrap();
+        assert!(
+            !params.contains_key("count"),
+            "count must be absent when None"
+        );
+        assert!(
+            !params.contains_key("since"),
+            "since must be absent when None"
+        );
+        assert!(
+            !params.contains_key("trigger"),
+            "trigger must be absent when None"
+        );
+        assert!(
+            !params.contains_key("selector_name"),
+            "selector_name must be absent when None"
+        );
+    }
+
+    /// AC: get_journal_entry returns Some when the entry is present.
+    #[tokio::test]
+    async fn test_get_journal_entry_returns_some_when_entry_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_mock_server(
+            path.clone(),
+            serde_json::json!({ "entry": {"seq": 42, "timestamp": "2026-04-20T14:30:00Z"} }),
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.get_journal_entry(42).await;
+        assert!(result.is_ok(), "get_journal_entry must succeed, got {result:?}");
+
+        let entry = result.unwrap();
+        assert!(entry.is_some(), "entry must be Some when present");
+        assert_eq!(
+            entry.unwrap()["seq"].as_u64(),
+            Some(42),
+            "returned entry must have seq=42"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// AC: get_journal_entry returns None when the entry is null (not found).
+    #[tokio::test]
+    async fn test_get_journal_entry_returns_none_when_entry_is_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_mock_server(
+            path.clone(),
+            serde_json::json!({ "entry": null }),
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.get_journal_entry(9999).await;
+        assert!(result.is_ok(), "get_journal_entry must succeed, got {result:?}");
+        assert!(result.unwrap().is_none(), "entry must be None when server returns null");
+
+        server.await.unwrap();
+    }
+
+    /// AC: get_journal_entry sends io.netfyr.GetJournalEntry with the correct seq.
+    #[tokio::test]
+    async fn test_get_journal_entry_sends_correct_method_and_seq() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_mock_server(
+            path.clone(),
+            serde_json::json!({ "entry": null }),
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        client.get_journal_entry(42).await.unwrap();
+
+        let req = server.await.unwrap();
+        assert_eq!(
+            req["method"].as_str(),
+            Some("io.netfyr.GetJournalEntry"),
+            "method must be io.netfyr.GetJournalEntry"
+        );
+        assert_eq!(
+            req["parameters"]["seq"].as_u64(),
+            Some(42),
+            "seq parameter must be 42"
+        );
+    }
 }
