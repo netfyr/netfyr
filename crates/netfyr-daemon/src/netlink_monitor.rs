@@ -587,6 +587,7 @@ mod tests {
         Instant::now() + Duration::from_secs(365 * 24 * 3600)
     }
 
+    #[allow(clippy::type_complexity)]
     fn empty_state() -> (
         HashMap<u32, (Option<String>, Vec<ChangeKind>)>,
         HashMap<u32, String>,

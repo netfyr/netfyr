@@ -1064,7 +1064,7 @@ async fn netns_external_mtu_change_creates_external_change_journal_entry() {
     let ext_entry = entries_after
         .iter()
         .filter(|e| trigger_type(e) == "external_change")
-        .last()
+        .next_back()
         .expect("must have at least one ExternalChange entry");
 
     // Outcome must be Observed.
@@ -1659,7 +1659,7 @@ async fn netns_address_change_detected_after_daemon_restart() {
     let new_ext = entries_after
         .iter()
         .filter(|e| trigger_type(e) == "external_change")
-        .last()
+        .next_back()
         .expect("must have at least one ExternalChange entry after restart");
 
     if let netfyr_journal::Trigger::ExternalChange { ref changed_entities } = new_ext.trigger {
@@ -1718,7 +1718,7 @@ async fn netns_readonly_fields_excluded_from_external_change_diff() {
     sleep(Duration::from_millis(1200)).await;
 
     let entries = daemon.read_journal_entries();
-    let ext_entry = entries.iter().filter(|e| trigger_type(e) == "external_change").last();
+    let ext_entry = entries.iter().filter(|e| trigger_type(e) == "external_change").next_back();
 
     let ext_entry = match ext_entry {
         Some(e) => e,

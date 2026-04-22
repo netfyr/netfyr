@@ -1435,4 +1435,74 @@ mod tests {
             "empty policy set must pass validation"
         );
     }
+
+    // ── display_dry_run_report smoke tests ────────────────────────────────────
+    //
+    // AC "Dry-run shows diff without applying" and "Dry-run with no changes needed".
+    // These verify that the display function does not panic for both the empty
+    // and non-empty paths — the output itself is consumed by stdout.
+
+    use netfyr_reconcile::generate_diff;
+    use std::collections::HashSet;
+
+    fn empty_diff_report() -> DiffReport {
+        let schema = SchemaRegistry::default();
+        let desired = StateSet::new();
+        let actual = StateSet::new();
+        let managed: HashSet<EntityKey> = HashSet::new();
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        DiffReport::new(diff, &desired, &actual)
+    }
+
+    /// AC "Dry-run with no changes needed" — display_dry_run_report does not panic
+    /// when the diff is empty and is_empty=true.
+    #[test]
+    fn test_display_dry_run_report_no_panic_when_no_changes() {
+        let report = empty_diff_report();
+        display_dry_run_report(&report, true);
+    }
+
+    /// AC "Dry-run with no changes needed" — display_dry_run_report also does not
+    /// panic when called with is_empty=false on an empty diff (edge case).
+    #[test]
+    fn test_display_dry_run_report_no_panic_empty_diff_is_empty_false() {
+        let report = empty_diff_report();
+        display_dry_run_report(&report, false);
+    }
+
+    /// AC "Dry-run shows diff without applying" — display_dry_run_report does not panic
+    /// when the diff contains actual operations (Add with one field change).
+    #[test]
+    fn test_display_dry_run_report_no_panic_with_diff_operations() {
+        use netfyr_state::{FieldValue, Provenance, StateMetadata, Value};
+
+        let schema = SchemaRegistry::default();
+
+        // Build a desired state with mtu=9000; leave actual state empty → Add operation.
+        let mut desired = StateSet::new();
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert(
+            "mtu".to_string(),
+            FieldValue { value: Value::U64(9000), provenance: Provenance::KernelDefault },
+        );
+        desired.insert(State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields,
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 100,
+        });
+        let actual = StateSet::new();
+
+        let mut managed: HashSet<EntityKey> = HashSet::new();
+        managed.insert(("ethernet".to_string(), "eth0".to_string()));
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let is_empty = !diff.has_meaningful_changes();
+        let report = DiffReport::new(diff, &desired, &actual);
+
+        // Must not panic regardless of whether any changes were detected.
+        display_dry_run_report(&report, is_empty);
+    }
 }

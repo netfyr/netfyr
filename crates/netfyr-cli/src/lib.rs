@@ -183,6 +183,99 @@ mod tests {
         // Cleanup.
         colored::control::unset_override();
     }
+
+    // ── Clap CLI parsing / structural tests ───────────────────────────────────
+
+    use clap::Parser;
+    use super::Cli;
+
+    /// AC "No subcommand shows usage help and exit code 2":
+    /// Running `netfyr` with no arguments must fail with a clap error so that
+    /// the binary exits with code 2. With `subcommand_required = true,
+    /// arg_required_else_help = true`, clap signals this via an error.
+    #[test]
+    fn test_cli_no_subcommand_produces_clap_error() {
+        let result = Cli::try_parse_from(["netfyr"]);
+        assert!(
+            result.is_err(),
+            "invoking `netfyr` with no subcommand must fail; \
+             with subcommand_required=true clap returns an error so the binary exits 2"
+        );
+    }
+
+    /// AC "No path arguments shows error and exit code 2":
+    /// Running `netfyr apply` with no paths must fail because `paths` has
+    /// `required = true` on the `ApplyArgs` field.
+    #[test]
+    fn test_cli_apply_no_paths_produces_clap_error() {
+        let result = Cli::try_parse_from(["netfyr", "apply"]);
+        assert!(
+            result.is_err(),
+            "invoking `netfyr apply` without any path arguments must fail; \
+             ApplyArgs.paths has required=true so clap returns an error (exit 2)"
+        );
+    }
+
+    /// AC "--color is a global flag": it must be accepted before the subcommand.
+    #[test]
+    fn test_cli_color_flag_before_subcommand_is_accepted() {
+        let result = Cli::try_parse_from(["netfyr", "--color", "never", "apply", "/tmp/dummy.yaml"]);
+        assert!(
+            result.is_ok(),
+            "`--color never` before the subcommand must be accepted as a global flag; \
+             got: {:?}",
+            result.err()
+        );
+        let cli = result.unwrap();
+        assert!(
+            matches!(cli.color, ColorMode::Never),
+            "`--color never` must parse to ColorMode::Never"
+        );
+    }
+
+    /// AC "--color is a global flag": it must also be accepted after the subcommand name.
+    #[test]
+    fn test_cli_color_flag_after_subcommand_is_accepted() {
+        let result = Cli::try_parse_from(["netfyr", "apply", "--color", "always", "/tmp/dummy.yaml"]);
+        assert!(
+            result.is_ok(),
+            "`--color always` after the subcommand must be accepted as a global flag; \
+             got: {:?}",
+            result.err()
+        );
+        let cli = result.unwrap();
+        assert!(
+            matches!(cli.color, ColorMode::Always),
+            "`--color always` after subcommand must parse to ColorMode::Always"
+        );
+    }
+
+    /// AC "--color defaults to auto": omitting `--color` must default to `Auto`.
+    #[test]
+    fn test_cli_color_flag_default_is_auto() {
+        let result = Cli::try_parse_from(["netfyr", "apply", "/tmp/dummy.yaml"]);
+        assert!(
+            result.is_ok(),
+            "parsing `netfyr apply /tmp/dummy.yaml` without --color must succeed; \
+             got: {:?}",
+            result.err()
+        );
+        let cli = result.unwrap();
+        assert!(
+            matches!(cli.color, ColorMode::Auto),
+            "omitting --color must default to ColorMode::Auto"
+        );
+    }
+
+    /// AC "--color rejects invalid values": unrecognized values must be rejected.
+    #[test]
+    fn test_cli_color_flag_invalid_value_is_rejected() {
+        let result = Cli::try_parse_from(["netfyr", "--color", "rainbow", "apply", "/tmp/dummy.yaml"]);
+        assert!(
+            result.is_err(),
+            "`--color rainbow` must be rejected as an invalid ColorMode value"
+        );
+    }
 }
 
 #[derive(Subcommand)]

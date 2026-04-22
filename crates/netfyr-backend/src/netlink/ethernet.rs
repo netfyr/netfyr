@@ -518,16 +518,16 @@ mod tests {
     /// carrier byte 0 maps to false — link is physically down, no carrier signal.
     #[test]
     fn test_carrier_byte_zero_maps_to_false() {
-        let carrier: Option<u8> = Some(0);
-        let result = carrier.unwrap_or(0) != 0;
+        let carrier: u8 = 0;
+        let result = carrier != 0;
         assert!(!result, "carrier byte 0 must produce false (link down)");
     }
 
     /// carrier byte 1 maps to true — link is up, carrier is present.
     #[test]
     fn test_carrier_byte_one_maps_to_true() {
-        let carrier: Option<u8> = Some(1);
-        let result = carrier.unwrap_or(0) != 0;
+        let carrier: u8 = 1;
+        let result = carrier != 0;
         assert!(result, "carrier byte 1 must produce true (link up)");
     }
 
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn test_carrier_none_defaults_to_false() {
         let carrier: Option<u8> = None;
-        let result = carrier.unwrap_or(0) != 0;
+        let result = carrier.is_some_and(|b| b != 0);
         assert!(!result, "absent carrier attribute must default to false");
     }
 
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn test_carrier_nonzero_values_map_to_true() {
         for byte in [2u8, 10u8, 128u8, 255u8] {
-            let result = Some(byte).unwrap_or(0) != 0;
+            let result = byte != 0;
             assert!(result, "carrier byte {byte} must produce true");
         }
     }

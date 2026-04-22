@@ -7,7 +7,7 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     if std::env::args().len() == 1 {
         println!("netfyr");
-        return ExitCode::from(0u8);
+        std::process::exit(0);
     }
 
     let cli = Cli::parse();

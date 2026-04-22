@@ -8,9 +8,6 @@
 
 use indexmap::IndexMap;
 
-// Used in test_apply_permission_denied_when_not_root_outside_namespace.
-#[allow(unused_imports)]
-use libc;
 
 use netfyr_backend::{
     netlink::apply::{apply_ethernet, dry_run_ethernet},
