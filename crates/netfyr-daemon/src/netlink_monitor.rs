@@ -10,9 +10,10 @@
 //! linux/netlink.h and linux/rtnetlink.h.
 
 use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
 
 use anyhow::Result;
-use netlink_sys::{protocols::NETLINK_ROUTE, Socket};
+use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -28,8 +29,22 @@ const RTNLGRP_IPV4_IFADDR: u32 = 5;
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
+const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
+
+// ── Netlink control message types (linux/netlink.h) ───────────────────────────
+
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+
+// Receive timeout for the blocking RTM_GETLINK dump at startup (seconds).
+const DUMP_RECV_TIMEOUT_SECS: i64 = 5;
+
+// ── Netlink request flags (linux/netlink.h) ───────────────────────────────────
+
+const NLM_F_REQUEST: u16 = 0x1;
+const NLM_F_DUMP: u16 = 0x300; // NLM_F_ROOT | NLM_F_MATCH
 
 // ── Attribute types ───────────────────────────────────────────────────────────
 
@@ -93,18 +108,25 @@ impl NetlinkMonitor {
             .bind_auto()
             .map_err(|e| anyhow::anyhow!("Failed to bind netlink monitor socket: {}", e))?;
 
-        // Subscribe to multicast groups before setting non-blocking so that
-        // any buffered notifications are visible immediately on first read.
+        // Pre-populate the name cache with all existing interfaces by sending an
+        // RTM_GETLINK dump while the socket is still blocking and before joining
+        // multicast groups. This ensures address-only events after a daemon restart
+        // can be resolved to interface names even if no RTM_NEWLINK event has occurred.
+        let initial_name_cache = dump_link_names(&socket);
+
+        // Switch to non-blocking BEFORE joining multicast groups so that multicast
+        // events arriving after add_membership are handled by the async task, not
+        // accidentally interleaved with dump response parsing above.
+        socket
+            .set_non_blocking(true)
+            .map_err(|e| anyhow::anyhow!("Failed to set socket non-blocking: {}", e))?;
+
         socket
             .add_membership(RTNLGRP_LINK)
             .map_err(|e| anyhow::anyhow!("Failed to join RTNLGRP_LINK: {}", e))?;
         socket
             .add_membership(RTNLGRP_IPV4_IFADDR)
             .map_err(|e| anyhow::anyhow!("Failed to join RTNLGRP_IPV4_IFADDR: {}", e))?;
-
-        socket
-            .set_non_blocking(true)
-            .map_err(|e| anyhow::anyhow!("Failed to set socket non-blocking: {}", e))?;
 
         // Larger receive buffer reduces risk of ENOBUFS under heavy event load.
         let _ = socket.set_rx_buf_sz(1024u32 * 1024);
@@ -114,7 +136,7 @@ impl NetlinkMonitor {
         })?;
 
         let (tx, rx) = mpsc::channel(32);
-        let task = tokio::spawn(monitor_task(async_fd, tx));
+        let task = tokio::spawn(monitor_task(async_fd, tx, initial_name_cache));
 
         Ok(Self {
             change_rx: rx,
@@ -136,14 +158,119 @@ impl NetlinkMonitor {
     }
 }
 
+// ── Startup link dump ─────────────────────────────────────────────────────────
+
+/// Send an RTM_GETLINK dump request on a blocking socket and collect all
+/// ifindex → ifname mappings from the kernel's response.
+///
+/// Called during `NetlinkMonitor::start()` while the socket is still blocking
+/// and before any multicast subscriptions, so dump responses cannot interleave
+/// with multicast events.  On any failure the function logs a warning and returns
+/// an empty map — the monitor continues with an unpopulated cache and will fill
+/// it in as subsequent RTM_NEWLINK multicast messages arrive.
+fn dump_link_names(socket: &Socket) -> HashMap<u32, String> {
+    // Build an RTM_GETLINK dump request: nlmsghdr + zeroed ifinfomsg.
+    let msg_len = NLMSG_HDR_LEN + IFINFOMSG_LEN;
+    let mut msg = [0u8; NLMSG_HDR_LEN + IFINFOMSG_LEN];
+    msg[0..4].copy_from_slice(&(msg_len as u32).to_ne_bytes()); // nlmsg_len
+    msg[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes()); // nlmsg_type
+    msg[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes()); // nlmsg_flags
+    msg[8..12].copy_from_slice(&1u32.to_ne_bytes()); // nlmsg_seq
+    // nlmsg_pid = 0 (kernel); already zero
+
+    // Set a receive timeout so the blocking recv cannot hang the daemon if the
+    // kernel doesn't send NLMSG_DONE (e.g. due to NLMSG_ERROR or permission issues).
+    let timeout = libc::timeval { tv_sec: DUMP_RECV_TIMEOUT_SECS, tv_usec: 0 };
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeout as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
+    // Connect to the kernel (pid=0, groups=0) so that socket.send() knows the
+    // destination without requiring a separate sendto address argument.
+    if let Err(e) = socket.connect(&SocketAddr::new(0, 0)) {
+        warn!("RTM_GETLINK dump: failed to connect to kernel: {}", e);
+        return HashMap::new();
+    }
+
+    if let Err(e) = socket.send(&msg, 0) {
+        warn!("RTM_GETLINK dump: failed to send request: {}", e);
+        return HashMap::new();
+    }
+
+    let mut result = HashMap::new();
+    loop {
+        let mut buf = Vec::with_capacity(RECV_BUF_CAPACITY);
+        if let Err(e) = socket.recv_from(&mut buf, 0) {
+            // EAGAIN/EWOULDBLOCK = timeout expired; any other error = unrecoverable.
+            // In both cases, return what we have so far and let the monitor continue.
+            warn!("RTM_GETLINK dump: recv error: {}", e);
+            return result;
+        }
+
+        // Guard against a zero-length recv (shouldn't happen on a blocking netlink
+        // socket, but prevents an infinite outer loop if the kernel closes the socket).
+        if buf.is_empty() {
+            break;
+        }
+
+        let mut done = false;
+        let mut offset = 0;
+        while offset < buf.len() {
+            let remaining = &buf[offset..];
+            if remaining.len() < NLMSG_HDR_LEN {
+                break;
+            }
+            let nlmsg_len =
+                u32::from_ne_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
+                    as usize;
+            if nlmsg_len < NLMSG_HDR_LEN || nlmsg_len > remaining.len() {
+                break;
+            }
+            let nlmsg_type = u16::from_ne_bytes([remaining[4], remaining[5]]);
+            let msg_buf = &remaining[..nlmsg_len];
+
+            // NLMSG_DONE signals end of dump; NLMSG_ERROR signals a kernel error.
+            // Both terminate the recv loop.
+            if nlmsg_type == NLMSG_DONE || nlmsg_type == NLMSG_ERROR {
+                done = true;
+                break;
+            }
+            if nlmsg_type == RTM_NEWLINK {
+                if let Some((ifindex, Some(ifname))) = parse_link_message(msg_buf) {
+                    result.insert(ifindex, ifname);
+                }
+            }
+
+            let aligned = (nlmsg_len + 3) & !3;
+            offset += aligned.max(NLMSG_HDR_LEN);
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    result
+}
+
 // ── Background task ───────────────────────────────────────────────────────────
 
-async fn monitor_task(async_fd: AsyncFd<Socket>, tx: mpsc::Sender<Vec<NetlinkChange>>) {
+async fn monitor_task(
+    async_fd: AsyncFd<Socket>,
+    tx: mpsc::Sender<Vec<NetlinkChange>>,
+    initial_name_cache: HashMap<u32, String>,
+) {
     // Pending changes keyed by ifindex: (best-known ifname, accumulated kinds).
     let mut pending: HashMap<u32, (Option<String>, Vec<ChangeKind>)> = HashMap::new();
-    // Cache ifindex → ifname populated from RTM_NEWLINK messages, used to
-    // resolve the ifname for RTM_NEWADDR/RTM_DELADDR messages that omit it.
-    let mut name_cache: HashMap<u32, String> = HashMap::new();
+    // Cache ifindex → ifname, pre-populated from the RTM_GETLINK dump at startup
+    // and updated as RTM_NEWLINK messages arrive during normal operation.
+    let mut name_cache = initial_name_cache;
 
     // "Far future" sentinel means no pending debounce timer.
     let far_future = Instant::now() + Duration::from_secs(365 * 24 * 3600);

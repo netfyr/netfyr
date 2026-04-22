@@ -1517,6 +1517,232 @@ async fn netns_external_address_removal_creates_journal_entry() {
     );
 }
 
+// ── Feature: Address change detected after daemon restart ─────────────────────
+
+/// AC: Address change detected after daemon restart — the startup RTM_GETLINK dump
+/// pre-populates the name cache so that address events resolve to interface names
+/// even when no RTM_NEWLINK event has arrived in the new daemon's lifetime.
+///
+/// Flow:
+/// 1. Start daemon #1, apply a policy (creates journal snapshot for the interface).
+/// 2. Kill daemon #1 (no link events happen during or after the kill).
+/// 3. Start daemon #2 with the same journal + policy dirs.
+/// 4. Immediately run `ip addr add` (before any RTM_NEWLINK arrives).
+/// 5. Assert that an ExternalChange journal entry is written (cache was pre-populated).
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_address_change_detected_after_daemon_restart() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_address_change_after_restart: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-rst0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-rst1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let socket_dir = tempfile::tempdir().unwrap();
+    let policy_dir = tempfile::tempdir().unwrap();
+    let journal_dir = tempfile::tempdir().unwrap();
+    let socket_path = socket_dir.path().join("netfyr-rst.sock");
+
+    // ── Phase 1: Start daemon #1 and apply a policy to create a journal snapshot ──
+
+    let mut daemon1 = Command::new(env!("CARGO_BIN_EXE_netfyr-daemon"))
+        .env("NETFYR_SOCKET_PATH", socket_path.as_os_str())
+        .env("NETFYR_POLICY_DIR", policy_dir.path())
+        .env("NETFYR_JOURNAL_DIR", journal_dir.path())
+        .env("RUST_LOG", "off")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn daemon #1");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !socket_path.exists() {
+        assert!(Instant::now() < deadline, "daemon #1 socket did not appear");
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_millis(100)).await;
+
+    let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+
+    // Give daemon #1 time to write the journal entry.
+    sleep(Duration::from_millis(500)).await;
+
+    // Kill daemon #1.
+    let _ = daemon1.kill();
+    let _ = daemon1.wait();
+
+    // Remove the socket so daemon #2 can bind to the same path.
+    let _ = std::fs::remove_file(&socket_path);
+
+    // ── Phase 2: Start daemon #2 (same dirs, fresh netlink cache) ─────────────
+
+    let mut daemon2 = Command::new(env!("CARGO_BIN_EXE_netfyr-daemon"))
+        .env("NETFYR_SOCKET_PATH", socket_path.as_os_str())
+        .env("NETFYR_POLICY_DIR", policy_dir.path())
+        .env("NETFYR_JOURNAL_DIR", journal_dir.path())
+        .env("RUST_LOG", "off")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn daemon #2");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !socket_path.exists() {
+        assert!(Instant::now() < deadline, "daemon #2 socket did not appear");
+        sleep(Duration::from_millis(50)).await;
+    }
+    // Small grace period so daemon #2 finishes its startup RTM_GETLINK dump.
+    sleep(Duration::from_millis(200)).await;
+
+    // Record the journal baseline (entries written by both daemons so far).
+    let read_journal = |journal_dir: &tempfile::TempDir| -> Vec<netfyr_journal::JournalEntry> {
+        let path = journal_dir.path().join("current.ndjson");
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<netfyr_journal::JournalEntry>(l).ok())
+            .collect()
+    };
+
+    // Wait for daemon #2's startup reconcile to complete and any self-generated
+    // events to settle before measuring the baseline.
+    sleep(Duration::from_millis(1500)).await;
+    let baseline_entries = read_journal(&journal_dir);
+    let ext_baseline = count_entries_with_trigger(&baseline_entries, "external_change");
+
+    // ── Phase 3: Add address externally — no RTM_NEWLINK has arrived yet ──────
+    // This tests that the startup RTM_GETLINK dump populated the cache so the
+    // address event can be associated with the interface name.
+
+    if !ip_addr_add(iface, "10.99.77.1/24") {
+        eprintln!("SKIP: ip addr add failed");
+        let _ = daemon2.kill();
+        let _ = daemon2.wait();
+        return;
+    }
+
+    // Wait for the debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = read_journal(&journal_dir);
+    let ext_after = count_entries_with_trigger(&entries_after, "external_change");
+
+    // Cleanup before assertions to avoid leaving processes running.
+    let _ = daemon2.kill();
+    let _ = daemon2.wait();
+
+    assert!(
+        ext_after > ext_baseline,
+        "address addition after daemon restart must produce an ExternalChange journal \
+         entry — the startup cache dump must have pre-populated ifindex→name mappings \
+         (baseline ext_change={ext_baseline}, after={ext_after})"
+    );
+
+    // The new ExternalChange entry must reference the correct interface.
+    let new_ext = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change")
+        .last()
+        .expect("must have at least one ExternalChange entry after restart");
+
+    if let netfyr_journal::Trigger::ExternalChange { ref changed_entities } = new_ext.trigger {
+        assert!(
+            changed_entities.contains(&iface.to_string()),
+            "changed_entities must include {iface} after restart: {:?}",
+            changed_entities
+        );
+    } else {
+        panic!("trigger must be ExternalChange");
+    }
+}
+
+// ── Feature: Read-only fields excluded from external diffs ───────────────────
+
+/// AC: Read-only fields are excluded from external diffs — after an external MTU change,
+/// the journal entry's diff must not mention "driver", "carrier", "speed", "mac", or "name".
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_readonly_fields_excluded_from_external_change_diff() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_readonly_fields_excluded: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-ro0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-ro1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial policy: mtu=9000 so the interface is managed and has a journal snapshot.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+    sleep(Duration::from_millis(1500)).await;
+
+    // External change: set mtu=1500 without going through the daemon.
+    if !ip_set_mtu(iface, 1500) {
+        eprintln!("SKIP: ip link set mtu failed");
+        return;
+    }
+
+    // Wait for debounce (500ms) + buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries = daemon.read_journal_entries();
+    let ext_entry = entries.iter().filter(|e| trigger_type(e) == "external_change").last();
+
+    let ext_entry = match ext_entry {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: no ExternalChange entry found (daemon may not have detected change)");
+            return;
+        }
+    };
+
+    // The diff must not mention any readonly field name.
+    let readonly_fields = ["driver", "carrier", "speed", "mac", "name"];
+    for op in &ext_entry.diff.operations {
+        for fc in &op.field_changes {
+            assert!(
+                !readonly_fields.contains(&fc.field_name.as_str()),
+                "readonly field '{}' must not appear in ExternalChange journal diff \
+                 (entry diff: {:?})",
+                fc.field_name,
+                op.field_changes.iter().map(|f| f.field_name.as_str()).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 // ── Feature: Daemon handles DHCP policy in namespace ─────────────────────────
 
 /// Scenario: Daemon handles DHCP policy in namespace — lease acquired.

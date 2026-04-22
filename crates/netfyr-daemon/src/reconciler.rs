@@ -24,6 +24,11 @@ use netfyr_state::{SchemaRegistry, Selector, StateSet};
 use crate::factory_manager::FactoryManager;
 use crate::policy_store::PolicyStore;
 
+// Fields reported by the backend query but never set by policies. Comparing
+// them against journal snapshots (which store desired/writable state only)
+// would produce spurious ExternalChange diffs.
+const READONLY_FIELDS: &[&str] = &["carrier", "speed", "mac", "driver", "name"];
+
 // ── ApplyResult ───────────────────────────────────────────────────────────────
 
 /// The result of a full reconciliation and apply cycle.
@@ -592,6 +597,9 @@ fn compute_external_field_changes(
 
     // Fields present in the current (live) state.
     for (field_name, fv) in &current.fields {
+        if READONLY_FIELDS.contains(&field_name.as_str()) {
+            continue;
+        }
         let current_json = serde_json::to_value(&fv.value).unwrap_or(serde_json::Value::Null);
         match last.fields.get(field_name) {
             Some(last_val) if last_val == &current_json => {
@@ -620,6 +628,9 @@ fn compute_external_field_changes(
     // Fields present in the last snapshot but absent from the current state.
     if let Some(last_obj) = last.fields.as_object() {
         for (field_name, last_val) in last_obj {
+            if READONLY_FIELDS.contains(&field_name.as_str()) {
+                continue;
+            }
             if !current.fields.contains_key(field_name) {
                 changes.push(SerializableFieldChange {
                     field_name: field_name.clone(),
@@ -1052,8 +1063,8 @@ mod tests {
         let current = make_current_state(
             "eth0",
             vec![
-                ("mtu", Value::U64(1500)),    // unchanged
-                ("speed", Value::U64(1000)),  // new field (address-like addition)
+                ("mtu", Value::U64(1500)),       // unchanged
+                ("addresses", Value::U64(1000)), // new field (address-like addition)
             ],
         );
 
@@ -1061,7 +1072,7 @@ mod tests {
 
         assert_eq!(changes.len(), 1, "only the newly added field should appear");
         let change = &changes[0];
-        assert_eq!(change.field_name, "speed");
+        assert_eq!(change.field_name, "addresses");
         assert_eq!(change.change_kind, "set");
         assert!(
             change.current.is_none(),
@@ -1076,7 +1087,7 @@ mod tests {
     fn test_compute_external_field_changes_removed_field_has_unset_kind_and_no_desired() {
         let last = make_journal_snapshot(
             "eth0",
-            serde_json::json!({ "mtu": 1500u64, "speed": 1000u64 }),
+            serde_json::json!({ "mtu": 1500u64, "addresses": 1000u64 }),
         );
         let current = make_current_state("eth0", vec![("mtu", Value::U64(1500))]);
 
@@ -1084,7 +1095,7 @@ mod tests {
 
         assert_eq!(changes.len(), 1, "only the removed field should appear");
         let change = &changes[0];
-        assert_eq!(change.field_name, "speed");
+        assert_eq!(change.field_name, "addresses");
         assert_eq!(change.change_kind, "unset", "removed field must have kind 'unset'");
         assert_eq!(
             change.current,
@@ -1136,13 +1147,13 @@ mod tests {
     fn test_compute_external_field_changes_multiple_changed_fields_all_captured() {
         let last = make_journal_snapshot(
             "eth0",
-            serde_json::json!({ "mtu": 9000u64, "speed": 100u64 }),
+            serde_json::json!({ "mtu": 9000u64, "addresses": 100u64 }),
         );
         let current = make_current_state(
             "eth0",
             vec![
-                ("mtu", Value::U64(1500)),   // changed
-                ("speed", Value::U64(1000)), // also changed
+                ("mtu", Value::U64(1500)),        // changed
+                ("addresses", Value::U64(1000)),  // also changed
             ],
         );
 
@@ -1152,10 +1163,10 @@ mod tests {
         let mtu = changes.iter().find(|c| c.field_name == "mtu").expect("mtu must be present");
         assert_eq!(mtu.current, Some(serde_json::json!(9000u64)));
         assert_eq!(mtu.desired, Some(serde_json::json!(1500u64)));
-        let speed =
-            changes.iter().find(|c| c.field_name == "speed").expect("speed must be present");
-        assert_eq!(speed.current, Some(serde_json::json!(100u64)));
-        assert_eq!(speed.desired, Some(serde_json::json!(1000u64)));
+        let addresses =
+            changes.iter().find(|c| c.field_name == "addresses").expect("addresses must be present");
+        assert_eq!(addresses.current, Some(serde_json::json!(100u64)));
+        assert_eq!(addresses.desired, Some(serde_json::json!(1000u64)));
     }
 
     /// AC: External changes do not trigger re-reconciliation — record_external_change
@@ -1207,5 +1218,140 @@ mod tests {
         assert!(names.contains(&"eth0"), "eth0 must be in changed_entities");
         assert!(names.contains(&"eth1"), "eth1 must be in changed_entities");
         assert!(names.contains(&"eth2"), "eth2 must be in changed_entities");
+    }
+
+    // ── Feature: Read-only fields excluded from external diffs (AC) ───────────
+    //
+    // READONLY_FIELDS = ["carrier", "speed", "mac", "driver", "name"]
+    //
+    /// AC: Read-only fields are excluded from external diffs — carrier, speed, mac, driver,
+    /// and name must not appear in the computed field changes even when they differ.
+    #[test]
+    fn test_compute_external_field_changes_all_readonly_field_names_are_excluded() {
+        // Snapshot: only the writable "mtu" field.
+        let last = make_journal_snapshot("veth-e2e0", serde_json::json!({ "mtu": 9000u64 }));
+        // Current: mtu changed (writable) + all readonly fields present with different values.
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![
+                ("mtu", Value::U64(1500)),    // writable, changed — must appear
+                ("carrier", Value::U64(1)),   // readonly — must be excluded
+                ("speed", Value::U64(1000)),  // readonly — must be excluded
+                ("mac", Value::U64(0)),       // readonly — must be excluded
+                ("driver", Value::U64(0)),    // readonly — must be excluded
+                ("name", Value::U64(0)),      // readonly — must be excluded
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        // Only "mtu" should appear; all readonly fields must be absent.
+        assert_eq!(
+            changes.len(),
+            1,
+            "only the changed writable field (mtu) must appear; got: {:?}",
+            changes.iter().map(|c| c.field_name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(changes[0].field_name, "mtu");
+
+        for readonly_field in READONLY_FIELDS {
+            assert!(
+                !changes.iter().any(|c| c.field_name == *readonly_field),
+                "readonly field '{}' must not appear in the external change diff",
+                readonly_field
+            );
+        }
+    }
+
+    /// AC: Read-only fields in the journal snapshot that are absent from the current state
+    /// must not produce a diff entry (excluded in both directions).
+    #[test]
+    fn test_compute_external_field_changes_readonly_fields_absent_from_current_are_excluded() {
+        // Snapshot contains readonly fields (e.g., written by an older code path).
+        let last = make_journal_snapshot(
+            "eth0",
+            serde_json::json!({
+                "mtu": 1500u64,
+                "carrier": 1u64,
+                "speed": 1000u64,
+                "mac": 0u64,
+                "driver": 0u64,
+                "name": 0u64
+            }),
+        );
+        // Current has only mtu — all readonly fields absent (no change to writable state).
+        let current = make_current_state("eth0", vec![("mtu", Value::U64(1500))]);
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert!(
+            changes.is_empty(),
+            "readonly fields absent from current state must not produce diff entries: {:?}",
+            changes.iter().map(|c| c.field_name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// AC: Only writable fields appear in external diffs — even when multiple readonly
+    /// fields change simultaneously with a writable field, only the writable field appears.
+    #[test]
+    fn test_compute_external_field_changes_mixed_readonly_and_writable_only_writable_appears() {
+        let last = make_journal_snapshot(
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64, "operstate": "up" }),
+        );
+        let current = make_current_state(
+            "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),     // writable, changed
+                ("operstate", Value::from("down")), // writable field changed (not in readonly list)
+                ("carrier", Value::U64(0)),    // readonly
+                ("speed", Value::U64(100)),    // readonly
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        let field_names: Vec<&str> = changes.iter().map(|c| c.field_name.as_str()).collect();
+
+        // mtu and operstate must appear (both are writable and changed).
+        assert!(field_names.contains(&"mtu"), "mtu must appear (writable, changed)");
+        assert!(field_names.contains(&"operstate"), "operstate must appear (writable, changed)");
+
+        // carrier and speed must not appear (readonly).
+        assert!(
+            !field_names.contains(&"carrier"),
+            "carrier must not appear (readonly): {:?}",
+            field_names
+        );
+        assert!(
+            !field_names.contains(&"speed"),
+            "speed must not appear (readonly): {:?}",
+            field_names
+        );
+    }
+
+    /// AC: An empty snapshot vs a current state with only readonly fields produces no changes.
+    /// This guards against the monitor generating spurious entries for carrier/speed/mac
+    /// when no writable fields have actually changed.
+    #[test]
+    fn test_compute_external_field_changes_only_readonly_fields_in_current_produces_no_diff() {
+        let last = make_journal_snapshot("eth0", serde_json::json!({}));
+        let current = make_current_state(
+            "eth0",
+            vec![
+                ("carrier", Value::U64(1)),
+                ("speed", Value::U64(1000)),
+                ("mac", Value::U64(0)),
+                ("driver", Value::U64(0)),
+                ("name", Value::U64(0)),
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert!(
+            changes.is_empty(),
+            "current state with only readonly fields must produce no external change diff"
+        );
     }
 }

@@ -36,6 +36,8 @@ tracing-subscriber = "0.3"
 # RTNLGRP_IPV4_IFADDR) for the external change monitor. Already in the lockfile
 # as a transitive dep of rtnetlink 0.20; pinning here makes it a direct dep.
 netlink-sys = "0.8"
+# libc: used to set SO_RCVTIMEO on the blocking netlink socket in dump_link_names
+libc = "0.2"
 
 [dev-dependencies]
 # tempfile: creates temporary directories for unit tests
