@@ -2122,4 +2122,80 @@ mod tests {
             output.escape_debug()
         );
     }
+
+    // ── trigger_detail_str: ExternalChange format ─────────────────────────────
+
+    /// AC: trigger_detail_str for ExternalChange formats entity names as " (eth0, eth1)".
+    ///
+    /// The spec detail view shows "Trigger: external (entity1, entity2, ...)" —
+    /// the trigger_detail_str must produce the parenthesized list.
+    #[test]
+    fn test_trigger_detail_str_external_change_formats_entity_names_in_parentheses() {
+        let trigger = Trigger::ExternalChange {
+            changed_entities: vec!["eth0".to_string(), "eth1".to_string()],
+        };
+        let detail = trigger_detail_str(&trigger);
+        assert_eq!(
+            detail, " (eth0, eth1)",
+            "ExternalChange trigger_detail_str must produce ' (eth0, eth1)', got: {:?}",
+            detail
+        );
+    }
+
+    /// AC: trigger_detail_str for ExternalChange with no entities returns an empty string.
+    #[test]
+    fn test_trigger_detail_str_external_change_with_no_entities_returns_empty_string() {
+        let trigger = Trigger::ExternalChange { changed_entities: vec![] };
+        let detail = trigger_detail_str(&trigger);
+        assert_eq!(
+            detail, "",
+            "ExternalChange trigger_detail_str with empty changed_entities must return '', got: {:?}",
+            detail
+        );
+    }
+
+    /// AC: format_text_detail for an ExternalChange entry includes the changed entity names
+    /// in the Trigger line, showing "external (veth-e2e0)".
+    ///
+    /// The spec detail view shows the changed entities as part of the Trigger line.
+    #[test]
+    fn test_format_text_detail_external_change_trigger_line_includes_changed_entity_names() {
+        let mut entry = make_entry();
+        entry.trigger = Trigger::ExternalChange {
+            changed_entities: vec!["veth-e2e0".to_string()],
+        };
+        entry.outcome = ApplyOutcome::Observed;
+        let output = format_text_detail(&entry);
+
+        assert!(
+            output.contains("external"),
+            "detail Trigger line must show 'external' for ExternalChange trigger, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("veth-e2e0"),
+            "detail Trigger line must include the changed entity 'veth-e2e0', got:\n{}",
+            output
+        );
+        // The trigger line must combine the display name and the entity list.
+        assert!(
+            output.contains("external (veth-e2e0)"),
+            "detail Trigger line must be 'external (veth-e2e0)', got:\n{}",
+            output
+        );
+    }
+
+    /// AC: format_text_detail for an ExternalChange entry shows "observed" outcome.
+    #[test]
+    fn test_format_text_detail_external_change_outcome_is_observed() {
+        let mut entry = make_entry();
+        entry.trigger = Trigger::ExternalChange { changed_entities: vec!["eth0".to_string()] };
+        entry.outcome = ApplyOutcome::Observed;
+        let output = format_text_detail(&entry);
+        assert!(
+            output.contains("observed"),
+            "detail Outcome line must show 'observed' for ExternalChange entry, got:\n{}",
+            output
+        );
+    }
 }

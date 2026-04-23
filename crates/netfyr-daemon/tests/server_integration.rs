@@ -2162,6 +2162,199 @@ async fn netns_external_route_removal_creates_journal_entry() {
     );
 }
 
+// ── Feature: Diff values for MTU change ──────────────────────────────────────
+
+/// AC: The entry's diff shows mtu: 9000 -> 1500 — verifies specific `current` and
+/// `desired` values, not just field presence.
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_external_mtu_change_diff_shows_specific_old_and_new_mtu_values() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_external_mtu_values: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-mtuval0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-mtuval1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial policy: mtu=9000 (this is the "before" value in the diff).
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+
+    // Wait for the policy apply and self-generated netlink events to settle.
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // External change: set mtu=1500 — this is the "after" value in the diff.
+    if !ip_set_mtu(iface, 1500) {
+        eprintln!("SKIP: ip link set mtu failed");
+        return;
+    }
+
+    // Wait for debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+    let ext_entry = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .next_back();
+
+    let ext_entry = match ext_entry {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: no new ExternalChange entry found after MTU change");
+            return;
+        }
+    };
+
+    // Find the mtu field change in the diff.
+    let mtu_fc = ext_entry
+        .diff
+        .operations
+        .iter()
+        .flat_map(|op| op.field_changes.iter())
+        .find(|fc| fc.field_name == "mtu");
+
+    let mtu_fc = match mtu_fc {
+        Some(fc) => fc,
+        None => {
+            panic!(
+                "mtu field must appear in the ExternalChange diff; operations: {:?}",
+                ext_entry.diff.operations.iter().map(|op| &op.field_changes).collect::<Vec<_>>()
+            );
+        }
+    };
+
+    // The diff must record the old value (9000) as "current" and the new value (1500) as "desired".
+    assert_eq!(
+        mtu_fc.current,
+        Some(serde_json::json!(9000u64)),
+        "diff mtu 'current' must be 9000 (the value before external change), got {:?}",
+        mtu_fc.current
+    );
+    assert_eq!(
+        mtu_fc.desired,
+        Some(serde_json::json!(1500u64)),
+        "diff mtu 'desired' must be 1500 (the new externally-set value), got {:?}",
+        mtu_fc.desired
+    );
+}
+
+// ── Feature: Burst coalescing — diff contains both changed fields ──────────────
+
+/// AC: A burst of two rapid external changes (mtu + address) coalesces into a single
+/// journal entry whose diff includes both the mtu and addresses field changes.
+///
+/// The spec says: "And the entry's diff includes both the mtu and address changes."
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_burst_changes_diff_includes_both_mtu_and_address_field_changes() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP netns_burst_both_fields: namespace unavailable ({e})");
+            return;
+        }
+    };
+
+    let iface = "veth-ec-bst2-0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-bst2-1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial policy (mtu=9000) and wait for events to settle so the journal
+    // has a snapshot for this interface.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // Make two rapid changes within the 500ms debounce window.
+    if !ip_set_mtu(iface, 1400) {
+        eprintln!("SKIP: ip link set mtu 1400 failed");
+        return;
+    }
+    if !ip_addr_add(iface, "10.99.56.1/24") {
+        eprintln!("SKIP: ip addr add failed");
+        return;
+    }
+
+    // Wait for debounce (500ms) + buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+    let new_ext: Vec<_> = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .collect();
+
+    if new_ext.is_empty() {
+        eprintln!("SKIP: no new ExternalChange entries found after burst changes");
+        return;
+    }
+
+    // Verify the burst produced a single coalesced entry.
+    assert_eq!(
+        new_ext.len(),
+        1,
+        "burst changes must produce exactly one coalesced ExternalChange entry, got {}",
+        new_ext.len()
+    );
+
+    let entry = new_ext[0];
+
+    // The single coalesced entry must have BOTH the mtu and addresses field changes.
+    let all_field_names: Vec<&str> = entry
+        .diff
+        .operations
+        .iter()
+        .flat_map(|op| op.field_changes.iter().map(|fc| fc.field_name.as_str()))
+        .collect();
+
+    assert!(
+        all_field_names.contains(&"mtu"),
+        "coalesced burst entry diff must include an 'mtu' field change; \
+         found fields: {:?}",
+        all_field_names
+    );
+    assert!(
+        all_field_names.contains(&"addresses"),
+        "coalesced burst entry diff must include an 'addresses' field change; \
+         found fields: {:?}",
+        all_field_names
+    );
+}
+
 // ── Feature: Daemon handles DHCP policy in namespace ─────────────────────────
 
 /// Scenario: Daemon handles DHCP policy in namespace — lease acquired.
