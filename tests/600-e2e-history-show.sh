@@ -137,4 +137,46 @@ if ! echo "$SHOW_OUTPUT" | grep -qi "applied"; then
     exit 1
 fi
 
+# Verify output contains "State after:" section header.
+if ! echo "$SHOW_OUTPUT" | grep -qi "State after:"; then
+    echo "FAIL: 600-e2e-history-show: output does not contain 'State after:' section" >&2
+    echo "      output: $SHOW_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify State after section contains YAML sequence element with type field.
+if ! echo "$SHOW_OUTPUT" | grep -qe "- type: ethernet"; then
+    echo "FAIL: 600-e2e-history-show: State after section does not contain '- type: ethernet'" >&2
+    echo "      output: $SHOW_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify State after section contains the interface name.
+if ! echo "$SHOW_OUTPUT" | grep -q "name: veth-e2e0"; then
+    echo "FAIL: 600-e2e-history-show: State after section does not contain 'name: veth-e2e0'" >&2
+    echo "      output: $SHOW_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify State after section contains mtu value.
+if ! echo "$SHOW_OUTPUT" | grep -q "mtu: 1400"; then
+    echo "FAIL: 600-e2e-history-show: State after section does not contain 'mtu: 1400'" >&2
+    echo "      output: $SHOW_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify output does NOT contain JSON-style inline arrays.
+if echo "$SHOW_OUTPUT" | grep -q '\["'; then
+    echo "FAIL: 600-e2e-history-show: output contains JSON inline array syntax '[\"'" >&2
+    echo "      output: $SHOW_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify output does NOT contain JSON-style inline objects.
+if echo "$SHOW_OUTPUT" | grep -q '{"'; then
+    echo "FAIL: 600-e2e-history-show: output contains JSON inline object syntax '{\"'" >&2
+    echo "      output: $SHOW_OUTPUT" >&2
+    exit 1
+fi
+
 echo "PASS: 600-e2e-history-show"
