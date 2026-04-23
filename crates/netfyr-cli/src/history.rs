@@ -12,8 +12,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use colored::Colorize;
+use indexmap::IndexMap;
 
-use netfyr_journal::{ApplyOutcome, Journal, JournalEntry, SerializableDiffOp, SerializableFieldChange, Trigger};
+use netfyr_journal::{ApplyOutcome, Journal, JournalEntry, SerializableDiffOp, SerializableFieldChange, SerializableState, Trigger};
 use netfyr_varlink::{VarlinkClient, VarlinkError};
 
 use crate::daemon_socket_path;
@@ -460,18 +461,16 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
     out.push_str(&format!("Outcome: {}\n", outcome_detail(&entry.outcome)));
 
     if !entry.state_after.entities.is_empty() {
+        let maps: Vec<IndexMap<String, serde_json::Value>> = entry
+            .state_after
+            .entities
+            .iter()
+            .map(serializable_state_to_flat_map)
+            .collect();
+        let yaml = serde_yaml::to_string(&maps).unwrap_or_default();
+        let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
         out.push_str("State after:\n");
-        for state in &entry.state_after.entities {
-            out.push_str(&format!(
-                "  {} {}:\n",
-                state.entity_type, state.selector_name
-            ));
-            if let Some(obj) = state.fields.as_object() {
-                for (k, v) in obj {
-                    out.push_str(&format!("    {}: {}\n", k, json_compact(v)));
-                }
-            }
-        }
+        out.push_str(yaml);
     }
 
     out
@@ -800,6 +799,18 @@ fn opt_json_compact(v: &Option<serde_json::Value>) -> String {
         Some(val) => json_compact(val),
         None => "null".to_string(),
     }
+}
+
+fn serializable_state_to_flat_map(state: &SerializableState) -> IndexMap<String, serde_json::Value> {
+    let mut map = IndexMap::new();
+    map.insert("type".to_string(), serde_json::Value::String(state.entity_type.clone()));
+    map.insert("name".to_string(), serde_json::Value::String(state.selector_name.clone()));
+    if let Some(obj) = state.fields.as_object() {
+        for (k, v) in obj {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    map
 }
 
 pub fn journal_dir_path() -> String {
@@ -1376,7 +1387,7 @@ mod tests {
         );
     }
 
-    /// AC: Detail output shows state snapshot after the change.
+    /// AC: Detail output shows state snapshot after the change in YAML block format.
     #[test]
     fn test_format_text_detail_shows_state_after_section() {
         let mut entry = make_entry();
@@ -1392,6 +1403,60 @@ mod tests {
             output.contains("State after:"),
             "detail output should contain 'State after:' section"
         );
+        assert!(
+            output.contains("- type: ethernet"),
+            "state-after should contain '- type: ethernet' in YAML block format, got:\n{output}"
+        );
+        assert!(
+            output.contains("  name: eth0"),
+            "state-after should contain '  name: eth0' in YAML block format, got:\n{output}"
+        );
+        assert!(
+            output.contains("  mtu: 9000"),
+            "state-after should contain '  mtu: 9000' in YAML block format, got:\n{output}"
+        );
+    }
+
+    /// AC: State-after with list fields renders addresses as YAML block sequences, not JSON arrays.
+    #[test]
+    fn test_format_text_detail_state_after_addresses_yaml_block_sequence() {
+        let mut entry = make_entry();
+        entry.state_after = SerializableStateSet {
+            entities: vec![SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                fields: serde_json::json!({
+                    "mtu": 9000u64,
+                    "addresses": ["10.0.1.50/24", "172.16.0.1/24"]
+                }),
+            }],
+        };
+        let output = format_text_detail(&entry);
+        assert!(
+            output.contains("  - 10.0.1.50/24"),
+            "addresses must be rendered as YAML block sequence items, got:\n{output}"
+        );
+        assert!(
+            !output.contains("[\"10.0.1.50/24\""),
+            "addresses must not be rendered as JSON inline array, got:\n{output}"
+        );
+    }
+
+    /// AC: serializable_state_to_flat_map places "type" first, "name" second.
+    #[test]
+    fn test_serializable_state_to_flat_map_puts_type_first_name_second() {
+        let state = SerializableState {
+            entity_type: "ethernet".to_string(),
+            selector_name: "eth0".to_string(),
+            fields: serde_json::json!({ "mtu": 1500u64 }),
+        };
+        let map = serializable_state_to_flat_map(&state);
+        let keys: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys[0], "type", "first key must be 'type'");
+        assert_eq!(keys[1], "name", "second key must be 'name'");
+        assert_eq!(map["type"], serde_json::json!("ethernet"));
+        assert_eq!(map["name"], serde_json::json!("eth0"));
+        assert_eq!(map["mtu"], serde_json::json!(1500u64));
     }
 
     // ── format_json_list ──────────────────────────────────────────────────────

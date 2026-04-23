@@ -104,10 +104,9 @@ impl Journal {
         // Acquire advisory write lock (blocks until acquired)
         Self::lock_file_write(&file)?;
 
-        // Assign sequence number and timestamp
+        // Assign sequence number; caller is responsible for setting timestamp.
         self.seq += 1;
         entry.seq = self.seq;
-        entry.timestamp = Utc::now();
 
         // Serialize and write
         let json = serde_json::to_string(&entry)?;
