@@ -46,9 +46,11 @@ pub struct HistoryArgs {
     #[arg(long, short = 's', value_parser = parse_history_selector)]
     pub selector: Vec<(String, String)>,
 
-    /// Show full detail for a single entry by sequence ID
-    #[arg(long)]
-    pub show: Option<u64>,
+    /// Show full detail for a single entry by sequence ID.
+    /// Positive values are absolute sequence numbers.
+    /// Negative values count from the end: -1 is the most recent entry.
+    #[arg(long, allow_hyphen_values = true)]
+    pub show: Option<i64>,
 
     /// Output format: text (default), json
     #[arg(long, short = 'o', default_value = "text")]
@@ -90,19 +92,37 @@ async fn run_history_local(args: &HistoryArgs) -> Result<ExitCode> {
         .with_context(|| format!("failed to open journal at {}", journal_dir))?;
 
     if let Some(seq) = args.show {
-        let entry = journal
-            .read_entry(seq)
-            .with_context(|| format!("failed to read journal entry #{}", seq))?;
-
-        match entry {
-            Some(e) => {
-                print_detail(&e, &args.output)?;
-                return Ok(ExitCode::from(0u8));
+        if seq > 0 {
+            let entry = journal
+                .read_entry(seq as u64)
+                .with_context(|| format!("failed to read journal entry #{}", seq))?;
+            match entry {
+                Some(e) => {
+                    print_detail(&e, &args.output)?;
+                    return Ok(ExitCode::from(0u8));
+                }
+                None => {
+                    eprintln!("Entry #{} not found", seq);
+                    return Ok(ExitCode::from(1u8));
+                }
             }
-            None => {
-                eprintln!("Entry #{} not found", seq);
+        } else if seq < 0 {
+            // Negative offset: -1 is most recent, -2 is second-to-last, etc.
+            // read_recent(k) returns entries newest-first; the last element is the k-th-to-last.
+            let k = seq.unsigned_abs() as usize;
+            let entries = journal
+                .read_recent(k)
+                .context("failed to read journal entries for negative offset")?;
+            if entries.len() < k {
+                eprintln!("Entry not found");
                 return Ok(ExitCode::from(1u8));
             }
+            let e = entries.into_iter().last().expect("entries.len() == k >= 1");
+            print_detail(&e, &args.output)?;
+            return Ok(ExitCode::from(0u8));
+        } else {
+            eprintln!("Entry #0 not found");
+            return Ok(ExitCode::from(1u8));
         }
     }
 
@@ -137,22 +157,41 @@ async fn run_history_daemon(
     args: &HistoryArgs,
 ) -> Result<ExitCode> {
     if let Some(seq) = args.show {
-        let raw = client
-            .get_journal_entry(seq)
-            .await
-            .context("failed to get journal entry from daemon")?;
-
-        match raw {
-            Some(value) => {
-                let entry: JournalEntry = serde_json::from_value(value)
-                    .context("failed to deserialize journal entry from daemon")?;
-                print_detail(&entry, &args.output)?;
-                return Ok(ExitCode::from(0u8));
+        if seq > 0 {
+            let raw = client
+                .get_journal_entry(seq as u64)
+                .await
+                .context("failed to get journal entry from daemon")?;
+            match raw {
+                Some(value) => {
+                    let entry: JournalEntry = serde_json::from_value(value)
+                        .context("failed to deserialize journal entry from daemon")?;
+                    print_detail(&entry, &args.output)?;
+                    return Ok(ExitCode::from(0u8));
+                }
+                None => {
+                    eprintln!("Entry #{} not found", seq);
+                    return Ok(ExitCode::from(1u8));
+                }
             }
-            None => {
-                eprintln!("Entry #{} not found", seq);
+        } else if seq < 0 {
+            let k = seq.unsigned_abs() as usize;
+            let raw_entries = client
+                .get_history(Some(k), None, None, None)
+                .await
+                .context("failed to get history from daemon for negative offset")?;
+            if raw_entries.len() < k {
+                eprintln!("Entry not found");
                 return Ok(ExitCode::from(1u8));
             }
+            let last_value = raw_entries.into_iter().last().expect("len == k >= 1");
+            let entry: JournalEntry = serde_json::from_value(last_value)
+                .context("failed to deserialize journal entry from daemon")?;
+            print_detail(&entry, &args.output)?;
+            return Ok(ExitCode::from(0u8));
+        } else {
+            eprintln!("Entry #0 not found");
+            return Ok(ExitCode::from(1u8));
         }
     }
 
@@ -2077,10 +2116,7 @@ mod tests {
     /// character.  For example the red line must be `\x1b[31m-mtu: 1500\x1b[0m`,
     /// not `\x1b[31m-\x1b[0mmtu: 1500`.
     ///
-    /// NOTE: The current `format_scalar_field_diff` implementation calls
-    /// `"-".red()` / `"+".green()`, which colors only the prefix character.  This
-    /// test is expected to fail until the implementation is corrected to color the
-    /// entire line content.
+    /// Verifies that ANSI color codes wrap the full line content, not just the +/- prefix.
     #[test]
     fn test_format_text_detail_scalar_change_colors_entire_line_not_just_prefix() {
         let _lock = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -2198,6 +2234,181 @@ mod tests {
             output.contains("observed"),
             "detail Outcome line must show 'observed' for ExternalChange entry, got:\n{}",
             output
+        );
+    }
+
+    // ── Negative offset: --show -1 / --show -3 / beyond size ─────────────────
+
+    /// AC: --show -1 returns the most recent journal entry (seq=30 in a 30-entry journal).
+    ///
+    /// The implementation does: read_recent(1) → entries[0] = newest → print detail.
+    #[test]
+    fn test_negative_offset_1_read_recent_returns_most_recent_seq() {
+        let dir = temp_dir();
+        let mut journal = Journal::open(&dir).unwrap();
+        for _ in 0..30 {
+            journal.append(make_entry()).unwrap();
+        }
+
+        // --show -1 → k=1 → read_recent(1) → [seq=30]
+        let entries = journal.read_recent(1).unwrap();
+        assert_eq!(entries.len(), 1, "read_recent(1) should return exactly 1 entry");
+        assert_eq!(
+            entries[0].seq, 30,
+            "--show -1 should resolve to seq=30 (the most recent entry)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: --show -3 returns the 3rd-to-last entry (seq=28 in a 30-entry journal).
+    ///
+    /// The implementation does: read_recent(3) → entries = [30, 29, 28] → last() = 28.
+    #[test]
+    fn test_negative_offset_3_read_recent_returns_third_to_last_seq() {
+        let dir = temp_dir();
+        let mut journal = Journal::open(&dir).unwrap();
+        for _ in 0..30 {
+            journal.append(make_entry()).unwrap();
+        }
+
+        // --show -3 → k=3 → read_recent(3) → [seq=30, seq=29, seq=28] → last() = seq=28
+        let entries = journal.read_recent(3).unwrap();
+        assert_eq!(entries.len(), 3, "read_recent(3) should return exactly 3 entries");
+        let last_seq = entries.into_iter().last().unwrap().seq;
+        assert_eq!(
+            last_seq, 28,
+            "--show -3 should resolve to seq=28 (the 3rd-to-last entry)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: --show -1 on a populated journal returns exit code 0.
+    #[tokio::test]
+    async fn test_run_history_local_show_negative_1_returns_exit_code_0() {
+        let dir = temp_dir();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = Journal::open(&dir).unwrap();
+        for _ in 0..30 {
+            journal.append(make_entry()).unwrap();
+        }
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let mut args = default_args();
+        args.show = Some(-1);
+        let result = run_history_local(&args).await.unwrap();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            result,
+            ExitCode::from(0u8),
+            "--show -1 should return exit code 0 for a 30-entry journal"
+        );
+    }
+
+    /// AC: --show -3 on a 30-entry journal returns exit code 0.
+    #[tokio::test]
+    async fn test_run_history_local_show_negative_3_returns_exit_code_0() {
+        let dir = temp_dir();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = Journal::open(&dir).unwrap();
+        for _ in 0..30 {
+            journal.append(make_entry()).unwrap();
+        }
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let mut args = default_args();
+        args.show = Some(-3);
+        let result = run_history_local(&args).await.unwrap();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            result,
+            ExitCode::from(0u8),
+            "--show -3 should return exit code 0 for a 30-entry journal"
+        );
+    }
+
+    /// AC: --show -10 on a 5-entry journal (offset exceeds size) returns exit code 1.
+    ///
+    /// When read_recent(10) returns only 5 entries (< k=10), "Entry not found" is printed
+    /// and exit code 1 is returned.
+    #[tokio::test]
+    async fn test_run_history_local_show_negative_offset_beyond_journal_size_returns_exit_code_1()
+    {
+        let dir = temp_dir();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = Journal::open(&dir).unwrap();
+        for _ in 0..5 {
+            journal.append(make_entry()).unwrap();
+        }
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let mut args = default_args();
+        args.show = Some(-10); // offset larger than journal size
+        let result = run_history_local(&args).await.unwrap();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            result,
+            ExitCode::from(1u8),
+            "--show -10 with only 5 entries should return exit code 1 (Entry not found)"
+        );
+    }
+
+    /// AC: read_recent(k) where k > journal size returns fewer than k entries.
+    ///
+    /// This validates the boundary check: entries.len() < k → "Entry not found".
+    #[test]
+    fn test_read_recent_beyond_journal_size_returns_fewer_entries_than_requested() {
+        let dir = temp_dir();
+        let mut journal = Journal::open(&dir).unwrap();
+        for _ in 0..5 {
+            journal.append(make_entry()).unwrap();
+        }
+
+        let entries = journal.read_recent(10).unwrap();
+        assert!(
+            entries.len() < 10,
+            "read_recent(10) on a 5-entry journal should return fewer than 10 entries, got {}",
+            entries.len()
+        );
+        assert_eq!(
+            entries.len(),
+            5,
+            "read_recent(10) on a 5-entry journal should return exactly 5 entries"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: --show 0 returns exit code 1 (seq=0 is never a valid entry).
+    #[tokio::test]
+    async fn test_run_history_local_show_seq_0_returns_exit_code_1() {
+        let dir = temp_dir();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = Journal::open(&dir).unwrap();
+        journal.append(make_entry()).unwrap();
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let mut args = default_args();
+        args.show = Some(0);
+        let result = run_history_local(&args).await.unwrap();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            result,
+            ExitCode::from(1u8),
+            "--show 0 should return exit code 1 (seq 0 is not a valid entry)"
         );
     }
 }
