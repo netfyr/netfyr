@@ -25,7 +25,7 @@ use tracing::{debug, error, warn};
 
 const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_IPV4_IFADDR: u32 = 5;
-const RTNLGRP_IPV4_ROUTE: u32 = 6;
+const RTNLGRP_IPV4_ROUTE: u32 = 7;
 
 // ── RTnetlink message types (from linux/rtnetlink.h) ─────────────────────────
 
@@ -55,7 +55,7 @@ const NLM_F_DUMP: u16 = 0x300; // NLM_F_ROOT | NLM_F_MATCH
 const IFLA_IFNAME: u16 = 3;
 /// Route output interface attribute (RTA_OIF) — carries the ifindex of the
 /// output interface for a route.
-const RTA_OIF: u16 = 7;
+const RTA_OIF: u16 = 4;
 
 // ── Fixed-size struct layouts (bytes) ────────────────────────────────────────
 

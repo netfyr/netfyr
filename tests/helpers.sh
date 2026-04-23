@@ -73,7 +73,7 @@ start_dnsmasq() {
         --no-resolv \
         --no-hosts \
         --log-dhcp \
-        &
+        >/dev/null 2>&1 &
 
     local pid=$!
     _DNSMASQ_PIDS+=("$pid")
