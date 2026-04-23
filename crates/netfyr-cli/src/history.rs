@@ -397,12 +397,12 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
         out.push_str("  (no changes)\n");
     } else {
         for op in &entry.diff.operations {
-            let colored_prefix = match op.kind.as_str() {
-                "add" => "+".green(),
-                "remove" => "-".red(),
-                _ => "~".yellow(),
+            let header = match op.kind.as_str() {
+                "add" => format!("  + {} {}\n", op.entity_type, op.entity_name).green().to_string(),
+                "remove" => format!("  - {} {}\n", op.entity_type, op.entity_name).red().to_string(),
+                _ => format!("  ~ {} {}\n", op.entity_type, op.entity_name).yellow().to_string(),
             };
-            out.push_str(&format!("  {} {} {}\n", colored_prefix, op.entity_type, op.entity_name));
+            out.push_str(&header);
             for fc in &op.field_changes {
                 if fc.change_kind == "unchanged" {
                     continue;
@@ -719,12 +719,14 @@ fn format_list_field_diff(out: &mut String, fc: &SerializableFieldChange) {
     out.push_str(&format!("      {}:\n", fc.field_name));
     for item in desired_items {
         if !current_items.contains(item) {
-            out.push_str(&format!("        {}{}\n", "+".green(), format_list_element(item)));
+            let line = format!("        +{}", format_list_element(item));
+            out.push_str(&format!("{}\n", line.green()));
         }
     }
     for item in current_items {
         if !desired_items.contains(item) {
-            out.push_str(&format!("        {}{}\n", "-".red(), format_list_element(item)));
+            let line = format!("        -{}", format_list_element(item));
+            out.push_str(&format!("{}\n", line.red()));
         }
     }
 }
