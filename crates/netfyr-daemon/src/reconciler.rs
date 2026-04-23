@@ -322,7 +322,7 @@ impl Reconciler {
                 policy_store,
                 &trigger,
                 &reconcile_diff,
-                &effective_state,
+                &filter_readonly_fields(&managed_actual),
                 ApplyOutcome::Applied {
                     succeeded: 0,
                     failed: 0,
@@ -342,11 +342,33 @@ impl Reconciler {
         let skipped = report.skipped.len();
         tracing::debug!(succeeded, failed, skipped, "apply completed");
 
+        // Re-query so state_after reflects what actually exists post-apply,
+        // not just the desired policy fields.  Self-generated netlink events
+        // (~500 ms later) will then compare equal and produce no diff.
+        let post_apply_state = match self.backend_registry.query_all().await {
+            Ok(actual_post) => {
+                let mut managed_post = StateSet::new();
+                for (entity_type, selector_key) in effective_state.entities() {
+                    if let Some(s) = actual_post.get(&entity_type, &selector_key) {
+                        managed_post.insert(s.clone());
+                    }
+                }
+                filter_readonly_fields(&managed_post)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to re-query after apply; falling back to pre-apply state for journal snapshot"
+                );
+                filter_readonly_fields(&managed_actual)
+            }
+        };
+
         self.append_journal_entry(
             policy_store,
             &trigger,
             &reconcile_diff,
-            &effective_state,
+            &post_apply_state,
             ApplyOutcome::Applied {
                 succeeded: report.succeeded.len() as u32,
                 failed: report.failed.len() as u32,
@@ -423,12 +445,14 @@ impl Reconciler {
             });
         }
 
+        let filtered_target = filter_readonly_fields(target_state);
+
         if state_diff.is_empty() {
             self.append_revert_journal_entry(
                 policies,
                 target_seq,
                 &reconcile_diff,
-                target_state,
+                &filtered_target,
                 ApplyOutcome::Applied { succeeded: 0, failed: 0, skipped: 0 },
             );
             return Ok(RevertResult {
@@ -451,7 +475,7 @@ impl Reconciler {
             policies,
             target_seq,
             &reconcile_diff,
-            target_state,
+            &filtered_target,
             ApplyOutcome::Applied {
                 succeeded: apply_report.succeeded.len() as u32,
                 failed: apply_report.failed.len() as u32,
@@ -600,6 +624,24 @@ impl Reconciler {
 
         inputs
     }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Return a copy of `set` with all `READONLY_FIELDS` removed from every state.
+///
+/// Journal snapshots must reflect actual writable state so that self-generated
+/// netlink events (debounced ~500 ms later) compare equal and produce no diff.
+fn filter_readonly_fields(set: &StateSet) -> StateSet {
+    let mut filtered = StateSet::new();
+    for state in set.iter() {
+        let mut s = state.clone();
+        for field in READONLY_FIELDS {
+            s.fields.shift_remove(*field);
+        }
+        filtered.insert(s);
+    }
+    filtered
 }
 
 // ── External diff helpers ─────────────────────────────────────────────────────

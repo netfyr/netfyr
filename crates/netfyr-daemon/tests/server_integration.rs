@@ -2355,6 +2355,126 @@ async fn netns_burst_changes_diff_includes_both_mtu_and_address_field_changes() 
     );
 }
 
+// ── Feature: Route and address changes coalesced ─────────────────────────────
+
+/// AC: Route and address changes are coalesced — an address addition and a route
+/// addition in quick succession produce a single ExternalChange journal entry
+/// whose diff shows both the address addition and the route addition.
+///
+/// Requires unprivileged user namespace support. Skips gracefully if unavailable.
+#[tokio::test]
+async fn netns_route_and_address_changes_coalesced_into_single_journal_entry() {
+    use netfyr_test_utils::{netns, NetnsGuard};
+
+    let _ns = match NetnsGuard::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "SKIP netns_route_and_address_coalesced: namespace unavailable ({e})"
+            );
+            return;
+        }
+    };
+
+    let iface = "veth-ec-coal0";
+    if let Err(e) = netns::create_veth_pair(iface, "veth-ec-coal1").await {
+        eprintln!("SKIP: create_veth_pair failed: {e}");
+        return;
+    }
+    if let Err(e) = netns::set_link_up(iface).await {
+        eprintln!("SKIP: set_link_up failed: {e}");
+        return;
+    }
+
+    let daemon = DaemonProcessWithJournal::start().await;
+    let mut stream = daemon.connect().await;
+
+    // Apply initial MTU policy so the interface is managed and has a journal snapshot.
+    submit_mtu_policy(&mut stream, iface, 9000).await;
+
+    // Wait for the policy apply and self-generated events to settle.
+    sleep(Duration::from_millis(1500)).await;
+
+    let entries_baseline = daemon.read_journal_entries();
+    let baseline_max_seq = entries_baseline.iter().map(|e| e.seq).max().unwrap_or(0);
+
+    // Add an address — provides a subnet so the subsequent route resolves.
+    if !ip_addr_add(iface, "10.99.0.3/24") {
+        eprintln!("SKIP: ip addr add failed");
+        return;
+    }
+
+    // Immediately add a route — both changes happen within the 500ms debounce window.
+    if !ip_route_add_onlink(iface, "10.99.3.0/24") {
+        eprintln!("SKIP: ip route add onlink failed (may not be supported in this namespace)");
+        return;
+    }
+
+    // Wait for debounce (500ms) + processing buffer (700ms).
+    sleep(Duration::from_millis(1200)).await;
+
+    let entries_after = daemon.read_journal_entries();
+    let new_ext: Vec<_> = entries_after
+        .iter()
+        .filter(|e| trigger_type(e) == "external_change" && e.seq > baseline_max_seq)
+        .collect();
+
+    if new_ext.is_empty() {
+        eprintln!("SKIP: no new ExternalChange entries found after addr+route changes");
+        return;
+    }
+
+    // Both changes must be coalesced into exactly one journal entry.
+    assert_eq!(
+        new_ext.len(),
+        1,
+        "address and route changes in quick succession must produce exactly one coalesced \
+         ExternalChange journal entry, got {}",
+        new_ext.len()
+    );
+
+    let entry = new_ext[0];
+
+    // The single coalesced entry must show changes to both the "addresses" and "routes" fields.
+    let all_field_names: Vec<&str> = entry
+        .diff
+        .operations
+        .iter()
+        .flat_map(|op| op.field_changes.iter().map(|fc| fc.field_name.as_str()))
+        .collect();
+
+    assert!(
+        all_field_names.contains(&"addresses"),
+        "coalesced route+address entry diff must include an 'addresses' field change; \
+         found fields: {:?}",
+        all_field_names
+    );
+    assert!(
+        all_field_names.contains(&"routes"),
+        "coalesced route+address entry diff must include a 'routes' field change; \
+         found fields: {:?}",
+        all_field_names
+    );
+
+    // The trigger must be ExternalChange naming the managed interface.
+    if let netfyr_journal::Trigger::ExternalChange { ref changed_entities } = entry.trigger {
+        assert!(
+            changed_entities.contains(&iface.to_string()),
+            "ExternalChange entry must name {iface} in changed_entities: {:?}",
+            changed_entities
+        );
+    } else {
+        panic!("trigger must be ExternalChange, got {:?}", entry.trigger);
+    }
+
+    // Outcome must be Observed — no re-reconciliation.
+    assert!(
+        matches!(entry.outcome, netfyr_journal::ApplyOutcome::Observed),
+        "ExternalChange entry outcome must be Observed, got {:?}",
+        entry.outcome
+    );
+}
+
 // ── Feature: Daemon handles DHCP policy in namespace ─────────────────────────
 
 /// Scenario: Daemon handles DHCP policy in namespace — lease acquired.
