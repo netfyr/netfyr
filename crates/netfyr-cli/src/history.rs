@@ -687,17 +687,21 @@ fn format_scalar_field_diff(out: &mut String, fc: &SerializableFieldChange) {
     match fc.change_kind.as_str() {
         "set" if fc.current.is_none() => {
             let desired = opt_json_compact(&fc.desired);
-            out.push_str(&format!("      {}{}: {}\n", "+".green(), fc.field_name, desired));
+            let line = format!("+{}: {}", fc.field_name, desired);
+            out.push_str(&format!("      {}\n", line.green()));
         }
         "set" => {
             let current = opt_json_compact(&fc.current);
             let desired = opt_json_compact(&fc.desired);
-            out.push_str(&format!("      {}{}: {}\n", "-".red(), fc.field_name, current));
-            out.push_str(&format!("      {}{}: {}\n", "+".green(), fc.field_name, desired));
+            let old_line = format!("-{}: {}", fc.field_name, current);
+            let new_line = format!("+{}: {}", fc.field_name, desired);
+            out.push_str(&format!("      {}\n", old_line.red()));
+            out.push_str(&format!("      {}\n", new_line.green()));
         }
         "unset" => {
             let current = opt_json_compact(&fc.current);
-            out.push_str(&format!("      {}{}: {}\n", "-".red(), fc.field_name, current));
+            let line = format!("-{}: {}", fc.field_name, current);
+            out.push_str(&format!("      {}\n", line.red()));
         }
         _ => {}
     }
@@ -2058,5 +2062,64 @@ mod tests {
     #[test]
     fn test_parse_since_empty_string_returns_error() {
         assert!(parse_since("").is_err(), "empty string should return error");
+    }
+
+    // ── format_text_detail: line coloring ─────────────────────────────────────
+
+    static COLOR_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// AC: Detail diff colors entire lines, not just the prefix character.
+    ///
+    /// The spec requires ANSI codes to wrap the full "-mtu: 1500" / "+mtu: 9000"
+    /// strings (including field name and value), not only the leading "-" or "+"
+    /// character.  For example the red line must be `\x1b[31m-mtu: 1500\x1b[0m`,
+    /// not `\x1b[31m-\x1b[0mmtu: 1500`.
+    ///
+    /// NOTE: The current `format_scalar_field_diff` implementation calls
+    /// `"-".red()` / `"+".green()`, which colors only the prefix character.  This
+    /// test is expected to fail until the implementation is corrected to color the
+    /// entire line content.
+    #[test]
+    fn test_format_text_detail_scalar_change_colors_entire_line_not_just_prefix() {
+        let _lock = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        colored::control::set_override(true);
+        let output = {
+            let mut entry = make_entry();
+            entry.diff = SerializableDiff {
+                operations: vec![SerializableDiffOp {
+                    kind: "modify".to_string(),
+                    entity_type: "ethernet".to_string(),
+                    entity_name: "eth0".to_string(),
+                    field_changes: vec![SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1500u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                    }],
+                }],
+            };
+            format_text_detail(&entry)
+        };
+        // Restore before asserting so a panic does not leave color override enabled.
+        colored::control::unset_override();
+
+        // ANSI red = \x1b[31m ... \x1b[0m  (ESC [ 3 1 m)
+        // ANSI green = \x1b[32m ... \x1b[0m  (ESC [ 3 2 m)
+        //
+        // The full "-mtu: 1500" and "+mtu: 9000" strings (including the field
+        // name and the value) must be enclosed inside the ANSI color codes.
+        assert!(
+            output.contains("\x1b[31m-mtu: 1500\x1b[0m"),
+            "the entire '-mtu: 1500' line must be red — ANSI codes must wrap the \
+             full content, not only the '-' prefix character; got:\n{}",
+            output.escape_debug()
+        );
+        assert!(
+            output.contains("\x1b[32m+mtu: 9000\x1b[0m"),
+            "the entire '+mtu: 9000' line must be green — ANSI codes must wrap the \
+             full content, not only the '+' prefix character; got:\n{}",
+            output.escape_debug()
+        );
     }
 }
