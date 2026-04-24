@@ -1,0 +1,64 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-completions 1  "netfyr-completions " 
+.SH NAME
+netfyr\-completions \- Generate shell completion scripts
+.SH SYNOPSIS
+\fBnetfyr\-completions\fR [\fB\-h\fR|\fB\-\-help\fR] <\fISHELL\fR> 
+.SH DESCRIPTION
+Generate shell completion scripts
+.PP
+Print a completion script for the specified shell to stdout. Redirect the output to the appropriate file for your shell.
+.PP
+Example (bash): netfyr completions bash > ~/.local/share/bash\-completion/completions/netfyr
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fISHELL\fR>
+Shell to generate completions for
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+bash
+.IP \(bu 2
+elvish
+.IP \(bu 2
+fish
+.IP \(bu 2
+powershell
+.IP \(bu 2
+zsh
+.RE
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+See
+.BR netfyr-completions (1)
+for usage details.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-apply (1),
+.BR netfyr-query (1),
+.BR netfyr-daemon (8),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

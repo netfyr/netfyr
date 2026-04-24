@@ -18,6 +18,8 @@ path = "src/netfyr_cli_main.rs"
 [dependencies]
 # CLI argument parsing — no std equivalent for subcommands and derive macros
 clap = { version = "4", features = ["derive"] }
+# Shell completion generation — derives completion scripts from the clap Command tree; no std equivalent
+clap_complete = "4"
 # Async runtime — backend and varlink operations are all async
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Error handling with context chains — spec explicitly requires anyhow

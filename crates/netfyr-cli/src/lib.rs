@@ -5,11 +5,13 @@
 //! documentation artifacts such as man pages.
 
 pub mod apply;
+pub mod completions;
 pub mod history;
 pub mod query;
 pub mod revert;
 
 pub use apply::run_apply;
+pub use completions::run_completions;
 pub use history::run_history;
 pub use query::run_query;
 pub use revert::run_revert;
@@ -323,4 +325,13 @@ pub enum Commands {
     ///
     /// Use --dry-run to preview changes without applying them.
     Revert(revert::RevertArgs),
+
+    /// Generate shell completion scripts
+    ///
+    /// Print a completion script for the specified shell to stdout.
+    /// Redirect the output to the appropriate file for your shell.
+    ///
+    /// Example (bash):
+    ///   netfyr completions bash > ~/.local/share/bash-completion/completions/netfyr
+    Completions(completions::CompletionsArgs),
 }

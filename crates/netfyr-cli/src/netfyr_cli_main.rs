@@ -1,4 +1,4 @@
-use netfyr_cli::{resolve_color_mode, run_apply, run_history, run_query, run_revert, Cli, Commands};
+use netfyr_cli::{resolve_color_mode, run_apply, run_completions, run_history, run_query, run_revert, Cli, Commands};
 
 use clap::Parser;
 use std::process::ExitCode;
@@ -42,5 +42,6 @@ async fn main() -> ExitCode {
                 ExitCode::from(2u8)
             }
         },
+        Commands::Completions(args) => run_completions(args),
     }
 }
