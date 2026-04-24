@@ -1027,11 +1027,6 @@ mod tests {
 
     #[test]
     fn test_read_only_driver_field_excluded_from_diff() {
-        // BUG: "driver" is absent from ethernet.json — it has no x-netfyr-writable annotation.
-        // generate_diff() conservatively treats fields absent from the schema as writable,
-        // so this test currently fails with a spurious Modify operation.
-        // Fix: add "driver": {"type":"string","x-netfyr-writable":false} to ethernet.json.
-        // Criterion 16 requires driver to be excluded just like carrier/speed/mac/name.
         let mut desired = StateSet::new();
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
 
@@ -1064,10 +1059,6 @@ mod tests {
         // Criterion 16: desired=eth0(mtu=1500), actual=eth0(mtu=1500, carrier=true,
         // speed=1000, mac="aa:bb:cc:dd:ee:ff", driver="virtio_net", name="eth0").
         // All five read-only fields must be excluded — StateDiff must be empty.
-        //
-        // BUG: "driver" is absent from ethernet.json so it is treated as writable,
-        // causing this test to fail with a spurious Modify. Fix is to add "driver"
-        // with x-netfyr-writable: false to the ethernet schema (see criterion 17).
         let mut desired = StateSet::new();
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
 
@@ -1092,7 +1083,7 @@ mod tests {
         assert!(
             diff.is_empty(),
             "carrier, speed, mac, driver, and name are all read-only — StateDiff must be \
-             empty; diff had {} operation(s) — see BUG comment above",
+             empty; diff had {} operation(s)",
             diff.len()
         );
     }
