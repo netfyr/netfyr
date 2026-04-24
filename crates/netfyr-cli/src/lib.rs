@@ -6,12 +6,14 @@
 
 pub mod apply;
 pub mod completions;
+pub mod diagnose;
 pub mod history;
 pub mod query;
 pub mod revert;
 
 pub use apply::run_apply;
 pub use completions::run_completions;
+pub use diagnose::run_diagnose;
 pub use history::run_history;
 pub use query::run_query;
 pub use revert::run_revert;
@@ -325,6 +327,14 @@ pub enum Commands {
     ///
     /// Use --dry-run to preview changes without applying them.
     Revert(revert::RevertArgs),
+
+    /// Diagnose network problems
+    ///
+    /// Analyze journal history and current system state to detect
+    /// configuration drift, carrier loss, DHCP failures, and other
+    /// network problems. Reports findings with severity and suggested
+    /// corrective actions.
+    Diagnose(diagnose::DiagnoseArgs),
 
     /// Generate shell completion scripts
     ///

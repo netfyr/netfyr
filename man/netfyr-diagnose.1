@@ -1,0 +1,62 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-diagnose 1  "netfyr-diagnose " 
+.SH NAME
+netfyr\-diagnose \- Diagnose network problems
+.SH SYNOPSIS
+\fBnetfyr\-diagnose\fR [\fB\-s\fR|\fB\-\-selector\fR] [\fB\-\-since\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Diagnose network problems
+.PP
+Analyze journal history and current system state to detect configuration drift, carrier loss, DHCP failures, and other network problems. Reports findings with severity and suggested corrective actions.
+.SH OPTIONS
+.TP
+\fB\-s\fR, \fB\-\-selector\fR \fI<SELECTOR>\fR
+Filter by entity name (e.g. name=eth0)
+.TP
+\fB\-\-since\fR \fI<SINCE>\fR [default: 1h]
+How far back to scan journal entries (e.g. 1h, 30m, 7d or ISO 8601)
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: text]
+Output format: text (default), json
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+text
+.IP \(bu 2
+json
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+See
+.BR netfyr-diagnose (1)
+for usage details.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-apply (1),
+.BR netfyr-query (1),
+.BR netfyr-daemon (8),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

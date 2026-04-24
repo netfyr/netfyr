@@ -1015,6 +1015,7 @@ dependencies = [
  "netfyr-state",
  "netfyr-test-utils",
  "netfyr-varlink",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",

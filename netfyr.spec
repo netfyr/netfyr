@@ -100,6 +100,7 @@ target/release/netfyr-daemon --help > /dev/null
 %{_mandir}/man1/netfyr-history.1*
 %{_mandir}/man1/netfyr-revert.1*
 %{_mandir}/man1/netfyr-completions.1*
+%{_mandir}/man1/netfyr-diagnose.1*
 %{_mandir}/man5/netfyr.yaml.5*
 %{_mandir}/man7/netfyr-examples.7*
 %dir %{_sysconfdir}/netfyr
