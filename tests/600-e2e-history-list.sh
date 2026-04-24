@@ -66,13 +66,15 @@ done
 POLICY_A="$TMPDIR_TEST/policy-a.yaml"
 cat > "$POLICY_A" <<'EOF'
 kind: policy
-name: e2e-history-list-a
+name: e2e-a
 factory: static
 priority: 100
 state:
   type: ethernet
   name: veth-e2e0
   mtu: 1400
+  addresses:
+    - "10.99.0.1/24"
 EOF
 
 APPLY_EXIT=0
@@ -89,7 +91,7 @@ fi
 POLICY_B="$TMPDIR_TEST/policy-b.yaml"
 cat > "$POLICY_B" <<'EOF'
 kind: policy
-name: e2e-history-list-b
+name: e2e-b
 factory: static
 priority: 100
 state:
@@ -135,8 +137,8 @@ if ! echo "$HISTORY_OUTPUT" | head -n 1 | grep -q "OUTCOME"; then
     exit 1
 fi
 
-# Verify at least 2 data rows mention "policy-apply".
-POLICY_APPLY_COUNT=$(echo "$HISTORY_OUTPUT" | grep -c "policy-apply") || true
+# Verify at least 2 data rows show "apply (" (the text format for policy-apply trigger).
+POLICY_APPLY_COUNT=$(echo "$HISTORY_OUTPUT" | grep -c "apply (") || true
 if [[ "$POLICY_APPLY_COUNT" -lt 2 ]]; then
     echo "FAIL: 600-e2e-history-list: expected >= 2 policy-apply rows, found $POLICY_APPLY_COUNT" >&2
     echo "      output: $HISTORY_OUTPUT" >&2
@@ -144,8 +146,8 @@ if [[ "$POLICY_APPLY_COUNT" -lt 2 ]]; then
 fi
 
 # Verify reverse chronological order: first policy-apply row has higher seq than second.
-SEQ_FIRST=$(echo "$HISTORY_OUTPUT" | grep "policy-apply" | head -n 1 | awk '{print $1}')
-SEQ_SECOND=$(echo "$HISTORY_OUTPUT" | grep "policy-apply" | sed -n '2p' | awk '{print $1}')
+SEQ_FIRST=$(echo "$HISTORY_OUTPUT" | grep "apply (" | head -n 1 | awk '{print $1}')
+SEQ_SECOND=$(echo "$HISTORY_OUTPUT" | grep "apply (" | sed -n '2p' | awk '{print $1}')
 
 if [[ -z "$SEQ_FIRST" || -z "$SEQ_SECOND" ]]; then
     echo "FAIL: 600-e2e-history-list: could not extract seq numbers from output" >&2
@@ -156,6 +158,78 @@ fi
 if [[ "$SEQ_FIRST" -le "$SEQ_SECOND" ]]; then
     echo "FAIL: 600-e2e-history-list: entries not in reverse order: first_seq=$SEQ_FIRST second_seq=$SEQ_SECOND" >&2
     echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify header contains ENTITIES and CHANGES column names.
+if ! echo "$HISTORY_OUTPUT" | head -n 1 | grep -q "ENTITIES"; then
+    echo "FAIL: 600-e2e-history-list: output header does not contain 'ENTITIES'" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+if ! echo "$HISTORY_OUTPUT" | head -n 1 | grep -q "CHANGES"; then
+    echo "FAIL: 600-e2e-history-list: output header does not contain 'CHANGES'" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify TRIGGER column shows "apply (e2e-history-list-b)" for the most recent entry.
+# The most recent entry is the first apply row (highest seq, shown first).
+FIRST_APPLY_LINE=$(echo "$HISTORY_OUTPUT" | grep "apply (" | head -n 1)
+if ! echo "$FIRST_APPLY_LINE" | grep -qF "apply (e2e-b)"; then
+    echo "FAIL: 600-e2e-history-list: most recent entry TRIGGER does not show 'apply (e2e-b)'" >&2
+    echo "      first policy-apply line: $FIRST_APPLY_LINE" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify ENTITIES column shows "veth-e2e0" without "+"/"-" prefix (modified, not created/removed).
+if ! echo "$HISTORY_OUTPUT" | grep -qF "veth-e2e0"; then
+    echo "FAIL: 600-e2e-history-list: output does not contain 'veth-e2e0' in ENTITIES" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+if echo "$HISTORY_OUTPUT" | grep -qF "+veth-e2e0"; then
+    echo "FAIL: 600-e2e-history-list: ENTITIES column shows '+veth-e2e0' (entity was modified, not added)" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+if echo "$HISTORY_OUTPUT" | grep -qF -- "-veth-e2e0"; then
+    echo "FAIL: 600-e2e-history-list: ENTITIES column shows '-veth-e2e0' (entity was modified, not removed)" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify CHANGES column for the second apply (policy B, mtu=1300) shows mtu old→new values.
+# The first policy-apply row is policy B (most recent, seq=2); check for both MTU values.
+if ! echo "$FIRST_APPLY_LINE" | grep -qF "1400"; then
+    echo "FAIL: 600-e2e-history-list: CHANGES column for policy B does not contain old mtu '1400'" >&2
+    echo "      first policy-apply line: $FIRST_APPLY_LINE" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+if ! echo "$FIRST_APPLY_LINE" | grep -qF "1300"; then
+    echo "FAIL: 600-e2e-history-list: CHANGES column for policy B does not contain new mtu '1300'" >&2
+    echo "      first policy-apply line: $FIRST_APPLY_LINE" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify CHANGES column shows address removal by value (policy A had 10.99.0.1/24; policy B removes it).
+if ! echo "$FIRST_APPLY_LINE" | grep -qF "10.99.0.1"; then
+    echo "FAIL: 600-e2e-history-list: CHANGES column does not show address removal value '10.99.0.1'" >&2
+    echo "      first policy-apply line: $FIRST_APPLY_LINE" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
+# Verify --absolute-timestamps shows full date format (YYYY-MM-DD).
+ABS_HISTORY=$(NETFYR_SOCKET_PATH="$SOCKET_PATH" \
+    NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
+    "$NETFYR_BIN" history --absolute-timestamps -n 5 2>&1)
+if ! echo "$ABS_HISTORY" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}"; then
+    echo "FAIL: 600-e2e-history-list: --absolute-timestamps output does not match YYYY-MM-DD pattern" >&2
+    echo "      output: $ABS_HISTORY" >&2
     exit 1
 fi
 

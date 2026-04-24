@@ -147,4 +147,14 @@ if [[ "$REVERT_COUNT" -lt 1 ]]; then
     exit 1
 fi
 
+# Verify history TRIGGER column shows "revert (SEQ_A)" with the target sequence number.
+HISTORY_OUTPUT=$(NETFYR_SOCKET_PATH="$SOCKET_PATH" \
+    NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
+    "$NETFYR_BIN" history -n 1 2>&1)
+if ! echo "$HISTORY_OUTPUT" | grep -qF "revert ($SEQ_A)"; then
+    echo "FAIL: 600-e2e-revert: history TRIGGER does not show 'revert ($SEQ_A)'" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
 echo "PASS: 600-e2e-revert"

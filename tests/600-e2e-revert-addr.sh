@@ -149,4 +149,25 @@ assert_has_address veth-e2e0 "10.99.0.2"
 # 10.99.0.3 must no longer be present.
 assert_not_has_address veth-e2e0 "10.99.0.3"
 
+# Verify history CHANGES column for the most recent entry (the revert) shows
+# restored and removed address values by value.
+HISTORY_OUTPUT=$(NETFYR_SOCKET_PATH="$SOCKET_PATH" \
+    NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
+    "$NETFYR_BIN" history -n 1 2>&1)
+if ! echo "$HISTORY_OUTPUT" | grep -qF "10.99.0.1"; then
+    echo "FAIL: 600-e2e-revert-addr: history CHANGES does not show restored address '10.99.0.1'" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+if ! echo "$HISTORY_OUTPUT" | grep -qF "10.99.0.2"; then
+    echo "FAIL: 600-e2e-revert-addr: history CHANGES does not show restored address '10.99.0.2'" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+if ! echo "$HISTORY_OUTPUT" | grep -qF "10.99.0.3"; then
+    echo "FAIL: 600-e2e-revert-addr: history CHANGES does not show removed address '10.99.0.3'" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
+
 echo "PASS: 600-e2e-revert-addr"

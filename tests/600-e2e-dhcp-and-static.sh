@@ -38,7 +38,8 @@ trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"
 
 SOCKET_PATH="$TMPDIR_TEST/netfyr.sock"
 POLICY_DIR="$TMPDIR_TEST/policies"
-mkdir -p "$POLICY_DIR"
+JOURNAL_DIR="$TMPDIR_TEST/journal"
+mkdir -p "$POLICY_DIR" "$JOURNAL_DIR"
 
 # Static interface pair.
 create_veth veth-static0 veth-static1
@@ -53,6 +54,7 @@ start_dnsmasq veth-dhcp1 10.99.1.1 10.99.1.100 10.99.1.200 120
 # Start the daemon.
 NETFYR_SOCKET_PATH="$SOCKET_PATH" \
 NETFYR_POLICY_DIR="$POLICY_DIR" \
+NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
     "$NETFYR_DAEMON_BIN" &
 DAEMON_PID=$!
 
@@ -117,5 +119,15 @@ assert_has_address veth-dhcp0 "10.99.1."
 # Cross-contamination checks: static address must not be on the DHCP interface and vice versa.
 assert_not_has_address veth-dhcp0 "10.99.0."
 assert_not_has_address veth-static0 "10.99.1."
+
+# Verify the DHCP lease event was recorded in the journal with trigger "dhcp-acquire".
+HISTORY_OUTPUT=$(NETFYR_SOCKET_PATH="$SOCKET_PATH" \
+    NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
+    "$NETFYR_BIN" history -n 10 2>&1)
+if ! echo "$HISTORY_OUTPUT" | grep -qF "dhcp-acquire"; then
+    echo "FAIL: 600-e2e-dhcp-and-static: history does not contain dhcp-acquire trigger" >&2
+    echo "      output: $HISTORY_OUTPUT" >&2
+    exit 1
+fi
 
 echo "PASS: 600-e2e-dhcp-and-static"

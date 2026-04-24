@@ -248,4 +248,56 @@ if [[ "$FINAL_APPLY_COUNT" -ne "$INITIAL_APPLY_COUNT" ]]; then
     exit 1
 fi
 
+# ── Phase 5: Text history output verification ─────────────────────────────────
+
+HISTORY_TEXT=$(NETFYR_SOCKET_PATH="$SOCKET_PATH" \
+    NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
+    "$NETFYR_BIN" history -n 5 2>&1)
+
+# CHANGES column must show old MTU value (1400) and new MTU value (1500) for the
+# external MTU change entry (format: "mtu 1400→1500").
+if ! echo "$HISTORY_TEXT" | grep -qF "1400"; then
+    echo "FAIL: 600-e2e-external-change: text history does not contain old MTU value '1400'" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+if ! echo "$HISTORY_TEXT" | grep -qF "1500"; then
+    echo "FAIL: 600-e2e-external-change: text history does not contain new MTU value '1500'" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+
+# CHANGES column must show address values by value (e.g., "+10.99.0.1/24").
+if ! echo "$HISTORY_TEXT" | grep -qF "10.99.0.1"; then
+    echo "FAIL: 600-e2e-external-change: text history does not contain address value '10.99.0.1'" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+
+# TRIGGER column must show "external" for external change entries.
+if ! echo "$HISTORY_TEXT" | grep -qF "external"; then
+    echo "FAIL: 600-e2e-external-change: text history does not show 'external' trigger" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+
+# ENTITIES column must show "veth-e2e0" without lifecycle prefix.
+if ! echo "$HISTORY_TEXT" | grep -qF "veth-e2e0"; then
+    echo "FAIL: 600-e2e-external-change: text history does not contain 'veth-e2e0' in ENTITIES" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+
+# External changes modify existing entities — no "+veth-e2e0" or "-veth-e2e0" prefix.
+if echo "$HISTORY_TEXT" | grep -qF "+veth-e2e0"; then
+    echo "FAIL: 600-e2e-external-change: ENTITIES shows '+veth-e2e0' (external changes do not add entities)" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+if echo "$HISTORY_TEXT" | grep -qF -- "-veth-e2e0"; then
+    echo "FAIL: 600-e2e-external-change: ENTITIES shows '-veth-e2e0' (external changes do not remove entities)" >&2
+    echo "      output: $HISTORY_TEXT" >&2
+    exit 1
+fi
+
 echo "PASS: 600-e2e-external-change"
