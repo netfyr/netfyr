@@ -1041,6 +1041,76 @@ async fn test_apply_report_summary_format_for_successful_operation() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Scenario: Removing a non-existent route counts as success
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Scenario: Removing a non-existent route counts as success
+///
+/// The spec states: "Removing a route that does not exist: treat as a
+/// successful operation — the desired state (route absent) is already achieved.
+/// This commonly occurs when the kernel automatically removes implied routes
+/// (e.g., prefix route, local and broadcast host routes) as a side effect of
+/// address removal earlier in the same apply operation."
+///
+/// This test exercises that code path:
+/// 1. A veth interface is given address 10.99.11.1/24.
+/// 2. The kernel auto-adds a connected prefix route (10.99.11.0/24).
+/// 3. A diff clears both addresses AND routes to empty.
+/// 4. Phase 2 removes the address — the kernel simultaneously removes the
+///    connected route.
+/// 5. Phase 3 tries to remove the (now-gone) connected route; `find_route_message`
+///    returns None → the code adds it to `fields_changed` (success path).
+/// 6. The overall Modify op appears in `report.succeeded`, not `failed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_remove_nonexistent_route_counts_as_success() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-rmrx0", "veth-rmrx1").await.unwrap();
+    set_link_up("veth-rmrx0").await.unwrap();
+    add_address("veth-rmrx0", "10.99.11.1/24").await.unwrap();
+    // At this point the kernel has auto-added a connected route for 10.99.11.0/24.
+    // get_current_state() (called inside apply_ethernet) will capture it in
+    // current_routes so that it appears in `to_remove` for the routes phase.
+
+    // Diff: set desired addresses = [] and desired routes = [].
+    // Phase 2 (addresses): removing 10.99.11.1/24 causes the kernel to
+    // auto-remove the connected route 10.99.11.0/24.
+    // Phase 3 (routes): find_route_message returns None for the connected
+    // route (already gone) → counted as success, NOT failure.
+    let mut changed_fields = IndexMap::new();
+    changed_fields.insert("addresses".to_string(), kd(Value::List(vec![])));
+    changed_fields.insert("routes".to_string(), kd(Value::List(vec![])));
+
+    let diff = make_diff(vec![modify_op("veth-rmrx0", changed_fields, vec![])]);
+
+    let handle = establish_connection().await.unwrap();
+    let report = apply_ethernet(&handle, &diff).await.unwrap();
+
+    // The operation must be in succeeded, not failed.
+    assert_eq!(
+        report.succeeded.len(),
+        1,
+        "Modify op must be in succeeded when route was already removed: {}",
+        report.summary()
+    );
+    assert!(
+        report.failed.is_empty(),
+        "No failures expected for remove of already-gone route: {:?}",
+        report.failed
+    );
+    assert!(
+        report.is_success(),
+        "is_success() must be true: {}",
+        report.summary()
+    );
+    assert!(
+        !report.is_partial(),
+        "is_partial() must be false when nothing failed: {}",
+        report.summary()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Idempotency: skip with "already present" / "not present" (EEXIST / ENODEV)
 // ══════════════════════════════════════════════════════════════════════════════
 

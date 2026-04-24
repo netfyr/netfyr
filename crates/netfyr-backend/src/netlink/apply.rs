@@ -754,14 +754,7 @@ async fn apply_modify_fields(
                                                     fields_changed.push("routes".to_string())
                                                 }
                                                 Err(ref e) if is_not_found_error(e) => {
-                                                    skipped.push(SkippedOperation {
-                                                        operation: DiffOpKind::Modify,
-                                                        entity_type: "ethernet".to_string(),
-                                                        selector: Selector::with_name(name),
-                                                        reason: format!(
-                                                            "route {dst_ip}/{dst_prefix} not present"
-                                                        ),
-                                                    });
+                                                    fields_changed.push("routes".to_string());
                                                 }
                                                 Err(e) => failures.push(make_field_failure(
                                                     name,
@@ -774,14 +767,7 @@ async fn apply_modify_fields(
                                             }
                                         }
                                         None => {
-                                            skipped.push(SkippedOperation {
-                                                operation: DiffOpKind::Modify,
-                                                entity_type: "ethernet".to_string(),
-                                                selector: Selector::with_name(name),
-                                                reason: format!(
-                                                    "route {dst_ip}/{dst_prefix} not present"
-                                                ),
-                                            });
+                                            fields_changed.push("routes".to_string());
                                         }
                                     }
                                 }
@@ -1567,6 +1553,100 @@ mod tests {
                 "READONLY_FIELDS must contain '{field}' per spec"
             );
         }
+    }
+
+    // ── value_to_str ──────────────────────────────────────────────────────────
+
+    /// Value::String is returned as-is (the common case for kernel-queried CIDR strings).
+    #[test]
+    fn test_value_to_str_string_variant_returns_inner_string() {
+        let v = Value::String("10.0.1.50/24".to_string());
+        assert_eq!(
+            value_to_str(&v),
+            Some("10.0.1.50/24".to_string()),
+            "Value::String must be returned unchanged"
+        );
+    }
+
+    /// Value::IpAddr (from YAML bare IP) returns its dotted-decimal representation.
+    #[test]
+    fn test_value_to_str_ipaddr_variant_returns_dotted_decimal() {
+        use std::net::Ipv4Addr;
+        // Value::IpAddr(Ipv4Addr) is what From<Ipv4Addr> for Value creates.
+        let v = Value::IpAddr(Ipv4Addr::new(10, 0, 1, 50));
+        assert_eq!(
+            value_to_str(&v),
+            Some("10.0.1.50".to_string()),
+            "Value::IpAddr must be formatted as dotted-decimal"
+        );
+    }
+
+    /// Value::U64 (e.g., mtu) is not a string-like type — must return None.
+    #[test]
+    fn test_value_to_str_u64_variant_returns_none() {
+        let v = Value::U64(1500);
+        assert_eq!(
+            value_to_str(&v),
+            None,
+            "Value::U64 must return None from value_to_str"
+        );
+    }
+
+    /// Value::Bool (e.g., carrier) is not a string-like type — must return None.
+    #[test]
+    fn test_value_to_str_bool_variant_returns_none() {
+        let v = Value::Bool(true);
+        assert_eq!(
+            value_to_str(&v),
+            None,
+            "Value::Bool must return None from value_to_str"
+        );
+    }
+
+    /// Value::I64 is not a string-like type — must return None.
+    #[test]
+    fn test_value_to_str_i64_variant_returns_none() {
+        let v = Value::I64(-1);
+        assert_eq!(
+            value_to_str(&v),
+            None,
+            "Value::I64 must return None from value_to_str"
+        );
+    }
+
+    /// Value::List is not a string-like type — must return None.
+    #[test]
+    fn test_value_to_str_list_variant_returns_none() {
+        let v = Value::List(vec![Value::String("10.0.1.1/24".to_string())]);
+        assert_eq!(
+            value_to_str(&v),
+            None,
+            "Value::List must return None from value_to_str"
+        );
+    }
+
+    /// Value::Map is not a string-like type — must return None.
+    #[test]
+    fn test_value_to_str_map_variant_returns_none() {
+        let mut map = IndexMap::new();
+        map.insert("destination".to_string(), Value::String("0.0.0.0/0".to_string()));
+        let v = Value::Map(map);
+        assert_eq!(
+            value_to_str(&v),
+            None,
+            "Value::Map must return None from value_to_str"
+        );
+    }
+
+    /// Empty string is a valid Value::String — must return Some("").
+    #[test]
+    fn test_value_to_str_empty_string_variant_returns_some_empty() {
+        let v = Value::String(String::new());
+        assert_eq!(
+            value_to_str(&v),
+            Some(String::new()),
+            "Value::String(\"\") must return Some(\"\")"
+        );
     }
 }
 
