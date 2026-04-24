@@ -59,6 +59,10 @@ install -pm 0644 man/netfyr-examples.7 %{buildroot}%{_mandir}/man7/
 install -d %{buildroot}%{_mandir}/man8
 install -pm 0644 man/netfyr-daemon.8 %{buildroot}%{_mandir}/man8/
 
+# Install bash completion
+install -d %{buildroot}%{_datadir}/bash-completion/completions
+target/release/netfyr completions bash > %{buildroot}%{_datadir}/bash-completion/completions/netfyr
+
 # Install systemd units
 install -Dpm 0644 dist/systemd/netfyr.service %{buildroot}%{_unitdir}/netfyr.service
 install -Dpm 0644 dist/systemd/netfyr.socket %{buildroot}%{_unitdir}/netfyr.socket
@@ -95,10 +99,12 @@ target/release/netfyr-daemon --help > /dev/null
 %{_mandir}/man1/netfyr-query.1*
 %{_mandir}/man1/netfyr-history.1*
 %{_mandir}/man1/netfyr-revert.1*
+%{_mandir}/man1/netfyr-completions.1*
 %{_mandir}/man5/netfyr.yaml.5*
 %{_mandir}/man7/netfyr-examples.7*
 %dir %{_sysconfdir}/netfyr
 %dir %{_sysconfdir}/netfyr/policies
+%{_datadir}/bash-completion/completions/netfyr
 %{_docdir}/%{name}/examples/policies/
 
 %files daemon
