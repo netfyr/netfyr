@@ -203,6 +203,16 @@ mod tests {
         );
     }
 
+    /// AC: completion script contains "--absolute-timestamps" flag.
+    #[test]
+    fn test_generate_bash_completion_contains_absolute_timestamps_flag() {
+        let output = generate_bash_completion();
+        assert!(
+            output.contains("--absolute-timestamps"),
+            "completion script must contain the '--absolute-timestamps' flag"
+        );
+    }
+
     // ── Enum value presence (for interactive Tab completion) ──────────────────
 
     /// AC (interactive): "auto", "always", "never" offered for --color.
