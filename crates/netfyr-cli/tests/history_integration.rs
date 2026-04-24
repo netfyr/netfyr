@@ -670,7 +670,7 @@ fn test_history_list_entries_in_reverse_chronological_order() {
 
 // ── Feature: CHANGES column notation ──────────────────────────────────────────
 
-/// AC: CHANGES column shows "addr(+N)" notation for list field additions.
+/// AC: CHANGES column shows actual address value "+addr" for single address addition (spec: 1-2 changes show values inline).
 #[test]
 fn test_history_list_changes_column_shows_addr_plus_n_for_list_additions() {
     let entry = make_entry_with_diff("eth0", vec![SerializableFieldChange {
@@ -683,13 +683,14 @@ fn test_history_list_changes_column_shows_addr_plus_n_for_list_additions() {
     let output = run_history(dir.path(), &[]);
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
+    // Spec: 1-2 address changes show actual values "+addr"
     assert!(
-        text.contains("addresses(+1)"),
-        "CHANGES column must show 'addresses(+1)' for one address added; got:\n{text}"
+        text.contains("+10.0.0.1/24"),
+        "CHANGES column must show '+10.0.0.1/24' (actual value) for one address added; got:\n{text}"
     );
 }
 
-/// AC: CHANGES column shows "~field" notation for scalar field modifications.
+/// AC: CHANGES column shows "field old→new" notation for scalar field modifications.
 #[test]
 fn test_history_list_changes_column_shows_tilde_field_for_scalar_changes() {
     let entry = make_entry_with_diff("eth0", vec![SerializableFieldChange {
@@ -702,9 +703,10 @@ fn test_history_list_changes_column_shows_tilde_field_for_scalar_changes() {
     let output = run_history(dir.path(), &[]);
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
+    // Spec: scalar field changes use "field old→new" notation
     assert!(
-        text.contains("~mtu"),
-        "CHANGES column must show '~mtu' for scalar field modification; got:\n{text}"
+        text.contains("mtu 1500→9000") || text.contains("mtu 1500\u{2192}9000"),
+        "CHANGES column must show 'mtu 1500→9000' for scalar field modification; got:\n{text}"
     );
 }
 

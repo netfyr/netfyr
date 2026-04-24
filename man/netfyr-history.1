@@ -4,7 +4,7 @@
 .SH NAME
 netfyr\-history \- Show journal history of state changes
 .SH SYNOPSIS
-\fBnetfyr\-history\fR [\fB\-n\fR|\fB\-\-count\fR] [\fB\-\-since\fR] [\fB\-\-trigger\fR] [\fB\-s\fR|\fB\-\-selector\fR] [\fB\-\-show\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBnetfyr\-history\fR [\fB\-n\fR|\fB\-\-count\fR] [\fB\-\-since\fR] [\fB\-\-trigger\fR] [\fB\-s\fR|\fB\-\-selector\fR] [\fB\-\-show\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-absolute\-timestamps\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show journal history of state changes
 .PP
@@ -40,6 +40,9 @@ text
 .IP \(bu 2
 json
 .RE
+.TP
+\fB\-\-absolute\-timestamps\fR
+Show full timestamps (YYYY\-MM\-DD HH:MM:SS) instead of relative/abbreviated
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
