@@ -131,8 +131,8 @@ if ! echo "$HISTORY_OUTPUT" | head -n 1 | grep -q "TRIGGER"; then
     echo "      output: $HISTORY_OUTPUT" >&2
     exit 1
 fi
-if ! echo "$HISTORY_OUTPUT" | head -n 1 | grep -q "OUTCOME"; then
-    echo "FAIL: 600-e2e-history-list: output header does not contain 'OUTCOME'" >&2
+if echo "$HISTORY_OUTPUT" | head -n 1 | grep -q "OUTCOME"; then
+    echo "FAIL: 600-e2e-history-list: output header should not contain 'OUTCOME' column" >&2
     echo "      output: $HISTORY_OUTPUT" >&2
     exit 1
 fi

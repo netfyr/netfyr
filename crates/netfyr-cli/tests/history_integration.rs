@@ -234,7 +234,7 @@ fn test_history_list_header_contains_all_columns() {
     let output = run_history(dir.path(), &[]);
     let text = combined(&output);
     let header = text.lines().next().unwrap_or("");
-    for col in &["SEQ", "TIMESTAMP", "TRIGGER", "ENTITIES", "OUTCOME", "CHANGES"] {
+    for col in &["SEQ", "TIMESTAMP", "TRIGGER", "ENTITIES", "CHANGES"] {
         assert!(
             header.contains(col),
             "header must contain '{col}'; got: {header}"
@@ -603,11 +603,11 @@ fn test_history_show_route_diff_zero_metric_omitted() {
     );
 }
 
-// ── Feature: OUTCOME column ────────────────────────────────────────────────────
+// ── Feature: failure indicator in CHANGES column ─────────────────────────────
 
-/// AC: OUTCOME column shows "applied (N fail)" when failures occurred in list view.
+/// AC: CHANGES column shows "FAIL" prefix when failures occurred in list view.
 #[test]
-fn test_history_list_outcome_column_shows_fail_count_when_failures_occurred() {
+fn test_history_list_changes_column_shows_fail_prefix_when_failures_occurred() {
     let mut entry = make_entry();
     entry.outcome = ApplyOutcome::Applied { succeeded: 1, failed: 2, skipped: 0 };
     let dir = setup_journal(vec![entry]);
@@ -615,24 +615,24 @@ fn test_history_list_outcome_column_shows_fail_count_when_failures_occurred() {
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
     assert!(
-        text.contains("applied (2 fail)"),
-        "OUTCOME column must show 'applied (2 fail)' when 2 failures occurred; got:\n{text}"
+        text.contains("FAIL"),
+        "CHANGES column must show 'FAIL' prefix when failures occurred; got:\n{text}"
     );
 }
 
-/// AC: OUTCOME column shows "observed" for ExternalChange entries.
+/// AC: CHANGES column has no FAIL prefix for successful entries.
 #[test]
-fn test_history_list_outcome_column_shows_observed_for_external_changes() {
+fn test_history_list_changes_column_no_fail_prefix_for_success() {
     let mut entry = make_entry();
-    entry.trigger = Trigger::ExternalChange { changed_entities: vec!["eth0".to_string()] };
-    entry.outcome = ApplyOutcome::Observed;
+    entry.outcome = ApplyOutcome::Applied { succeeded: 2, failed: 0, skipped: 0 };
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &[]);
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
+    let data_row = text.lines().nth(1).unwrap_or("");
     assert!(
-        text.contains("observed"),
-        "OUTCOME column must show 'observed' for Observed outcome; got:\n{text}"
+        !data_row.contains("FAIL"),
+        "CHANGES column must not show 'FAIL' when no failures; got:\n{text}"
     );
 }
 

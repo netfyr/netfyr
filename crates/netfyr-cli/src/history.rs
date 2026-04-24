@@ -598,17 +598,15 @@ struct RowCells {
     ts: String,
     trigger: String,
     entities: String,
-    outcome: String,
     changes: String,
     is_daemon_startup: bool,
 }
 
 pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> String {
-    const CAP_SEQ: usize = 5;
+    const CAP_SEQ: usize = 7;
     const CAP_TS: usize = 20;
-    const CAP_TRIG: usize = 14;
+    const CAP_TRIG: usize = 24;
     const CAP_ENT: usize = 24;
-    const CAP_OUT: usize = 17;
 
     let now = Utc::now();
 
@@ -620,8 +618,7 @@ pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> 
             ts: format_timestamp(e.timestamp, now, absolute_timestamps),
             trigger: format_trigger_column(e),
             entities: entities_summary(&e.diff.operations),
-            outcome: outcome_summary(&e.outcome),
-            changes: changes_summary(&e.diff.operations),
+            changes: changes_column(e),
             is_daemon_startup: matches!(e.trigger, Trigger::DaemonStartup),
         })
         .collect();
@@ -641,22 +638,18 @@ pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> 
     let w_ent = cw("ENTITIES")
         .max(rows.iter().map(|r| cw(&r.entities)).max().unwrap_or(0))
         .min(CAP_ENT);
-    let w_out = cw("OUTCOME")
-        .max(rows.iter().map(|r| cw(&r.outcome)).max().unwrap_or(0))
-        .min(CAP_OUT);
 
-    let fixed_overhead = w_seq + 1 + w_ts + 1 + w_trig + 1 + w_ent + 1 + w_out + 1;
+    let fixed_overhead = w_seq + 2 + w_ts + 2 + w_trig + 2 + w_ent + 2;
     let max_changes = get_terminal_width().saturating_sub(fixed_overhead).max(10);
 
     // Pass 3: format
     let mut out = String::new();
     out.push_str(&format!(
-        "{} {} {} {} {} {}\n",
+        "{}  {}  {}  {}  {}\n",
         pad_or_truncate("SEQ", w_seq),
         pad_or_truncate("TIMESTAMP", w_ts),
         pad_or_truncate("TRIGGER", w_trig),
         pad_or_truncate("ENTITIES", w_ent),
-        pad_or_truncate("OUTCOME", w_out),
         "CHANGES",
     ));
 
@@ -664,16 +657,15 @@ pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> 
         let changes_plain = truncate_with_ellipsis(&row.changes, max_changes);
         let changes = colorize_changes(&changes_plain);
         out.push_str(&format!(
-            "{} {} {} {} {} {}\n",
+            "{}  {}  {}  {}  {}\n",
             pad_or_truncate(&row.seq, w_seq),
             pad_or_truncate(&row.ts, w_ts),
             pad_or_truncate(&row.trigger, w_trig),
             pad_or_truncate(&row.entities, w_ent),
-            pad_or_truncate(&row.outcome, w_out),
             changes,
         ));
         if row.is_daemon_startup && i + 1 < rows.len() {
-            out.push_str("─── daemon restart ───\n");
+            out.push_str("──── daemon restart ────\n");
         }
     }
 
@@ -792,6 +784,16 @@ pub fn outcome_summary(outcome: &ApplyOutcome) -> String {
             }
         }
         ApplyOutcome::Observed => "observed".to_string(),
+    }
+}
+
+fn changes_column(entry: &JournalEntry) -> String {
+    let changes = changes_summary(&entry.diff.operations);
+    match &entry.outcome {
+        ApplyOutcome::Applied { failed, .. } if *failed > 0 => {
+            format!("FAIL {}", changes)
+        }
+        _ => changes,
     }
 }
 
@@ -1509,9 +1511,8 @@ mod tests {
                 && output.contains("TIMESTAMP")
                 && output.contains("TRIGGER")
                 && output.contains("ENTITIES")
-                && output.contains("CHANGES")
-                && output.contains("OUTCOME"),
-            "text list header should contain SEQ, TIMESTAMP, TRIGGER, ENTITIES, CHANGES, OUTCOME"
+                && output.contains("CHANGES"),
+            "text list header should contain SEQ, TIMESTAMP, TRIGGER, ENTITIES, CHANGES"
         );
     }
 
@@ -2424,16 +2425,30 @@ mod tests {
         );
     }
 
-    /// AC: Each row in the text list shows the outcome description.
+    /// AC: Rows with failed operations show FAIL prefix in CHANGES column.
     #[test]
-    fn test_format_text_list_row_shows_outcome_description() {
+    fn test_format_text_list_row_shows_fail_prefix_when_failures() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 1, failed: 2, skipped: 0 };
+        let output = format_text_list(&[entry], false);
+        let data_row = output.lines().nth(1).unwrap();
+        assert!(
+            data_row.contains("FAIL"),
+            "data row should show FAIL prefix when there are failures, got: {}",
+            data_row
+        );
+    }
+
+    /// AC: Rows without failures do not show FAIL prefix.
+    #[test]
+    fn test_format_text_list_row_no_fail_prefix_when_no_failures() {
         let mut entry = make_entry();
         entry.outcome = ApplyOutcome::Applied { succeeded: 2, failed: 0, skipped: 0 };
         let output = format_text_list(&[entry], false);
         let data_row = output.lines().nth(1).unwrap();
         assert!(
-            data_row.contains("applied"),
-            "data row should show outcome 'applied', got: {}",
+            !data_row.contains("FAIL"),
+            "data row should not show FAIL when no failures, got: {}",
             data_row
         );
     }
@@ -3250,7 +3265,7 @@ mod tests {
 
     // ── format_text_list: daemon-startup separators ───────────────────────────
 
-    /// AC: Separator "─── daemon restart ───" appears after a daemon-startup row.
+    /// AC: Separator "──── daemon restart ────" appears after a daemon-startup row.
     #[test]
     fn test_format_text_list_daemon_startup_separator_appears_after_startup_entry() {
         let mut apply_entry = make_entry();
@@ -3269,7 +3284,7 @@ mod tests {
         let output = format_text_list(&entries, false);
 
         assert!(
-            output.contains("─── daemon restart ───"),
+            output.contains("──── daemon restart ────"),
             "separator must appear when daemon-startup entry is followed by another entry, got:\n{}",
             output
         );
