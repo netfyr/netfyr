@@ -7,9 +7,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REPO_ROOT"
 
-# Extract Name and Version from the spec file
-NAME=$(grep '^Name:' "$SPEC" | awk '{print $2}')
-VERSION=$(grep '^Version:' "$SPEC" | awk '{print $2}')
+# Extract Name and Version from the spec file (resolve RPM macros first)
+PARSED=$(rpmspec --parse "$SPEC" 2>/dev/null)
+NAME=$(echo "$PARSED" | grep '^Name:' | awk '{print $2}')
+VERSION=$(echo "$PARSED" | grep '^Version:' | awk '{print $2}')
 
 # Create rpmbuild directory structure
 mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}

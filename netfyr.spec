@@ -1,12 +1,14 @@
+%global base_version 0.1.0
+
 Name:           netfyr
-Version:        0.1.0
+Version:        %{base_version}
 Release:        1%{?dist}
 Summary:        Declarative Linux network configuration
 
 License:        MIT
 URL:            https://github.com/netfyr/netfyr
-Source0:        %{name}-%{version}.tar.gz
-Source1:        %{name}-%{version}-vendor.tar.gz
+Source0:        %{name}-%{base_version}.tar.gz
+Source1:        %{name}-%{base_version}-vendor.tar.gz
 
 ExclusiveArch:  %{rust_arches}
 
@@ -31,7 +33,7 @@ It listens on a Varlink socket and accepts policy submissions from the
 netfyr CLI. Required only when using DHCP or other dynamic factories.
 
 %prep
-%autosetup -n %{name}-%{version}
+%autosetup -n %{name}-%{base_version}
 tar xf %{SOURCE1}
 %cargo_prep -v vendor
 
