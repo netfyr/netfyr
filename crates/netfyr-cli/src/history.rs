@@ -699,6 +699,25 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
         }
     }
 
+    // Determine whether to show per-field outcome annotations.
+    // Annotations are shown only when outcomes are mixed (some failed or skipped)
+    // and the trigger is not an external change observation.
+    let is_observed = matches!(entry.outcome, ApplyOutcome::Observed);
+    let has_mixed_outcomes = !is_observed
+        && entry
+            .diff
+            .operations
+            .iter()
+            .flat_map(|op| op.field_changes.iter())
+            .any(|fc| {
+                fc.change_kind != "unchanged"
+                    && matches!(
+                        fc.outcome.as_deref(),
+                        Some("failed") | Some("skipped")
+                    )
+            });
+    let show_annotations = has_mixed_outcomes;
+
     out.push_str("Diff:\n");
     if entry.diff.operations.is_empty() {
         out.push_str("  (no changes)\n");
@@ -714,12 +733,17 @@ pub fn format_text_detail(entry: &JournalEntry) -> String {
                 if fc.change_kind == "unchanged" {
                     continue;
                 }
+                let annotation = if show_annotations {
+                    fc.outcome.as_deref()
+                } else {
+                    None
+                };
                 let is_list = fc.current.as_ref().is_some_and(|v| v.is_array())
                     || fc.desired.as_ref().is_some_and(|v| v.is_array());
                 if is_list {
-                    format_list_field_diff(&mut out, fc);
+                    format_list_field_diff(&mut out, fc, annotation);
                 } else {
-                    format_scalar_field_diff(&mut out, fc);
+                    format_scalar_field_diff(&mut out, fc, annotation);
                 }
             }
         }
@@ -794,11 +818,29 @@ pub fn outcome_summary(outcome: &ApplyOutcome) -> String {
     }
 }
 
+fn count_failed_fields(entry: &JournalEntry) -> u32 {
+    let count = entry
+        .diff
+        .operations
+        .iter()
+        .flat_map(|op| op.field_changes.iter())
+        .filter(|fc| fc.change_kind != "unchanged" && fc.outcome.as_deref() == Some("failed"))
+        .count() as u32;
+    if count == 0 {
+        // Legacy fallback for entries written before per-field outcome annotation.
+        if let ApplyOutcome::Applied { failed, .. } = &entry.outcome {
+            return *failed;
+        }
+    }
+    count
+}
+
 fn changes_column(entry: &JournalEntry) -> String {
     let changes = changes_summary(&entry.diff.operations);
     match &entry.outcome {
         ApplyOutcome::Applied { failed, .. } if *failed > 0 => {
-            format!("FAIL {}", changes)
+            let n = count_failed_fields(entry);
+            format!("FAIL({}) {}", n, changes)
         }
         _ => changes,
     }
@@ -1043,12 +1085,23 @@ fn colorize_change_token(token: &str) -> String {
     }
 }
 
-fn format_scalar_field_diff(out: &mut String, fc: &SerializableFieldChange) {
+fn format_annotation_colored(annotation: Option<&str>) -> String {
+    match annotation {
+        Some("failed") => format!("  [{}]", "failed".red()),
+        Some("skipped") => format!("  [{}]", "skipped".yellow()),
+        Some("applied") => format!("  [{}]", "applied".green()),
+        Some(other) => format!("  [{}]", other),
+        None => String::new(),
+    }
+}
+
+fn format_scalar_field_diff(out: &mut String, fc: &SerializableFieldChange, annotation: Option<&str>) {
+    let ann = format_annotation_colored(annotation);
     match fc.change_kind.as_str() {
         "set" if fc.current.is_none() => {
             let desired = opt_json_compact(&fc.desired);
             let line = format!("+{}: {}", fc.field_name, desired);
-            out.push_str(&format!("      {}\n", line.green()));
+            out.push_str(&format!("      {}{}\n", line.green(), ann));
         }
         "set" => {
             let current = opt_json_compact(&fc.current);
@@ -1056,18 +1109,18 @@ fn format_scalar_field_diff(out: &mut String, fc: &SerializableFieldChange) {
             let old_line = format!("-{}: {}", fc.field_name, current);
             let new_line = format!("+{}: {}", fc.field_name, desired);
             out.push_str(&format!("      {}\n", old_line.red()));
-            out.push_str(&format!("      {}\n", new_line.green()));
+            out.push_str(&format!("      {}{}\n", new_line.green(), ann));
         }
         "unset" => {
             let current = opt_json_compact(&fc.current);
             let line = format!("-{}: {}", fc.field_name, current);
-            out.push_str(&format!("      {}\n", line.red()));
+            out.push_str(&format!("      {}{}\n", line.red(), ann));
         }
         _ => {}
     }
 }
 
-fn format_list_field_diff(out: &mut String, fc: &SerializableFieldChange) {
+fn format_list_field_diff(out: &mut String, fc: &SerializableFieldChange, annotation: Option<&str>) {
     let empty = Vec::new();
     let current_items = fc.current.as_ref()
         .and_then(|v| v.as_array())
@@ -1076,17 +1129,18 @@ fn format_list_field_diff(out: &mut String, fc: &SerializableFieldChange) {
         .and_then(|v| v.as_array())
         .unwrap_or(&empty);
 
+    let ann = format_annotation_colored(annotation);
     out.push_str(&format!("      {}:\n", fc.field_name));
     for item in desired_items {
         if !current_items.contains(item) {
             let line = format!("        +{}", format_list_element(item));
-            out.push_str(&format!("{}\n", line.green()));
+            out.push_str(&format!("{}{}\n", line.green(), ann));
         }
     }
     for item in current_items {
         if !desired_items.contains(item) {
             let line = format!("        -{}", format_list_element(item));
-            out.push_str(&format!("{}\n", line.red()));
+            out.push_str(&format!("{}{}\n", line.red(), ann));
         }
     }
 }
@@ -3922,6 +3976,652 @@ mod tests {
             result,
             ExitCode::from(1u8),
             "--show 0 should return exit code 1 (seq 0 is not a valid entry)"
+        );
+    }
+
+    // ── Feature: FAIL prefix ──────────────────────────────────────────────────
+
+    /// AC: External change has no FAIL prefix in the CHANGES column.
+    ///
+    /// External changes produce ApplyOutcome::Observed, which does not match the
+    /// Applied { failed, .. } if *failed > 0 pattern — so FAIL should never appear.
+    #[test]
+    fn test_format_text_list_external_change_has_no_fail_prefix() {
+        let mut entry = make_entry();
+        entry.trigger = Trigger::ExternalChange { changed_entities: vec!["eth0".to_string()] };
+        entry.outcome = ApplyOutcome::Observed;
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![SerializableFieldChange {
+                    field_name: "mtu".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!(1400u64)),
+                    desired: Some(serde_json::json!(1500u64)),
+                    outcome: None,
+                }],
+            }],
+        };
+        let output = format_text_list(&[entry], false);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+        assert!(
+            !plain.contains("FAIL"),
+            "external change should not show FAIL prefix, got: {}",
+            plain
+        );
+    }
+
+    /// AC: FAIL(N) count is the per-field failure count, not just the legacy outcome count.
+    ///
+    /// When field changes have explicit outcome="failed", count_failed_fields reads
+    /// those per-field annotations and uses that count in FAIL(N).
+    #[test]
+    fn test_format_text_list_fail_count_reflects_per_field_failures() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 2, failed: 3, skipped: 0 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1500u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: Some("failed".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "speed".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(100u64)),
+                        desired: Some(serde_json::json!(1000u64)),
+                        outcome: Some("failed".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "state".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!("down")),
+                        desired: Some(serde_json::json!("up")),
+                        outcome: Some("failed".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = format_text_list(&[entry], false);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+        assert!(
+            plain.contains("FAIL(3)"),
+            "FAIL prefix should show per-field failure count FAIL(3), got: {}",
+            plain
+        );
+    }
+
+    /// AC: Multiple failures show correct count — FAIL(1) when only 1 field failed.
+    #[test]
+    fn test_format_text_list_fail_count_1_when_only_1_field_failed_and_2_skipped() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 0, failed: 1, skipped: 2 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1400u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: Some("skipped".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "addresses".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!(["0.0.0.0/0"])),
+                        outcome: Some("failed".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "state".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!("down")),
+                        desired: Some(serde_json::json!("up")),
+                        outcome: Some("skipped".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = format_text_list(&[entry], false);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+        assert!(
+            plain.contains("FAIL(1)"),
+            "should show FAIL(1) when only 1 of 3 field changes failed (2 skipped), got: {}",
+            plain
+        );
+    }
+
+    // ── Feature: per-field outcome annotations ────────────────────────────────
+
+    /// AC: Per-field outcome annotations appear for failed/skipped fields in mixed results.
+    ///
+    /// When any field change has outcome "failed" or "skipped", annotations appear.
+    #[test]
+    fn test_format_text_detail_per_field_annotations_on_mixed_outcomes() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 0, failed: 1, skipped: 2 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "enp7s0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1492u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: Some("skipped".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "speed".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(100u64)),
+                        desired: Some(serde_json::json!(1000u64)),
+                        outcome: Some("failed".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "state".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!("down")),
+                        desired: Some(serde_json::json!("up")),
+                        outcome: Some("skipped".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            plain.contains("[skipped]"),
+            "mixed outcomes must show '[skipped]' annotation, got:\n{plain}"
+        );
+        assert!(
+            plain.contains("[failed]"),
+            "mixed outcomes must show '[failed]' annotation, got:\n{plain}"
+        );
+    }
+
+    /// AC: [applied] annotation appears only when outcomes are mixed (some failed or skipped).
+    ///
+    /// The spec says [applied] is shown only when the reader needs to distinguish
+    /// applied fields from failed/skipped ones.
+    #[test]
+    fn test_format_text_detail_applied_annotation_shown_only_with_mixed_outcomes() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 1, failed: 1, skipped: 0 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1500u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: Some("applied".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "speed".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(100u64)),
+                        desired: Some(serde_json::json!(1000u64)),
+                        outcome: Some("failed".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            plain.contains("[applied]"),
+            "mixed outcomes must show '[applied]' annotation for applied field, got:\n{plain}"
+        );
+        assert!(
+            plain.contains("[failed]"),
+            "mixed outcomes must show '[failed]' annotation, got:\n{plain}"
+        );
+    }
+
+    /// AC: No annotations when all fields succeeded.
+    ///
+    /// When every field change has outcome "applied" (no failed or skipped),
+    /// the Outcome line is sufficient and no per-field annotations appear.
+    #[test]
+    fn test_format_text_detail_no_annotations_when_all_fields_succeeded() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 2, failed: 0, skipped: 0 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1500u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: Some("applied".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "speed".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(100u64)),
+                        desired: Some(serde_json::json!(1000u64)),
+                        outcome: Some("applied".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            !plain.contains("[applied]"),
+            "all-success should NOT show '[applied]' annotation, got:\n{plain}"
+        );
+        assert!(
+            !plain.contains("[failed]"),
+            "all-success should NOT show '[failed]' annotation, got:\n{plain}"
+        );
+        assert!(
+            !plain.contains("[skipped]"),
+            "all-success should NOT show '[skipped]' annotation, got:\n{plain}"
+        );
+    }
+
+    /// AC: External change entries (Observed outcome) have no per-field outcome annotations.
+    #[test]
+    fn test_format_text_detail_external_change_has_no_field_outcome_annotations() {
+        let mut entry = make_entry();
+        entry.trigger = Trigger::ExternalChange { changed_entities: vec!["eth0".to_string()] };
+        entry.outcome = ApplyOutcome::Observed;
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![SerializableFieldChange {
+                    field_name: "mtu".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!(1400u64)),
+                    desired: Some(serde_json::json!(1500u64)),
+                    // Even with a "skipped" outcome, external changes must show no annotations
+                    outcome: Some("skipped".to_string()),
+                }],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            !plain.contains("[failed]"),
+            "external change should not show '[failed]' annotation, got:\n{plain}"
+        );
+        assert!(
+            !plain.contains("[skipped]"),
+            "external change should not show '[skipped]' annotation, got:\n{plain}"
+        );
+        assert!(
+            !plain.contains("[applied]"),
+            "external change should not show '[applied]' annotation, got:\n{plain}"
+        );
+    }
+
+    /// AC: Per-field annotation colors: [failed]=red, [skipped]=yellow, [applied]=green.
+    ///
+    /// The spec requires colored annotations to help operators distinguish outcomes at a glance.
+    #[test]
+    fn test_format_text_detail_annotation_colors_are_correct() {
+        let _lock = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        colored::control::set_override(true);
+        let output = {
+            let mut entry = make_entry();
+            entry.outcome = ApplyOutcome::Applied { succeeded: 1, failed: 1, skipped: 1 };
+            entry.diff = SerializableDiff {
+                operations: vec![SerializableDiffOp {
+                    kind: "modify".to_string(),
+                    entity_type: "ethernet".to_string(),
+                    entity_name: "eth0".to_string(),
+                    field_changes: vec![
+                        SerializableFieldChange {
+                            field_name: "mtu".to_string(),
+                            change_kind: "set".to_string(),
+                            current: Some(serde_json::json!(1500u64)),
+                            desired: Some(serde_json::json!(9000u64)),
+                            outcome: Some("applied".to_string()),
+                        },
+                        SerializableFieldChange {
+                            field_name: "speed".to_string(),
+                            change_kind: "set".to_string(),
+                            current: Some(serde_json::json!(100u64)),
+                            desired: Some(serde_json::json!(1000u64)),
+                            outcome: Some("failed".to_string()),
+                        },
+                        SerializableFieldChange {
+                            field_name: "state".to_string(),
+                            change_kind: "set".to_string(),
+                            current: Some(serde_json::json!("down")),
+                            desired: Some(serde_json::json!("up")),
+                            outcome: Some("skipped".to_string()),
+                        },
+                    ],
+                }],
+            };
+            format_text_detail(&entry)
+        };
+        colored::control::unset_override();
+
+        // ANSI red = \x1b[31m...m, yellow = \x1b[33m, green = \x1b[32m
+        // The annotation format is: "  [<colored_text>]"
+        // where <colored_text> = "\x1b[3Xm<word>\x1b[0m"
+        assert!(
+            output.contains("\x1b[31mfailed\x1b[0m"),
+            "[failed] annotation must use red ANSI code (\\x1b[31m), got:\n{}",
+            output.escape_debug()
+        );
+        assert!(
+            output.contains("\x1b[33mskipped\x1b[0m"),
+            "[skipped] annotation must use yellow ANSI code (\\x1b[33m), got:\n{}",
+            output.escape_debug()
+        );
+        assert!(
+            output.contains("\x1b[32mapplied\x1b[0m"),
+            "[applied] annotation must use green ANSI code (\\x1b[32m), got:\n{}",
+            output.escape_debug()
+        );
+    }
+
+    // ── Feature: Dynamic column widths ────────────────────────────────────────
+
+    /// AC: Column widths adapt to content — not padded to their maximum caps.
+    ///
+    /// With a single-digit seq number (1 char), the SEQ column width is
+    /// max("SEQ".len(), 1) = 3, not the cap of 7. The header "SEQ" is
+    /// formatted at exactly 3 chars with no extra padding.
+    #[test]
+    fn test_format_text_list_seq_column_width_adapts_to_content_not_capped() {
+        let mut entry = make_entry();
+        entry.seq = 7; // single-digit
+        let output = format_text_list(&[entry], false);
+
+        let header = output.lines().next().unwrap();
+        // With w_seq=3, pad_or_truncate("SEQ", 3)="SEQ", then "  " separator before TIMESTAMP.
+        // The header should start with "SEQ  " (3 + 2 sep), not "SEQ    " (7 + 2 sep).
+        assert!(
+            header.starts_with("SEQ  "),
+            "SEQ column width should be 3 (header width) with single-digit seq, got header: {}",
+            header
+        );
+        assert!(
+            !header.starts_with("SEQ   "),
+            "SEQ column should NOT be padded to the cap of 7 with single-digit seq, got header: {}",
+            header
+        );
+    }
+
+    /// AC: ENTITIES column width adapts to content (header width = 8 is the minimum).
+    ///
+    /// With entity names "eth0" (4 chars), the ENTITIES column width is
+    /// max("ENTITIES".len(), 4) = 8. The header is padded to exactly 8 chars.
+    #[test]
+    fn test_format_text_list_entities_column_width_adapts_to_content() {
+        let mut entry = make_entry();
+        entry.seq = 1;
+        // Single entity "eth0" (4 chars), shorter than the "ENTITIES" header (8 chars)
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![],
+            }],
+        };
+        let output = format_text_list(&[entry], false);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+
+        // The data row should contain "eth0" padded to 8 chars (matching "ENTITIES" header),
+        // not to the cap of 24 chars. Count spaces after "eth0" until the next non-space field.
+        // With w_ent=8, "eth0" is padded to 8 chars = "eth0    " (4 + 4 spaces).
+        // But we just verify the data contains "eth0" and the column is not over-padded to 24.
+        assert!(
+            plain.contains("eth0"),
+            "data row must contain entity name 'eth0', got: {}",
+            plain
+        );
+
+        // Find "eth0" in the plain row and check that there are <=20 spaces after it
+        // (i.e., it's not padded to the max cap of 24).
+        if let Some(pos) = plain.find("eth0") {
+            let after_entity = &plain[pos + 4..];
+            let spaces_after = after_entity.chars().take_while(|c| *c == ' ').count();
+            // With w_ent=8, entity is padded to 8 chars. eth0=4 chars, so 4 spaces of padding,
+            // then 2 separator spaces = 6 total spaces before CHANGES. This is < 20.
+            assert!(
+                spaces_after < 20,
+                "entity column should not be padded to the cap of 24; \
+                 found {} spaces after 'eth0' — expected ~6 (4 padding + 2 sep), got row: {}",
+                spaces_after, plain
+            );
+        }
+    }
+
+    /// AC: Column widths respect maximum caps — trigger column truncated at 24 chars.
+    ///
+    /// A policy name longer than fits in the 24-char TRIGGER cap results in "…".
+    #[test]
+    fn test_format_text_list_trigger_column_capped_at_24_chars() {
+        let mut entry = make_entry();
+        entry.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
+        // "apply (very-long-policy-name-exceeding)" > 24 chars → truncated with "…"
+        entry.active_policies = vec![PolicySummary {
+            name: "a-very-long-policy-name-that-exceeds".to_string(),
+            factory_type: "static".to_string(),
+            priority: 100,
+        }];
+        let output = format_text_list(&[entry], false);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+        // The trigger column must be at most 24 chars wide; truncated with "…"
+        assert!(
+            plain.contains('…'),
+            "trigger column exceeding 24 chars must be truncated with '…', got: {}",
+            plain
+        );
+    }
+
+    // ── Feature: format_text_detail: list field annotations ──────────────────
+
+    /// AC: List field changes (e.g. addresses) show the same annotation for each element.
+    ///
+    /// When a list field change has outcome "skipped", each changed element line gets [skipped].
+    #[test]
+    fn test_format_text_detail_list_field_annotation_per_element() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 0, failed: 0, skipped: 1 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "enp7s0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "dns_servers".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!(["192.168.122.1"])),
+                        outcome: Some("skipped".to_string()),
+                    },
+                    // A separate field that failed to trigger mixed-outcome annotations
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1492u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: Some("failed".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = format_text_detail(&entry);
+        let plain = strip_ansi(&output);
+        assert!(
+            plain.contains("dns_servers:"),
+            "list field must show 'dns_servers:' header, got:\n{plain}"
+        );
+        assert!(
+            plain.contains("+192.168.122.1"),
+            "added element must show '+192.168.122.1', got:\n{plain}"
+        );
+        assert!(
+            plain.contains("[skipped]"),
+            "list field element with 'skipped' outcome must show '[skipped]', got:\n{plain}"
+        );
+    }
+
+    // ── Feature: format_text_detail: outcome detail breakdown ────────────────
+
+    /// AC: outcome_detail for Applied shows "applied (N succeeded, M failed, K skipped)".
+    #[test]
+    fn test_outcome_detail_applied_with_all_counts() {
+        let outcome = ApplyOutcome::Applied { succeeded: 1, failed: 1, skipped: 2 };
+        let result = outcome_detail(&outcome);
+        assert_eq!(result, "applied (1 succeeded, 1 failed, 2 skipped)");
+    }
+
+    /// AC: outcome_detail for Observed shows "observed".
+    #[test]
+    fn test_outcome_detail_observed_shows_observed() {
+        let result = outcome_detail(&ApplyOutcome::Observed);
+        assert_eq!(result, "observed");
+    }
+
+    /// AC: format_text_detail shows the outcome with full breakdown including skipped count.
+    #[test]
+    fn test_format_text_detail_outcome_shows_full_breakdown_with_skipped() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 0, failed: 1, skipped: 2 };
+        let output = format_text_detail(&entry);
+        assert!(
+            output.contains("0 succeeded"),
+            "detail outcome must show '0 succeeded', got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("1 failed"),
+            "detail outcome must show '1 failed', got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("2 skipped"),
+            "detail outcome must show '2 skipped', got:\n{}",
+            output
+        );
+    }
+
+    // ── Feature: format_text_list reverse chronological ordering ─────────────
+
+    /// AC: The 20 most recent entries are shown in reverse chronological order (newest first).
+    ///
+    /// Entries read from the journal via read_recent are already newest-first;
+    /// format_text_list must preserve that order (seq decreasing down the rows).
+    #[test]
+    fn test_format_text_list_entries_shown_in_reverse_chronological_order() {
+        let mut entries: Vec<JournalEntry> = Vec::new();
+        for seq in [10u64, 9, 8, 7, 6] {
+            let mut e = make_entry();
+            e.seq = seq;
+            entries.push(e);
+        }
+        let output = format_text_list(&entries, false);
+        let lines: Vec<&str> = output.lines().collect();
+        // Skip header (line 0), data rows start at line 1
+        let seqs: Vec<u64> = lines[1..]
+            .iter()
+            .filter(|l| !l.contains("daemon restart"))
+            .map(|l| {
+                l.split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            })
+            .collect();
+        assert_eq!(seqs.len(), 5, "should have 5 data rows");
+        for i in 0..seqs.len() - 1 {
+            assert!(
+                seqs[i] > seqs[i + 1],
+                "entries must be in reverse chronological order (seq {} > {}), got: {:?}",
+                seqs[i], seqs[i + 1], seqs
+            );
+        }
+    }
+
+    // ── Feature: filter_entries -- all three filters together ─────────────────
+
+    /// AC: Combine all three filters (--since, --trigger, -s name=X) with AND logic.
+    ///
+    /// Only entries that pass all three filters are returned.
+    #[test]
+    fn test_filter_entries_all_three_filters_combined_and_logic() {
+        let matching = {
+            let mut e = make_entry_with_entity("eth0");
+            e.timestamp = Utc::now() - Duration::minutes(30);
+            e.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
+            e
+        };
+        let wrong_time = {
+            let mut e = make_entry_with_entity("eth0");
+            e.timestamp = Utc::now() - Duration::hours(2); // fails --since 1h
+            e.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
+            e
+        };
+        let wrong_trigger = {
+            let mut e = make_entry_with_entity("eth0");
+            e.timestamp = Utc::now() - Duration::minutes(30);
+            e.trigger = Trigger::ExternalChange { changed_entities: vec![] }; // fails --trigger apply
+            e
+        };
+        let wrong_entity = {
+            let mut e = make_entry_with_entity("eth1"); // fails -s name=eth0
+            e.timestamp = Utc::now() - Duration::minutes(30);
+            e.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
+            e
+        };
+
+        let mut args = default_args();
+        args.since = Some("1h".to_string());
+        args.trigger = Some("apply".to_string());
+        args.selector = vec![("name".to_string(), "eth0".to_string())];
+
+        let result = filter_entries(
+            vec![matching, wrong_time, wrong_trigger, wrong_entity],
+            &args,
+        )
+        .unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "combined --since 1h --trigger apply -s name=eth0 must use AND logic, returning only 1 entry"
         );
     }
 }

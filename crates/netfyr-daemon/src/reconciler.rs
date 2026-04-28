@@ -328,6 +328,7 @@ impl Reconciler {
                     failed: 0,
                     skipped: 0,
                 },
+                None,
             );
             return Ok(ApplyResult {
                 report: ApplyReport::new(),
@@ -374,6 +375,7 @@ impl Reconciler {
                 failed: report.failed.len() as u32,
                 skipped: report.skipped.len() as u32,
             },
+            Some(&report),
         );
 
         Ok(ApplyResult { report, conflicts })
@@ -454,6 +456,7 @@ impl Reconciler {
                 &reconcile_diff,
                 &filtered_target,
                 ApplyOutcome::Applied { succeeded: 0, failed: 0, skipped: 0 },
+                None,
             );
             return Ok(RevertResult {
                 reconcile_diff,
@@ -481,6 +484,7 @@ impl Reconciler {
                 failed: apply_report.failed.len() as u32,
                 skipped: apply_report.skipped.len() as u32,
             },
+            Some(&apply_report),
         );
 
         Ok(RevertResult {
@@ -516,6 +520,7 @@ impl Reconciler {
         reconcile_diff: &ReconcileStateDiff,
         effective_state: &StateSet,
         outcome: ApplyOutcome,
+        apply_report: Option<&ApplyReport>,
     ) {
         let mut guard = match self.journal.lock() {
             Ok(g) => g,
@@ -525,12 +530,16 @@ impl Reconciler {
             }
         };
         if let Some(ref mut journal) = *guard {
+            let mut diff = SerializableDiff::from(reconcile_diff);
+            if let Some(report) = apply_report {
+                annotate_diff_outcomes(&mut diff, report);
+            }
             let entry = JournalEntry {
                 seq: 0,
                 timestamp: chrono::Utc::now(),
                 trigger: trigger.clone(),
                 active_policies: summarize_policies(policy_store.policies()),
-                diff: SerializableDiff::from(reconcile_diff),
+                diff,
                 state_after: SerializableStateSet::from(effective_state),
                 outcome,
             };
@@ -547,6 +556,7 @@ impl Reconciler {
         reconcile_diff: &ReconcileStateDiff,
         target_state: &StateSet,
         outcome: ApplyOutcome,
+        apply_report: Option<&ApplyReport>,
     ) {
         let mut guard = match self.journal.lock() {
             Ok(g) => g,
@@ -556,12 +566,16 @@ impl Reconciler {
             }
         };
         if let Some(ref mut journal) = *guard {
+            let mut diff = SerializableDiff::from(reconcile_diff);
+            if let Some(report) = apply_report {
+                annotate_diff_outcomes(&mut diff, report);
+            }
             let entry = JournalEntry {
                 seq: 0,
                 timestamp: chrono::Utc::now(),
                 trigger: Trigger::Revert { target_seq },
                 active_policies: summarize_policies(policies),
-                diff: SerializableDiff::from(reconcile_diff),
+                diff,
                 state_after: SerializableStateSet::from(target_state),
                 outcome,
             };
@@ -627,6 +641,45 @@ impl Reconciler {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Annotate each non-unchanged field change in `diff` with its apply outcome
+/// ("applied", "failed", or "skipped") by matching entities in `report`.
+///
+/// The backend applies changes atomically per entity, so all field changes for
+/// an entity share the same outcome.
+fn annotate_diff_outcomes(diff: &mut SerializableDiff, report: &ApplyReport) {
+    for op in &mut diff.operations {
+        let outcome = if report
+            .succeeded
+            .iter()
+            .any(|s| s.entity_type == op.entity_type && s.selector.key() == op.entity_name)
+        {
+            Some("applied")
+        } else if report
+            .failed
+            .iter()
+            .any(|f| f.entity_type == op.entity_type && f.selector.key() == op.entity_name)
+        {
+            Some("failed")
+        } else if report
+            .skipped
+            .iter()
+            .any(|s| s.entity_type == op.entity_type && s.selector.key() == op.entity_name)
+        {
+            Some("skipped")
+        } else {
+            None
+        };
+
+        if let Some(outcome_str) = outcome {
+            for fc in &mut op.field_changes {
+                if fc.change_kind != "unchanged" {
+                    fc.outcome = Some(outcome_str.to_string());
+                }
+            }
+        }
+    }
+}
 
 /// Return a copy of `set` with all `READONLY_FIELDS` removed from every state.
 ///
