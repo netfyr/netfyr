@@ -44,13 +44,34 @@ Default directory for policy files.
 .I /var/lib/netfyr/
 State directory for persistent daemon data.
 .SH EXAMPLES
-See
-.BR netfyr-show (1)
-for usage details.
+Show system overview:
+.PP
+.RS 4
+.nf
+netfyr show
+.fi
+.RE
+.PP
+Show system overview as JSON for scripting:
+.PP
+.RS 4
+.nf
+netfyr show -o json
+.fi
+.RE
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set (to any value), colored output is disabled regardless of the
+.B \-\-color
+flag.
 .SH "SEE ALSO"
 .BR netfyr (1),
 .BR netfyr-apply (1),
 .BR netfyr-query (1),
+.BR netfyr-show (1),
+.BR netfyr-history (1),
+.BR netfyr-revert (1),
 .BR netfyr-daemon (8),
 .BR netfyr-examples (7),
 .BR netfyr.yaml (5)

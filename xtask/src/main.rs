@@ -64,6 +64,7 @@ fn generate_man_pages() -> Result<(), Box<dyn std::error::Error>> {
         append_exit_status(&mut buf, None)?;
         append_files(&mut buf)?;
         append_examples(&mut buf, None)?;
+        append_environment(&mut buf)?;
         append_see_also(&mut buf, None)?;
         fs::write(out_dir.join("netfyr.1"), &buf)?;
         println!("Generated: man/netfyr.1");
@@ -81,6 +82,7 @@ fn generate_man_pages() -> Result<(), Box<dyn std::error::Error>> {
         append_exit_status(&mut buf, Some(&subcmd_name))?;
         append_files(&mut buf)?;
         append_examples(&mut buf, Some(&subcmd_name))?;
+        append_environment(&mut buf)?;
         append_see_also(&mut buf, Some(&subcmd_name))?;
         let filename = format!("{name}.1");
         fs::write(out_dir.join(&filename), &buf)?;
@@ -210,6 +212,23 @@ fn append_examples(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, ".fi")?;
             writeln!(buf, ".RE")?;
         }
+        Some("show") => {
+            writeln!(buf, "Show system overview:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr show")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, "Show system overview as JSON for scripting:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr show -o json")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+        }
         Some(other) => {
             // Fallback for any future subcommands.
             writeln!(buf, "See")?;
@@ -217,6 +236,17 @@ fn append_examples(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, "for usage details.")?;
         }
     }
+    Ok(())
+}
+
+/// Append `.SH ENVIRONMENT` documenting the NO_COLOR variable.
+fn append_environment(buf: &mut Vec<u8>) -> std::io::Result<()> {
+    writeln!(buf, ".SH ENVIRONMENT")?;
+    writeln!(buf, ".TP")?;
+    writeln!(buf, ".B NO_COLOR")?;
+    writeln!(buf, "If set (to any value), colored output is disabled regardless of the")?;
+    writeln!(buf, ".B \\-\\-color")?;
+    writeln!(buf, "flag.")?;
     Ok(())
 }
 
@@ -228,6 +258,7 @@ fn append_see_also(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             // Top-level page — reference all subcommand and supplementary pages.
             writeln!(buf, ".BR netfyr-apply (1),")?;
             writeln!(buf, ".BR netfyr-query (1),")?;
+            writeln!(buf, ".BR netfyr-show (1),")?;
             writeln!(buf, ".BR netfyr-history (1),")?;
             writeln!(buf, ".BR netfyr-revert (1),")?;
             writeln!(buf, ".BR netfyr-daemon (8),")?;
@@ -237,6 +268,9 @@ fn append_see_also(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
         Some("apply") => {
             writeln!(buf, ".BR netfyr (1),")?;
             writeln!(buf, ".BR netfyr-query (1),")?;
+            writeln!(buf, ".BR netfyr-show (1),")?;
+            writeln!(buf, ".BR netfyr-history (1),")?;
+            writeln!(buf, ".BR netfyr-revert (1),")?;
             writeln!(buf, ".BR netfyr-daemon (8),")?;
             writeln!(buf, ".BR netfyr-examples (7),")?;
             writeln!(buf, r".BR netfyr.yaml (5)")?;
@@ -244,6 +278,9 @@ fn append_see_also(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
         Some("query") => {
             writeln!(buf, ".BR netfyr (1),")?;
             writeln!(buf, ".BR netfyr-apply (1),")?;
+            writeln!(buf, ".BR netfyr-show (1),")?;
+            writeln!(buf, ".BR netfyr-history (1),")?;
+            writeln!(buf, ".BR netfyr-revert (1),")?;
             writeln!(buf, ".BR netfyr-daemon (8),")?;
             writeln!(buf, ".BR netfyr-examples (7),")?;
             writeln!(buf, r".BR netfyr.yaml (5)")?;
@@ -252,6 +289,9 @@ fn append_see_also(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, ".BR netfyr (1),")?;
             writeln!(buf, ".BR netfyr-apply (1),")?;
             writeln!(buf, ".BR netfyr-query (1),")?;
+            writeln!(buf, ".BR netfyr-show (1),")?;
+            writeln!(buf, ".BR netfyr-history (1),")?;
+            writeln!(buf, ".BR netfyr-revert (1),")?;
             writeln!(buf, ".BR netfyr-daemon (8),")?;
             writeln!(buf, ".BR netfyr-examples (7),")?;
             writeln!(buf, r".BR netfyr.yaml (5)")?;
@@ -1208,7 +1248,7 @@ mod tests {
     /// AC: All subcommand pages include EXIT STATUS, FILES, EXAMPLES, SEE ALSO.
     #[test]
     fn test_all_subcommand_pages_have_required_sections() {
-        let pages = ["netfyr-apply.1", "netfyr-query.1", "netfyr-history.1", "netfyr-revert.1"];
+        let pages = ["netfyr-apply.1", "netfyr-query.1", "netfyr-history.1", "netfyr-revert.1", "netfyr-show.1"];
         for page in pages {
             let content = read_generated_man_page(page);
             assert!(content.contains("EXIT STATUS"), "{page} must contain EXIT STATUS section");
@@ -1482,6 +1522,173 @@ mod tests {
             out.contains("--dry-run") || out.contains("dry"),
             "revert EXAMPLES must show a --dry-run usage example"
         );
+    }
+
+    // ── EXAMPLES section — show subcommand ───────────────────────────────────
+
+    /// AC: show EXAMPLES section header is emitted.
+    #[test]
+    fn test_show_examples_section_header_present() {
+        let out = render(|buf| append_examples(buf, Some("show")));
+        assert!(out.contains(".SH EXAMPLES"), "EXAMPLES .SH header must be present for show");
+    }
+
+    /// AC: show EXAMPLES must contain at least two real-world usage examples.
+    #[test]
+    fn test_show_examples_has_at_least_two_nf_blocks() {
+        let out = render(|buf| append_examples(buf, Some("show")));
+        let nf_count = out.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "show EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
+    // ── ENVIRONMENT section ───────────────────────────────────────────────────
+
+    /// AC: ENVIRONMENT section header is emitted.
+    #[test]
+    fn test_environment_section_header_present() {
+        let out = render(append_environment);
+        assert!(
+            out.contains(".SH ENVIRONMENT"),
+            "ENVIRONMENT .SH header must be present"
+        );
+    }
+
+    /// AC: ENVIRONMENT section documents NO_COLOR.
+    #[test]
+    fn test_environment_section_documents_no_color() {
+        let out = render(append_environment);
+        assert!(
+            out.contains("NO_COLOR"),
+            "ENVIRONMENT section must document NO_COLOR"
+        );
+    }
+
+    // ── SEE ALSO completeness — apply and query ───────────────────────────────
+
+    /// AC: apply SEE ALSO must cross-reference netfyr-history(1).
+    #[test]
+    fn test_see_also_apply_references_netfyr_history_1() {
+        let out = render(|buf| append_see_also(buf, Some("apply")));
+        assert!(
+            out.contains("netfyr-history (1)") || out.contains("netfyr-history(1)"),
+            "apply SEE ALSO must reference netfyr-history(1); got:\n{out}"
+        );
+    }
+
+    /// AC: apply SEE ALSO must cross-reference netfyr-revert(1).
+    #[test]
+    fn test_see_also_apply_references_netfyr_revert_1() {
+        let out = render(|buf| append_see_also(buf, Some("apply")));
+        assert!(
+            out.contains("netfyr-revert (1)") || out.contains("netfyr-revert(1)"),
+            "apply SEE ALSO must reference netfyr-revert(1); got:\n{out}"
+        );
+    }
+
+    /// AC: query SEE ALSO must cross-reference netfyr-history(1).
+    #[test]
+    fn test_see_also_query_references_netfyr_history_1() {
+        let out = render(|buf| append_see_also(buf, Some("query")));
+        assert!(
+            out.contains("netfyr-history (1)") || out.contains("netfyr-history(1)"),
+            "query SEE ALSO must reference netfyr-history(1); got:\n{out}"
+        );
+    }
+
+    /// AC: query SEE ALSO must cross-reference netfyr-revert(1).
+    #[test]
+    fn test_see_also_query_references_netfyr_revert_1() {
+        let out = render(|buf| append_see_also(buf, Some("query")));
+        assert!(
+            out.contains("netfyr-revert (1)") || out.contains("netfyr-revert(1)"),
+            "query SEE ALSO must reference netfyr-revert(1); got:\n{out}"
+        );
+    }
+
+    // ── Generated netfyr-show.1 content tests ─────────────────────────────────
+
+    /// AC: man/netfyr-show.1 must exist.
+    #[test]
+    fn test_generated_netfyr_show_1_exists() {
+        assert!(man_page_path_exists("netfyr-show.1"), "man/netfyr-show.1 must exist (run `cargo xtask man`)");
+    }
+
+    /// AC: netfyr-show.1 OPTIONS section lists --output.
+    #[test]
+    fn test_netfyr_show_1_options_lists_output() {
+        let content = read_generated_man_page("netfyr-show.1");
+        let options_start = content.find(".SH OPTIONS").expect("OPTIONS section must exist in netfyr-show.1");
+        let options = &content[options_start..];
+        assert!(
+            options.contains("output"),
+            "netfyr-show.1 OPTIONS must list --output; OPTIONS section:\n{options}"
+        );
+    }
+
+    /// AC: netfyr-show.1 EXAMPLES has at least two usage examples.
+    #[test]
+    fn test_netfyr_show_1_examples_has_at_least_two_examples() {
+        let content = read_generated_man_page("netfyr-show.1");
+        let ex_start = content.find(".SH EXAMPLES").expect("EXAMPLES section must exist in netfyr-show.1");
+        let ex = &content[ex_start..];
+        let nf_count = ex.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "netfyr-show.1 EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
+    /// AC: netfyr-show.1 EXIT STATUS documents codes 0 and 1.
+    #[test]
+    fn test_netfyr_show_1_exit_status_documents_codes_0_and_1() {
+        let content = read_generated_man_page("netfyr-show.1");
+        let es_start = content.find("EXIT STATUS").expect("EXIT STATUS section must exist in netfyr-show.1");
+        let es = &content[es_start..];
+        assert!(es.contains(".B 0") || es.contains("\\fB0\\fR"), "netfyr-show.1 EXIT STATUS must document code 0");
+        assert!(es.contains(".B 1") || es.contains("\\fB1\\fR"), "netfyr-show.1 EXIT STATUS must document code 1");
+    }
+
+    /// AC: netfyr-show.1 SEE ALSO references netfyr(1) and netfyr-daemon(8).
+    #[test]
+    fn test_netfyr_show_1_see_also_references_netfyr_1_and_daemon_8() {
+        let content = read_generated_man_page("netfyr-show.1");
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO section must exist in netfyr-show.1");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr (1)") || see_also.contains("netfyr(1)"),
+            "netfyr-show.1 SEE ALSO must reference netfyr(1)"
+        );
+        assert!(
+            see_also.contains("netfyr-daemon (8)") || see_also.contains("netfyr-daemon(8)"),
+            "netfyr-show.1 SEE ALSO must reference netfyr-daemon(8)"
+        );
+    }
+
+    /// AC: All generated pages have an ENVIRONMENT section with NO_COLOR.
+    #[test]
+    fn test_all_generated_pages_have_environment_section() {
+        let pages = [
+            "netfyr.1",
+            "netfyr-apply.1",
+            "netfyr-query.1",
+            "netfyr-history.1",
+            "netfyr-revert.1",
+            "netfyr-show.1",
+        ];
+        for page in pages {
+            let content = read_generated_man_page(page);
+            assert!(
+                content.contains("ENVIRONMENT"),
+                "{page} must contain an ENVIRONMENT section"
+            );
+            assert!(
+                content.contains("NO_COLOR"),
+                "{page} ENVIRONMENT section must document NO_COLOR"
+            );
+        }
     }
 
     // ── netfyr-examples.7 — missing scenario coverage ────────────────────────

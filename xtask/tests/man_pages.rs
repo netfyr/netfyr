@@ -1101,3 +1101,131 @@ fn test_regeneration_is_idempotent() {
         "man/netfyr-query.1 must be byte-identical after the second regeneration"
     );
 }
+
+// ── Scenario: netfyr.1 mentions the show subcommand ──────────────────────────
+
+/// AC: DESCRIPTION (or SUBCOMMANDS) in netfyr.1 mentions the show subcommand.
+///
+/// The spec states the DESCRIPTION section mentions apply, query, AND show.
+#[test]
+fn test_netfyr_1_description_mentions_show_subcommand() {
+    let content = read_man_page("netfyr.1");
+    assert!(
+        content.contains("show"),
+        "man/netfyr.1 must mention the 'show' subcommand"
+    );
+}
+
+/// AC: SEE ALSO in netfyr.1 references netfyr-show(1).
+///
+/// The spec says SEE ALSO should reference all subcommand man pages, and
+/// netfyr-show(1) is one of the six section-1 pages listed in SPEC-501.
+/// clap_mangen encodes hyphens as `\-` in the SUBCOMMANDS section; the SEE
+/// ALSO helper should emit a separate .BR entry for the show page.
+///
+/// NOTE: the xtask `append_see_also(None)` currently omits netfyr-show(1)
+/// from the SEE ALSO section — this test exposes that gap.
+#[test]
+fn test_netfyr_1_see_also_references_netfyr_show_1() {
+    let content = read_man_page("netfyr.1");
+    // The SEE ALSO section must include the show page; accept both the plain
+    // form ("netfyr-show") used in .BR entries and the troff-escaped form
+    // ("netfyr\-show") used in generated SUBCOMMANDS entries.
+    let see_also_start = content.find("SEE ALSO").expect("netfyr.1 must have a SEE ALSO section");
+    let see_also = &content[see_also_start..];
+    let has_show = see_also.contains("netfyr-show") || see_also.contains("netfyr\\-show");
+    assert!(
+        has_show,
+        "man/netfyr.1 SEE ALSO must reference netfyr-show(1)"
+    );
+}
+
+// ── Scenario: Show man page documents the show command ────────────────────────
+
+/// AC: man/netfyr-show.1 is created (or already exists) after running xtask man.
+#[test]
+fn test_xtask_man_creates_netfyr_show_1() {
+    run_xtask_man();
+    assert!(
+        man_dir().join("netfyr-show.1").exists(),
+        "man/netfyr-show.1 must exist after `cargo xtask man`"
+    );
+}
+
+/// AC: OPTIONS in netfyr-show.1 lists --output.
+///
+/// clap_mangen encodes the flag as `output` in the .TP entry; the raw source
+/// may also appear as `\-o` for the short form.
+#[test]
+fn test_show_1_options_lists_output_flag() {
+    let content = read_man_page("netfyr-show.1");
+    let has_output = content.contains("output") || content.contains("\\-o");
+    assert!(
+        has_output,
+        "man/netfyr-show.1 OPTIONS must document the --output flag"
+    );
+}
+
+/// AC: EXAMPLES section in netfyr-show.1 contains at least two usage examples.
+///
+/// Each code example is rendered in a troff .nf / .fi (no-fill) block.
+#[test]
+fn test_show_1_examples_has_at_least_two_usage_examples() {
+    let content = read_man_page("netfyr-show.1");
+    let nf_count = content.matches(".nf").count();
+    assert!(
+        nf_count >= 2,
+        "man/netfyr-show.1 EXAMPLES must contain ≥ 2 code examples (.nf blocks); found {nf_count}"
+    );
+}
+
+/// AC: EXIT STATUS section in netfyr-show.1 documents code 0.
+#[test]
+fn test_show_1_exit_status_documents_code_0() {
+    let content = read_man_page("netfyr-show.1");
+    assert!(
+        content.contains("EXIT STATUS"),
+        "man/netfyr-show.1 must contain an EXIT STATUS section"
+    );
+    assert!(
+        content.contains(".B 0"),
+        "man/netfyr-show.1 EXIT STATUS must document exit code 0 (.B 0)"
+    );
+}
+
+/// AC: EXIT STATUS section in netfyr-show.1 documents code 1.
+#[test]
+fn test_show_1_exit_status_documents_code_1() {
+    let content = read_man_page("netfyr-show.1");
+    assert!(
+        content.contains(".B 1"),
+        "man/netfyr-show.1 EXIT STATUS must document exit code 1 (.B 1)"
+    );
+}
+
+/// AC: SEE ALSO in netfyr-show.1 references netfyr(1).
+#[test]
+fn test_show_1_see_also_references_netfyr_1() {
+    let content = read_man_page("netfyr-show.1");
+    assert!(
+        content.contains("SEE ALSO"),
+        "man/netfyr-show.1 must have a SEE ALSO section"
+    );
+    assert!(
+        content.contains("netfyr (1)") || content.contains("netfyr(1)"),
+        "man/netfyr-show.1 SEE ALSO must reference netfyr(1)"
+    );
+}
+
+/// AC: SEE ALSO in netfyr-show.1 references netfyr-daemon(8).
+///
+/// The show command queries daemon status, so the daemon page is the primary
+/// cross-reference for understanding daemon-mode behavior.
+#[test]
+fn test_show_1_see_also_references_netfyr_daemon_8() {
+    let content = read_man_page("netfyr-show.1");
+    assert!(
+        content.contains("netfyr-daemon (8)") || content.contains("netfyr-daemon(8)"),
+        "man/netfyr-show.1 SEE ALSO must reference netfyr-daemon(8)"
+    );
+}

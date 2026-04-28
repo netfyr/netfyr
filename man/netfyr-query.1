@@ -64,9 +64,18 @@ Query a specific interface by name, output as JSON:
 netfyr query -s type=ethernet -s name=eth0 -o json
 .fi
 .RE
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set (to any value), colored output is disabled regardless of the
+.B \-\-color
+flag.
 .SH "SEE ALSO"
 .BR netfyr (1),
 .BR netfyr-apply (1),
+.BR netfyr-show (1),
+.BR netfyr-history (1),
+.BR netfyr-revert (1),
 .BR netfyr-daemon (8),
 .BR netfyr-examples (7),
 .BR netfyr.yaml (5)
