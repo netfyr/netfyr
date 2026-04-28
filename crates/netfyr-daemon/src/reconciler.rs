@@ -1446,6 +1446,166 @@ mod tests {
         );
     }
 
+    // ── Feature: List-type field changes (addresses and routes) ──────────────────
+    //
+    // The spec mandates tracking addresses and routes which are list-typed fields.
+    // These tests verify that compute_external_field_changes correctly detects
+    // differences in list values (address additions, address removals, route changes).
+
+    /// AC: Monitor detects address addition — list-type addresses field with an
+    /// extra element is detected as a change.
+    #[test]
+    fn test_compute_external_field_changes_list_field_address_addition_detected() {
+        // Snapshot: one address
+        let last = make_journal_snapshot(
+            "veth-e2e0",
+            serde_json::json!({ "addresses": ["10.99.0.1/24"] }),
+        );
+        // Current: two addresses (one added externally)
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![("addresses", Value::List(vec![
+                Value::String("10.99.0.1/24".to_string()),
+                Value::String("10.99.0.2/24".to_string()),
+            ]))],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "one field (addresses) must have changed");
+        let change = &changes[0];
+        assert_eq!(change.field_name, "addresses");
+        assert_eq!(change.change_kind, "set");
+        assert_eq!(change.current, Some(serde_json::json!(["10.99.0.1/24"])));
+        assert!(change.desired.is_some(), "new address list must be in desired");
+    }
+
+    /// AC: Monitor detects address removal — list-type addresses field with fewer
+    /// elements is detected as a change.
+    #[test]
+    fn test_compute_external_field_changes_list_field_address_removal_detected() {
+        // Snapshot: two addresses
+        let last = make_journal_snapshot(
+            "veth-e2e0",
+            serde_json::json!({ "addresses": ["10.99.0.1/24", "10.99.0.2/24"] }),
+        );
+        // Current: one address (one removed externally)
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![("addresses", Value::List(vec![
+                Value::String("10.99.0.1/24".to_string()),
+            ]))],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "addresses field must show a change after removal");
+        let change = &changes[0];
+        assert_eq!(change.field_name, "addresses");
+        assert_eq!(change.change_kind, "set");
+        assert_eq!(
+            change.current,
+            Some(serde_json::json!(["10.99.0.1/24", "10.99.0.2/24"]))
+        );
+    }
+
+    /// AC: Monitor detects route addition — list-type routes field is tracked.
+    #[test]
+    fn test_compute_external_field_changes_list_field_route_addition_detected() {
+        // Snapshot: empty routes
+        let last = make_journal_snapshot("veth-e2e0", serde_json::json!({ "routes": [] }));
+        // Current: one route added externally
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![("routes", Value::List(vec![Value::String("10.99.1.0/24".to_string())]))],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "routes field must show a change after route addition");
+        let change = &changes[0];
+        assert_eq!(change.field_name, "routes");
+        assert_eq!(change.change_kind, "set");
+        assert_eq!(change.current, Some(serde_json::json!([])));
+        assert!(change.desired.is_some());
+    }
+
+    /// AC: Monitor detects route removal — list-type routes field shrinks.
+    #[test]
+    fn test_compute_external_field_changes_list_field_route_removal_detected() {
+        // Snapshot: one route
+        let last = make_journal_snapshot(
+            "veth-e2e0",
+            serde_json::json!({ "routes": ["10.99.1.0/24"] }),
+        );
+        // Current: no routes
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![("routes", Value::List(vec![]))],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 1, "routes field must show a change after route removal");
+        assert_eq!(changes[0].field_name, "routes");
+        assert_eq!(changes[0].change_kind, "set");
+        assert_eq!(changes[0].current, Some(serde_json::json!(["10.99.1.0/24"])));
+    }
+
+    /// AC: Route and address changes are coalesced — both address and route list
+    /// changes in a single state comparison appear together in one call's output.
+    #[test]
+    fn test_compute_external_field_changes_route_and_address_both_captured() {
+        let last = make_journal_snapshot(
+            "veth-e2e0",
+            serde_json::json!({
+                "addresses": ["10.99.0.1/24"],
+                "routes": []
+            }),
+        );
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![
+                ("addresses", Value::List(vec![
+                    Value::String("10.99.0.1/24".to_string()),
+                    Value::String("10.99.0.3/24".to_string()),
+                ])),
+                ("routes", Value::List(vec![Value::String("10.99.3.0/24".to_string())])),
+            ],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert_eq!(changes.len(), 2, "both address and route changes must be captured");
+        let addr = changes.iter().find(|c| c.field_name == "addresses")
+            .expect("addresses change must be present");
+        assert_eq!(addr.change_kind, "set");
+        let route = changes.iter().find(|c| c.field_name == "routes")
+            .expect("routes change must be present");
+        assert_eq!(route.change_kind, "set");
+    }
+
+    /// AC: Unchanged list-type fields do not appear in the diff.
+    #[test]
+    fn test_compute_external_field_changes_unchanged_list_field_not_included() {
+        let last = make_journal_snapshot(
+            "veth-e2e0",
+            serde_json::json!({ "addresses": ["10.99.0.1/24"] }),
+        );
+        let current = make_current_state(
+            "veth-e2e0",
+            vec![("addresses", Value::List(vec![Value::String("10.99.0.1/24".to_string())]))],
+        );
+
+        let changes = compute_external_field_changes(&last, &current);
+
+        assert!(
+            changes.is_empty(),
+            "unchanged list field must produce no change entries, got: {:?}",
+            changes.iter().map(|c| c.field_name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     /// AC: An empty snapshot vs a current state with only readonly fields produces no changes.
     /// This guards against the monitor generating spurious entries for carrier/speed/mac
     /// when no writable fields have actually changed.

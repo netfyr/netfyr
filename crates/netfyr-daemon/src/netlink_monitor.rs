@@ -998,6 +998,132 @@ mod tests {
         );
     }
 
+    // ── AC: Address change detected after daemon restart ──────────────────────
+
+    /// AC: Address change detected after daemon restart — when the name cache is
+    /// pre-populated by the startup RTM_GETLINK dump (simulated here by pre-inserting
+    /// into name_cache), an addr message arrives without a preceding RTM_NEWLINK
+    /// message and is still resolved to the correct interface name.
+    #[test]
+    fn test_pre_populated_cache_resolves_addr_message_without_preceding_link_msg() {
+        // Simulate what dump_link_names() produces at daemon startup.
+        let mut name_cache = HashMap::new();
+        name_cache.insert(12u32, "veth-restart0".to_string());
+
+        // Address event arrives after restart — no NEWLINK in this particular buffer.
+        let addr_msg = build_addr_msg(RTM_NEWADDR, 12);
+        let mut pending = HashMap::new();
+        let mut has_pending = false;
+        let mut deadline = far_future();
+
+        process_buffer(&addr_msg, &mut pending, &mut name_cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending, "addr event must set has_pending even when resolved from startup dump");
+        let (ifname, kinds) = pending.get(&12).expect("ifindex 12 must be in pending");
+        assert_eq!(
+            ifname.as_deref(),
+            Some("veth-restart0"),
+            "addr event must resolve ifname from startup dump cache without a preceding NEWLINK"
+        );
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::AddressAdded)));
+    }
+
+    /// AC: Address change detected after daemon restart — route messages also
+    /// resolve correctly when the name cache is pre-populated from the startup dump.
+    #[test]
+    fn test_pre_populated_cache_resolves_route_message_without_preceding_link_msg() {
+        let mut name_cache = HashMap::new();
+        name_cache.insert(13u32, "veth-restart1".to_string());
+
+        let route_msg = build_route_msg(RTM_NEWROUTE, 13);
+        let mut pending = HashMap::new();
+        let mut has_pending = false;
+        let mut deadline = far_future();
+
+        process_buffer(&route_msg, &mut pending, &mut name_cache, &mut has_pending, &mut deadline);
+
+        assert!(has_pending);
+        let (ifname, _) = pending.get(&13).expect("ifindex 13 must be in pending");
+        assert_eq!(
+            ifname.as_deref(),
+            Some("veth-restart1"),
+            "route event must resolve ifname from startup dump cache"
+        );
+    }
+
+    /// AC: Address change detected after daemon restart — address removal also
+    /// resolves correctly from the pre-populated startup cache.
+    #[test]
+    fn test_pre_populated_cache_resolves_addr_del_message_without_preceding_link_msg() {
+        let mut name_cache = HashMap::new();
+        name_cache.insert(14u32, "veth-restart2".to_string());
+
+        let addr_del_msg = build_addr_msg(RTM_DELADDR, 14);
+        let mut pending = HashMap::new();
+        let mut has_pending = false;
+        let mut deadline = far_future();
+
+        process_buffer(
+            &addr_del_msg,
+            &mut pending,
+            &mut name_cache,
+            &mut has_pending,
+            &mut deadline,
+        );
+
+        assert!(has_pending);
+        let (ifname, kinds) = pending.get(&14).expect("ifindex 14 must be in pending");
+        assert_eq!(
+            ifname.as_deref(),
+            Some("veth-restart2"),
+            "addr removal must resolve ifname from startup dump cache"
+        );
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::AddressRemoved)));
+    }
+
+    // ── AC: Multiple separate process_buffer calls accumulate correctly ────────
+
+    /// AC: Burst changes are coalesced across separate recv() calls — events from
+    /// multiple process_buffer calls accumulate in the same pending map.
+    #[test]
+    fn test_process_buffer_called_multiple_times_accumulates_in_same_pending_map() {
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+
+        // First recv: link event for ifindex 1
+        let msg1 = build_link_msg(RTM_NEWLINK, 1, "eth-a");
+        process_buffer(&msg1, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+        assert_eq!(pending.len(), 1);
+
+        // Second recv: addr event for ifindex 1 (separate call, same pending map)
+        let msg2 = build_addr_msg(RTM_NEWADDR, 1);
+        process_buffer(&msg2, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        // Both events must coalesce into one entry for ifindex 1
+        assert_eq!(pending.len(), 1, "events from separate process_buffer calls must coalesce");
+        let (ifname, kinds) = &pending[&1];
+        assert_eq!(ifname.as_deref(), Some("eth-a"), "ifname from first call must persist");
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::LinkChanged)));
+        assert!(kinds.iter().any(|k| matches!(k, ChangeKind::AddressAdded)));
+    }
+
+    /// AC: Separate process_buffer calls for different ifindexes accumulate separately.
+    #[test]
+    fn test_process_buffer_multiple_calls_different_ifindexes_accumulate_separately() {
+        let (mut pending, mut cache, mut has_pending, mut deadline) = empty_state();
+
+        let msg1 = build_link_msg(RTM_NEWLINK, 1, "eth-x");
+        process_buffer(&msg1, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        let msg2 = build_link_msg(RTM_NEWLINK, 2, "eth-y");
+        process_buffer(&msg2, &mut pending, &mut cache, &mut has_pending, &mut deadline);
+
+        assert_eq!(pending.len(), 2, "events for different ifindexes accumulate as separate entries");
+        assert!(pending.contains_key(&1));
+        assert!(pending.contains_key(&2));
+        assert_eq!(pending[&1].0.as_deref(), Some("eth-x"));
+        assert_eq!(pending[&2].0.as_deref(), Some("eth-y"));
+    }
+
     // ── AC: Burst changes — same-kind accumulation before drain deduplication ───
 
     /// AC: Burst changes are coalesced — two RTM_NEWLINK events for the same interface
