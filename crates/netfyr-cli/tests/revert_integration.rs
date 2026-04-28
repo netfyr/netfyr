@@ -140,9 +140,6 @@ fn test_revert_nonexistent_entry_exit_code_is_1() {
         .output()
         .expect("failed to run netfyr");
 
-    // BUG: standalone mode exits with 2 instead of 1 for "entry not found".
-    // The spec says exit code 1. Daemon mode correctly returns 1 via
-    // VarlinkError::EntryNotFound. This test documents the spec expectation.
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -748,5 +745,325 @@ mod netns_tests {
 
         // Verify the MTU was not changed by the dry-run.
         assert_eq!(read_mtu("veth-rvdj0"), 1300, "dry-run must not change mtu");
+    }
+}
+
+// ── Feature: State revert (daemon mode) ──────────────────────────────────────
+//
+// These tests spawn a mock Varlink server over a Unix socket so that the CLI
+// binary enters its daemon-mode path (VarlinkClient::connect succeeds).
+// No real daemon or network access is required.
+
+#[cfg(test)]
+mod daemon_mode_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    // ── Mock server helpers ───────────────────────────────────────────────────
+
+    /// Read one NUL-terminated message from a synchronous stream and parse it as JSON.
+    fn read_varlink_request<R: Read>(stream: &mut R) -> serde_json::Value {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).expect("read byte from mock stream");
+            if byte[0] == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        serde_json::from_slice(&buf).expect("request must be valid JSON")
+    }
+
+    /// Write a NUL-terminated Varlink success response to a synchronous stream.
+    ///
+    /// `params_json` is a pre-serialized JSON object string placed under `"parameters"`.
+    fn write_varlink_success<W: Write>(stream: &mut W, params_json: &str) {
+        let response = format!(r#"{{"parameters":{}}}"#, params_json);
+        let mut msg = response.into_bytes();
+        msg.push(0);
+        stream.write_all(&msg).expect("write mock response");
+    }
+
+    /// Write a NUL-terminated Varlink error response to a synchronous stream.
+    fn write_varlink_error<W: Write>(stream: &mut W, error_name: &str, reason: &str) {
+        let response = serde_json::json!({
+            "error": error_name,
+            "parameters": { "reason": reason }
+        });
+        let mut msg = serde_json::to_vec(&response).expect("serialize error response");
+        msg.push(0);
+        stream.write_all(&msg).expect("write mock error response");
+    }
+
+    /// Spawn a background thread that accepts exactly one Varlink connection,
+    /// reads one request, sends `params_json` as a success response, and returns
+    /// the parsed request value.
+    ///
+    /// The `UnixListener` is bound **before** spawning so the socket file exists
+    /// before the client's `connect()` call.
+    fn spawn_success_server(
+        socket_path: &str,
+        params_json: &'static str,
+    ) -> thread::JoinHandle<serde_json::Value> {
+        let listener = UnixListener::bind(socket_path).expect("bind mock socket");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let req = read_varlink_request(&mut stream);
+            write_varlink_success(&mut stream, params_json);
+            req
+        })
+    }
+
+    /// Spawn a background thread that accepts exactly one Varlink connection,
+    /// reads one request, and sends a Varlink error response.
+    fn spawn_error_server(
+        socket_path: &str,
+        error_name: &'static str,
+        reason: &'static str,
+    ) -> thread::JoinHandle<serde_json::Value> {
+        let listener = UnixListener::bind(socket_path).expect("bind mock error socket");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let req = read_varlink_request(&mut stream);
+            write_varlink_error(&mut stream, error_name, reason);
+            req
+        })
+    }
+
+    // ── AC: Revert via daemon routes through io.netfyr.Revert ────────────────
+
+    /// AC: When the daemon socket is reachable, `netfyr revert` sends
+    /// `io.netfyr.Revert` with the correct `target_seq` and `dry_run=false`.
+    ///
+    /// This exercises the daemon-mode branch in `run_revert`.
+    #[test]
+    fn test_revert_daemon_mode_sends_varlink_revert_method_with_correct_target_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("revert-method.sock")
+            .to_string_lossy()
+            .into_owned();
+
+        // Mock server: accept one connection, return a successful revert report.
+        let server = spawn_success_server(
+            &socket_path,
+            r#"{"report":{"succeeded":1,"failed":0,"skipped":0,"changes":[],"conflicts":[]},"entry_timestamp":"2026-04-20T15:00:00Z"}"#,
+        );
+
+        let output = std::process::Command::new(netfyr_bin())
+            .args(["revert", "42"])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_SOCKET_PATH", &socket_path)
+            .output()
+            .expect("failed to run netfyr revert in daemon mode");
+
+        let req = server.join().expect("mock server thread must finish");
+
+        // AC: The CLI must have sent io.netfyr.Revert.
+        assert_eq!(
+            req["method"].as_str(),
+            Some("io.netfyr.Revert"),
+            "daemon mode must route through io.netfyr.Revert; got method={:?}",
+            req["method"]
+        );
+        assert_eq!(
+            req["parameters"]["target_seq"].as_u64(),
+            Some(42),
+            "target_seq must be 42"
+        );
+        assert_eq!(
+            req["parameters"]["dry_run"].as_bool(),
+            Some(false),
+            "dry_run must be false for a non-dry-run call"
+        );
+        let _ = output;
+    }
+
+    // ── AC: Policy drift warning is printed to stderr after daemon revert ─────
+
+    /// AC: After a successful daemon-mode revert, the CLI prints a warning to
+    /// stderr explaining that the active policy set was not changed.
+    #[test]
+    fn test_revert_daemon_mode_prints_policy_drift_warning_to_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("revert-warning.sock")
+            .to_string_lossy()
+            .into_owned();
+
+        let server = spawn_success_server(
+            &socket_path,
+            r#"{"report":{"succeeded":1,"failed":0,"skipped":0,"changes":[],"conflicts":[]},"entry_timestamp":"2026-04-20T15:00:00Z"}"#,
+        );
+
+        let output = std::process::Command::new(netfyr_bin())
+            .args(["revert", "1"])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_SOCKET_PATH", &socket_path)
+            .output()
+            .expect("failed to run netfyr revert in daemon mode");
+
+        let _req = server.join().expect("mock server thread must finish");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Warning") || stderr.contains("warning"),
+            "stderr must contain a policy drift warning; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("policy") || stderr.contains("reconciliation"),
+            "warning must mention policy drift or reconciliation; got: {stderr}"
+        );
+    }
+
+    // ── AC: No policy drift warning in dry-run daemon mode ────────────────────
+
+    /// AC: `netfyr revert --dry-run` in daemon mode does NOT print the policy
+    /// drift warning because no changes are applied.
+    #[test]
+    fn test_revert_dry_run_daemon_mode_does_not_print_policy_drift_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("revert-dryrun-warn.sock")
+            .to_string_lossy()
+            .into_owned();
+
+        let server = spawn_success_server(
+            &socket_path,
+            r#"{"report":{"succeeded":0,"failed":0,"skipped":0,"changes":[{"kind":"modify","entity_type":"ethernet","entity_name":"veth0","description":"mtu: 1300 -> 1400","status":"planned"}],"conflicts":[]},"entry_timestamp":"2026-04-20T15:00:00Z"}"#,
+        );
+
+        let output = std::process::Command::new(netfyr_bin())
+            .args(["revert", "1", "--dry-run"])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_SOCKET_PATH", &socket_path)
+            .output()
+            .expect("failed to run netfyr revert --dry-run in daemon mode");
+
+        let _req = server.join().expect("mock server thread must finish");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Warning: the active policy set was not changed"),
+            "dry-run must NOT print the policy drift warning; got stderr: {stderr}"
+        );
+    }
+
+    // ── AC: EntryNotFound in daemon mode exits with code 1 ───────────────────
+
+    /// AC: When the daemon returns `io.netfyr.EntryNotFound`, `netfyr revert`
+    /// exits with code 1 and prints an error message identifying the missing entry.
+    #[test]
+    fn test_revert_daemon_mode_entry_not_found_exits_with_code_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("revert-notfound.sock")
+            .to_string_lossy()
+            .into_owned();
+
+        let server = spawn_error_server(
+            &socket_path,
+            "io.netfyr.EntryNotFound",
+            "Entry #9999 not found",
+        );
+
+        let output = std::process::Command::new(netfyr_bin())
+            .args(["revert", "9999"])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_SOCKET_PATH", &socket_path)
+            .output()
+            .expect("failed to run netfyr revert in daemon mode with missing entry");
+
+        let _req = server.join().expect("mock server thread must finish");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "EntryNotFound in daemon mode must exit with code 1; got: {:?}",
+            output.status.code()
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("9999") || stderr.contains("not found") || stderr.contains("Entry"),
+            "error output must identify the missing entry; got stderr: {stderr}"
+        );
+    }
+
+    // ── AC: Dry-run via daemon sends dry_run=true ─────────────────────────────
+
+    /// AC: `netfyr revert <seq> --dry-run` in daemon mode sends `dry_run=true`
+    /// in the Varlink Revert request.
+    #[test]
+    fn test_revert_dry_run_daemon_mode_sends_dry_run_true_in_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("revert-dry-flag.sock")
+            .to_string_lossy()
+            .into_owned();
+
+        let server = spawn_success_server(
+            &socket_path,
+            r#"{"report":{"succeeded":0,"failed":0,"skipped":0,"changes":[],"conflicts":[]},"entry_timestamp":"2026-04-20T14:30:00Z"}"#,
+        );
+
+        let output = std::process::Command::new(netfyr_bin())
+            .args(["revert", "5", "--dry-run"])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_SOCKET_PATH", &socket_path)
+            .output()
+            .expect("failed to run netfyr revert --dry-run in daemon mode");
+
+        let req = server.join().expect("mock server thread must finish");
+
+        // AC: dry_run must be true in the forwarded Varlink request.
+        assert_eq!(
+            req["parameters"]["dry_run"].as_bool(),
+            Some(true),
+            "dry-run flag must be forwarded as dry_run=true; got: {:?}",
+            req["parameters"]["dry_run"]
+        );
+        assert_eq!(
+            req["parameters"]["target_seq"].as_u64(),
+            Some(5),
+            "target_seq must be 5"
+        );
+
+        let _ = output;
+    }
+
+    // ── AC: Daemon dry-run does not record a new journal entry ────────────────
+
+    /// AC: In daemon mode, `--dry-run` is forwarded to the daemon which handles
+    /// journal recording. The Varlink request must include `dry_run=true` so the
+    /// daemon knows not to record a journal entry.
+    ///
+    /// This complements `test_revert_dry_run_does_not_record_journal_entry`
+    /// (which tests the standalone path) by verifying the daemon-mode wire
+    /// protocol correctly carries the dry_run flag.
+    #[test]
+    fn test_revert_dry_run_daemon_mode_forwards_dry_run_flag_to_prevent_journal_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("revert-dry-journal.sock")
+            .to_string_lossy()
+            .into_owned();
+
+        let server = spawn_success_server(
+            &socket_path,
+            r#"{"report":{"succeeded":0,"failed":0,"skipped":0,"changes":[],"conflicts":[]},"entry_timestamp":"2026-04-20T14:30:00Z"}"#,
+        );
+
+        let _ = std::process::Command::new(netfyr_bin())
+            .args(["revert", "3", "--dry-run"])
+            .env("NO_COLOR", "1")
+            .env("NETFYR_SOCKET_PATH", &socket_path)
+            .output()
+            .expect("failed to run netfyr revert --dry-run");
+
+        let req = server.join().expect("mock server thread must finish");
+
+        assert_eq!(
+            req["parameters"]["dry_run"].as_bool(),
+            Some(true),
+            "dry_run=true must be sent to the daemon so it skips journal recording"
+        );
     }
 }

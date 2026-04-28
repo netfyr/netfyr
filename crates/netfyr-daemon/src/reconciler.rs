@@ -1630,4 +1630,52 @@ mod tests {
             "current state with only readonly fields must produce no external change diff"
         );
     }
+
+    // ── Feature: Revert ───────────────────────────────────────────────────────
+
+    /// Dry-run revert returns Ok with report=None.
+    #[tokio::test]
+    async fn test_reconciler_revert_dry_run_returns_ok_with_none_report() {
+        let reconciler = Reconciler::new();
+        let result = reconciler.revert(&StateSet::new(), 1, &[], true).await;
+        assert!(result.is_ok(), "revert dry-run must succeed: {:?}", result.err());
+        assert!(
+            result.unwrap().report.is_none(),
+            "dry-run revert must return None report"
+        );
+    }
+
+    /// Apply revert with empty target returns Ok with report=Some.
+    #[tokio::test]
+    async fn test_reconciler_revert_apply_with_empty_target_returns_ok_with_report() {
+        let reconciler = Reconciler::new();
+        let result = reconciler.revert(&StateSet::new(), 1, &[], false).await;
+        assert!(result.is_ok(), "revert apply must succeed: {:?}", result.err());
+        assert!(
+            result.unwrap().report.is_some(),
+            "apply revert must return Some report"
+        );
+    }
+
+    /// is_applying flag is false after revert() completes (empty target = no apply needed).
+    #[tokio::test]
+    async fn test_reconciler_revert_is_not_applying_after_completion() {
+        let reconciler = Reconciler::new();
+        let _ = reconciler.revert(&StateSet::new(), 1, &[], false).await;
+        assert!(
+            !reconciler.is_applying(),
+            "is_applying must be false after revert completes"
+        );
+    }
+
+    /// Empty target state produces an empty reconcile diff.
+    #[tokio::test]
+    async fn test_reconciler_revert_with_empty_target_produces_empty_diff() {
+        let reconciler = Reconciler::new();
+        let result = reconciler.revert(&StateSet::new(), 1, &[], false).await.unwrap();
+        assert!(
+            result.reconcile_diff.is_empty(),
+            "empty target state must produce an empty reconcile diff"
+        );
+    }
 }

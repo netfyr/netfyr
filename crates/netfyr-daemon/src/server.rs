@@ -1758,6 +1758,198 @@ mod tests {
         );
     }
 
+    // ── Revert handler ────────────────────────────────────────────────────────
+
+    /// Missing target_seq parameter returns InternalError.
+    #[tokio::test]
+    async fn test_handle_revert_missing_target_seq_returns_internal_error() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let reconciler = Reconciler::new();
+
+        handle_revert(&mut server, &serde_json::json!({}), &policy_store, &reconciler)
+            .await
+            .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_some(),
+            "missing target_seq must produce an error response: {msg:?}"
+        );
+        let error_name = msg["error"].as_str().unwrap_or("");
+        assert!(
+            error_name.contains("InternalError"),
+            "error must be InternalError for missing target_seq: {msg:?}"
+        );
+        let reason = msg["parameters"]["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("target_seq"),
+            "reason must mention 'target_seq': {msg:?}"
+        );
+    }
+
+    /// Nonexistent entry returns EntryNotFound error containing the seq number.
+    #[tokio::test]
+    async fn test_handle_revert_entry_not_found_returns_entry_not_found_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Open the journal (creates the directory structure) but write no entries.
+        let _journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let reconciler = Reconciler::new();
+
+        handle_revert(
+            &mut server,
+            &serde_json::json!({"target_seq": 9999u64}),
+            &policy_store,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_some(),
+            "nonexistent entry must produce an error response: {msg:?}"
+        );
+        let error_name = msg["error"].as_str().unwrap_or("");
+        assert!(
+            error_name.contains("EntryNotFound"),
+            "error must be EntryNotFound: {msg:?}"
+        );
+        let reason = msg["parameters"]["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("9999"),
+            "reason must mention the nonexistent seq '9999': {msg:?}"
+        );
+    }
+
+    /// Dry-run returns success response with report and entry_timestamp.
+    #[tokio::test]
+    async fn test_handle_revert_dry_run_returns_success_with_report_and_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+        journal.append(make_test_journal_entry()).unwrap(); // gets seq=1
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let reconciler = Reconciler::new();
+
+        handle_revert(
+            &mut server,
+            &serde_json::json!({"target_seq": 1u64, "dry_run": true}),
+            &policy_store,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "dry-run revert must not return an error: {msg:?}"
+        );
+        assert!(
+            msg["parameters"].get("report").is_some(),
+            "dry-run revert response must include 'report': {msg:?}"
+        );
+        let ts = msg["parameters"]["entry_timestamp"].as_str().unwrap_or("");
+        assert!(
+            !ts.is_empty(),
+            "dry-run revert response must include non-empty 'entry_timestamp': {msg:?}"
+        );
+    }
+
+    /// Dry-run does not write a new journal entry.
+    #[tokio::test]
+    async fn test_handle_revert_dry_run_does_not_write_journal_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+        journal.append(make_test_journal_entry()).unwrap(); // gets seq=1; count=1 before dry-run
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let reconciler = Reconciler::new();
+
+        handle_revert(
+            &mut server,
+            &serde_json::json!({"target_seq": 1u64, "dry_run": true}),
+            &policy_store,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let _msg = read_message(&mut client).await.unwrap();
+
+        // Re-open the journal by path (not env var) to count entries.
+        let journal2 = netfyr_journal::Journal::open(dir.path()).unwrap();
+        let entries = journal2.read_recent(100).unwrap();
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "dry-run must not write a new journal entry (expected 1, got {})",
+            entries.len()
+        );
+    }
+
+    /// Dry-run response report.changes is an array.
+    #[tokio::test]
+    async fn test_handle_revert_dry_run_report_has_changes_array() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut journal = netfyr_journal::Journal::open(dir.path()).unwrap();
+        journal.append(make_test_journal_entry()).unwrap(); // gets seq=1
+
+        // Safety: protected by ENV_MUTEX
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
+
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let reconciler = Reconciler::new();
+
+        handle_revert(
+            &mut server,
+            &serde_json::json!({"target_seq": 1u64, "dry_run": true}),
+            &policy_store,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg["parameters"]["report"]["changes"].is_array(),
+            "report.changes must be an array: {msg:?}"
+        );
+    }
+
     /// Scenario: Unknown method returns an error response.
     #[tokio::test]
     async fn test_handle_connection_unknown_method_returns_error() {
