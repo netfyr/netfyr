@@ -17,8 +17,9 @@ use netfyr_backend::FactoryEvent;
 use netfyr_journal::Trigger;
 use netfyr_reconcile::DiffKind;
 use netfyr_varlink::{
-    convert_apply_report_with_conflicts, VarlinkApplyReport, VarlinkChangeEntry, VarlinkDaemonStatus,
-    VarlinkFactoryStatus, VarlinkPolicy, VarlinkSelector, VarlinkState, VarlinkStateDiff,
+    convert_apply_report_with_conflicts, VarlinkApplyReport, VarlinkChangeEntry, VarlinkDaemonInfo,
+    VarlinkDaemonStatus, VarlinkDhcpInfo, VarlinkFactoryStatus, VarlinkInterfaceInfo, VarlinkPolicy,
+    VarlinkPolicyInfo, VarlinkSelector, VarlinkShowInfo, VarlinkState, VarlinkStateDiff,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -531,6 +532,126 @@ async fn handle_revert(
     .await
 }
 
+/// `io.netfyr.GetShowInfo` — return interface-centric system overview.
+async fn handle_get_show_info(
+    stream: &mut UnixStream,
+    policy_store: &PolicyStore,
+    factory_manager: &FactoryManager,
+    reconciler: &Reconciler,
+    start_time: Instant,
+) -> Result<()> {
+    let uptime_secs = start_time.elapsed().as_secs() as i64;
+    let daemon_info = VarlinkDaemonInfo {
+        status: "running".to_string(),
+        uptime_seconds: Some(uptime_secs),
+    };
+
+    // Query all system interfaces via the backend.
+    let state_set = match reconciler.query(None, None).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("GetShowInfo query failed: {}", e);
+            return write_error(stream, "InternalError", &e.to_string()).await;
+        }
+    };
+
+    // Index factory statuses by interface name for O(1) lookup.
+    let factory_by_iface: std::collections::HashMap<String, _> = factory_manager
+        .factory_statuses()
+        .into_iter()
+        .map(|fs| (fs.interface.clone(), fs))
+        .collect();
+
+    // Build per-interface info, deduplicating by name.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut interfaces: Vec<VarlinkInterfaceInfo> = Vec::new();
+
+    for state in state_set.iter() {
+        let name = match &state.selector.name {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+
+        let interface_selector = &state.selector;
+
+        // Find policies that target this interface.
+        let matching_policies: Vec<VarlinkPolicyInfo> = policy_store
+            .policies()
+            .iter()
+            .filter_map(|policy| {
+                let matches = match policy.factory_type {
+                    netfyr_policy::FactoryType::Static => {
+                        let via_state = policy
+                            .state
+                            .as_ref()
+                            .map(|s| s.selector.matches(interface_selector))
+                            .unwrap_or(false);
+                        let via_states = policy
+                            .states
+                            .as_ref()
+                            .map(|ss| ss.iter().any(|s| s.selector.matches(interface_selector)))
+                            .unwrap_or(false);
+                        via_state || via_states
+                    }
+                    netfyr_policy::FactoryType::Dhcpv4 => policy
+                        .selector
+                        .as_ref()
+                        .map(|sel| sel.matches(interface_selector))
+                        .unwrap_or(false),
+                };
+                if matches {
+                    let policy_type = match policy.factory_type {
+                        netfyr_policy::FactoryType::Static => "static",
+                        netfyr_policy::FactoryType::Dhcpv4 => "dhcpv4",
+                    };
+                    Some(VarlinkPolicyInfo {
+                        name: policy.name.clone(),
+                        policy_type: policy_type.to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Build DHCP info if a factory is running for this interface.
+        let dhcp = factory_by_iface.get(&name).map(|fs| {
+            if fs.has_lease {
+                VarlinkDhcpInfo {
+                    state: "running".to_string(),
+                    lease_address: fs.lease_address.clone(),
+                    lease_time_secs: fs.lease_time_secs.map(|v| v as i64),
+                    lease_remaining_secs: fs.lease_remaining_secs.map(|v| v as i64),
+                }
+            } else {
+                VarlinkDhcpInfo {
+                    state: "waiting".to_string(),
+                    lease_address: None,
+                    lease_time_secs: None,
+                    lease_remaining_secs: None,
+                }
+            }
+        });
+
+        interfaces.push(VarlinkInterfaceInfo {
+            name,
+            policies: Some(matching_policies),
+            dhcp,
+        });
+    }
+
+    let show_info = VarlinkShowInfo {
+        daemon: daemon_info,
+        interfaces,
+    };
+
+    write_success(stream, serde_json::json!({ "info": show_info })).await
+}
+
 fn server_trigger_type_str(trigger: &netfyr_journal::Trigger) -> &'static str {
     match trigger {
         netfyr_journal::Trigger::PolicyApply { .. } => "policy_apply",
@@ -643,6 +764,10 @@ async fn handle_connection(
             "io.netfyr.GetJournalEntry" => handle_get_journal_entry(stream, &params).await,
             "io.netfyr.Revert" => {
                 handle_revert(stream, &params, policy_store, reconciler).await
+            }
+            "io.netfyr.GetShowInfo" => {
+                handle_get_show_info(stream, policy_store, factory_manager, reconciler, start_time)
+                    .await
             }
             other => {
                 write_error(
@@ -1482,6 +1607,155 @@ mod tests {
         let msg = read_message(&mut client).await.unwrap();
         let entries = msg["parameters"]["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "count=2 must limit results to 2 entries");
+    }
+
+    // ── GetShowInfo handler ───────────────────────────────────────────────────
+
+    /// Scenario: GetShowInfo returns daemon.status = "running".
+    #[tokio::test]
+    async fn test_handle_get_show_info_daemon_status_is_running() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(
+            &mut server,
+            &policy_store,
+            &factory_manager,
+            &reconciler,
+            start_time,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "GetShowInfo must not return an error: {msg:?}"
+        );
+        let status = msg["parameters"]["info"]["daemon"]["status"]
+            .as_str()
+            .expect("daemon.status must be a string");
+        assert_eq!(status, "running", "daemon.status must be 'running'");
+    }
+
+    /// Scenario: GetShowInfo includes uptime_seconds in the daemon info block.
+    #[tokio::test]
+    async fn test_handle_get_show_info_daemon_uptime_seconds_is_present() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(
+            &mut server,
+            &policy_store,
+            &factory_manager,
+            &reconciler,
+            start_time,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        let uptime = &msg["parameters"]["info"]["daemon"]["uptime_seconds"];
+        assert!(
+            !uptime.is_null(),
+            "daemon.uptime_seconds must be present (not null)"
+        );
+        assert!(
+            uptime.as_i64().unwrap_or(-1) >= 0,
+            "daemon.uptime_seconds must be non-negative"
+        );
+    }
+
+    /// Scenario: GetShowInfo response includes an 'interfaces' array.
+    #[tokio::test]
+    async fn test_handle_get_show_info_interfaces_is_array() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(
+            &mut server,
+            &policy_store,
+            &factory_manager,
+            &reconciler,
+            start_time,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg["parameters"]["info"]["interfaces"].is_array(),
+            "GetShowInfo must return an 'interfaces' array: {msg:?}"
+        );
+    }
+
+    /// Scenario: GetShowInfo response has no 'error' field.
+    #[tokio::test]
+    async fn test_handle_get_show_info_response_has_no_error_field() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy_store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(
+            &mut server,
+            &policy_store,
+            &factory_manager,
+            &reconciler,
+            start_time,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "GetShowInfo must not return an error field: {msg:?}"
+        );
+    }
+
+    /// Scenario: GetShowInfo with a policy matching a system interface includes
+    /// that policy in the interface's policies list.
+    /// Uses a static policy targeting "lo" (always present in any netns).
+    #[tokio::test]
+    async fn test_handle_get_show_info_policies_appear_in_matching_interface() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let lo_policy = make_test_policy("lo-policy");
+        let policy_store = PolicyStore::ephemeral(vec![lo_policy]);
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(
+            &mut server,
+            &policy_store,
+            &factory_manager,
+            &reconciler,
+            start_time,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "GetShowInfo with a policy must not return an error: {msg:?}"
+        );
+        // The response must include the info block with an interfaces array.
+        assert!(
+            msg["parameters"]["info"]["interfaces"].is_array(),
+            "interfaces must be an array: {msg:?}"
+        );
     }
 
     /// Scenario: Unknown method returns an error response.

@@ -14,6 +14,8 @@ method GetJournalEntry(seq: int) -> (entry: ?object)
 
 method Revert(target_seq: int, dry_run: bool) -> (report: ApplyReport, entry_timestamp: string)
 
+method GetShowInfo() -> (info: ShowInfo)
+
 type Policy (
     name: string,
     factory: string,
@@ -97,6 +99,34 @@ type FactoryStatus (
     interface_name: string,
     state: string,
     lease_ip: ?string
+)
+
+type ShowInfo (
+    daemon: DaemonInfo,
+    interfaces: []InterfaceInfo
+)
+
+type DaemonInfo (
+    status: string,
+    uptime_seconds: ?int
+)
+
+type InterfaceInfo (
+    name: string,
+    policies: ?[]PolicyInfo,
+    dhcp: ?DhcpInfo
+)
+
+type PolicyInfo (
+    name: string,
+    type: string
+)
+
+type DhcpInfo (
+    state: string,
+    lease_address: ?string,
+    lease_time_secs: ?int,
+    lease_remaining_secs: ?int
 )
 
 error InvalidPolicy (reason: string)

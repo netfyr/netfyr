@@ -12,8 +12,8 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 use crate::types::{
-    VarlinkApplyReport, VarlinkDaemonStatus, VarlinkPolicy, VarlinkSelector, VarlinkState,
-    VarlinkStateDiff,
+    VarlinkApplyReport, VarlinkDaemonStatus, VarlinkPolicy, VarlinkSelector, VarlinkShowInfo,
+    VarlinkState, VarlinkStateDiff,
 };
 
 /// Maximum allowed response size (16 MiB). Prevents unbounded memory growth
@@ -196,6 +196,15 @@ impl VarlinkClient {
         let response = self.call("io.netfyr.GetStatus", serde_json::json!({})).await?;
         serde_json::from_value(response["status"].clone()).map_err(|e| {
             VarlinkError::Protocol(format!("failed to decode DaemonStatus: {e}"))
+        })
+    }
+
+    /// Get system overview: daemon status and per-interface details with matching
+    /// policies and DHCP state.
+    pub async fn get_show_info(&mut self) -> Result<VarlinkShowInfo, VarlinkError> {
+        let response = self.call("io.netfyr.GetShowInfo", serde_json::json!({})).await?;
+        serde_json::from_value(response["info"].clone()).map_err(|e| {
+            VarlinkError::Protocol(format!("failed to decode ShowInfo: {e}"))
         })
     }
 
@@ -880,6 +889,106 @@ mod tests {
                 "error reason must identify the missing entry; got: {msg}"
             );
         }
+        server.await.unwrap();
+    }
+
+    // ── Scenario: GetShowInfo ─────────────────────────────────────────────────
+
+    /// Scenario: GetShowInfo returns system overview — daemon.status = "running",
+    /// uptime_seconds >= 60, 3 interfaces, eth0 has policies and dhcp with lease.
+    #[tokio::test]
+    async fn test_get_show_info_sends_correct_method_and_returns_show_info() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let show_info_params = serde_json::json!({
+            "info": {
+                "daemon": {
+                    "status": "running",
+                    "uptime_seconds": 120
+                },
+                "interfaces": [
+                    {
+                        "name": "eth0",
+                        "policies": [{"name": "eth0-mtu", "type": "static"}],
+                        "dhcp": {
+                            "state": "running",
+                            "lease_address": "192.168.1.100/24",
+                            "lease_time_secs": 3600,
+                            "lease_remaining_secs": 1800
+                        }
+                    },
+                    {
+                        "name": "eth1",
+                        "policies": [],
+                        "dhcp": null
+                    },
+                    {
+                        "name": "lo",
+                        "policies": null,
+                        "dhcp": null
+                    }
+                ]
+            }
+        });
+        let server = spawn_mock_server(path.clone(), show_info_params);
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.get_show_info().await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let info = result.unwrap();
+        assert_eq!(info.daemon.status, "running", "daemon.status must be 'running'");
+        assert!(
+            info.daemon.uptime_seconds.unwrap_or(0) >= 60,
+            "daemon.uptime_seconds must be >= 60, got {:?}",
+            info.daemon.uptime_seconds
+        );
+        assert_eq!(info.interfaces.len(), 3, "must have 3 interfaces");
+
+        // eth0 has policies and dhcp with lease fields present.
+        let eth0 = info.interfaces.iter().find(|i| i.name == "eth0")
+            .expect("eth0 must be in interfaces");
+        assert!(eth0.policies.is_some(), "eth0 must have a policies array");
+        assert!(eth0.dhcp.is_some(), "eth0 must have dhcp info");
+        let dhcp = eth0.dhcp.as_ref().unwrap();
+        assert_eq!(dhcp.state, "running", "eth0 dhcp.state must be 'running'");
+        assert!(dhcp.lease_address.is_some(), "eth0 dhcp.lease_address must be present when running");
+        assert!(dhcp.lease_time_secs.is_some(), "eth0 dhcp.lease_time_secs must be present when running");
+        assert!(dhcp.lease_remaining_secs.is_some(), "eth0 dhcp.lease_remaining_secs must be present when running");
+
+        // lo has no policies (None) and no dhcp.
+        let lo = info.interfaces.iter().find(|i| i.name == "lo")
+            .expect("lo must be in interfaces");
+        assert!(lo.dhcp.is_none(), "lo must not have dhcp info");
+
+        let req = server.await.unwrap();
+        assert_eq!(
+            req["method"].as_str(),
+            Some("io.netfyr.GetShowInfo"),
+            "method must be io.netfyr.GetShowInfo"
+        );
+    }
+
+    /// GetShowInfo with a daemon error response returns VarlinkError::Internal.
+    #[tokio::test]
+    async fn test_get_show_info_internal_error_response_returns_internal_variant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_error_server(
+            path.clone(),
+            "io.netfyr.InternalError",
+            "backend query failed",
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.get_show_info().await;
+
+        assert!(
+            matches!(result, Err(VarlinkError::Internal(_))),
+            "expected Internal error for GetShowInfo backend failure, got {result:?}"
+        );
         server.await.unwrap();
     }
 

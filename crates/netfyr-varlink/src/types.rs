@@ -531,6 +531,59 @@ pub fn json_to_state_fields(
     Ok(result)
 }
 
+// ── VarlinkShowInfo ───────────────────────────────────────────────────────────
+
+/// Wire-format response for `GetShowInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VarlinkShowInfo {
+    pub daemon: VarlinkDaemonInfo,
+    pub interfaces: Vec<VarlinkInterfaceInfo>,
+}
+
+/// Wire-format daemon information within `GetShowInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VarlinkDaemonInfo {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<i64>,
+}
+
+/// Wire-format per-interface information within `GetShowInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VarlinkInterfaceInfo {
+    pub name: String,
+    /// Absent when in daemon-free mode (CLI fabricates locally).
+    /// Present but possibly empty when the daemon has policy data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policies: Option<Vec<VarlinkPolicyInfo>>,
+    /// Present only for interfaces with a DHCP factory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcp: Option<VarlinkDhcpInfo>,
+}
+
+/// Wire-format policy reference within `InterfaceInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VarlinkPolicyInfo {
+    pub name: String,
+    /// Factory type: `"static"` or `"dhcpv4"`. Uses `#[serde(rename)]`
+    /// because `type` is a reserved keyword in Rust.
+    #[serde(rename = "type")]
+    pub policy_type: String,
+}
+
+/// Wire-format DHCP state within `InterfaceInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VarlinkDhcpInfo {
+    /// `"running"` when a lease is active, `"waiting"` otherwise.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_time_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_remaining_secs: Option<i64>,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1346,6 +1399,72 @@ mod tests {
         let diff = ReconcileStateDiff { operations: vec![] };
         let vdiff = VarlinkStateDiff::from(diff);
         assert!(vdiff.operations.is_empty(), "empty ReconcileStateDiff must produce empty VarlinkStateDiff");
+    }
+
+    // ── Interface definition file ─────────────────────────────────────────────
+
+    /// Scenario: Interface definition file is valid — defines the 4 required
+    /// methods: SubmitPolicies, Query, DryRun, GetShowInfo.
+    #[test]
+    fn test_varlink_interface_file_defines_required_methods() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let varlink_file = std::path::Path::new(manifest_dir)
+            .join("src")
+            .join("io.netfyr.varlink");
+
+        let content = std::fs::read_to_string(&varlink_file)
+            .expect("io.netfyr.varlink must exist and be readable");
+
+        assert!(
+            content.contains("interface io.netfyr"),
+            "interface must be named 'io.netfyr'"
+        );
+
+        for method in &["SubmitPolicies", "Query", "DryRun", "GetShowInfo"] {
+            assert!(
+                content.contains(&format!("method {method}")),
+                "interface must define method '{method}'"
+            );
+        }
+    }
+
+    /// Interface definition file defines the 3 standard error types.
+    #[test]
+    fn test_varlink_interface_file_defines_required_error_types() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let varlink_file = std::path::Path::new(manifest_dir)
+            .join("src")
+            .join("io.netfyr.varlink");
+
+        let content = std::fs::read_to_string(&varlink_file)
+            .expect("io.netfyr.varlink must exist and be readable");
+
+        for error in &["InvalidPolicy", "BackendError", "InternalError"] {
+            assert!(
+                content.contains(&format!("error {error}")),
+                "interface must define error '{error}'"
+            );
+        }
+    }
+
+    /// Interface definition file defines key composite types (Policy, Selector,
+    /// ApplyReport, StateDiff, ShowInfo).
+    #[test]
+    fn test_varlink_interface_file_defines_required_composite_types() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let varlink_file = std::path::Path::new(manifest_dir)
+            .join("src")
+            .join("io.netfyr.varlink");
+
+        let content = std::fs::read_to_string(&varlink_file)
+            .expect("io.netfyr.varlink must exist and be readable");
+
+        for type_name in &["Policy", "Selector", "ApplyReport", "StateDiff", "ShowInfo"] {
+            assert!(
+                content.contains(&format!("type {type_name}")),
+                "interface must define type '{type_name}'"
+            );
+        }
     }
 }
 

@@ -9,9 +9,10 @@ pub mod types;
 
 pub use client::{VarlinkClient, VarlinkError};
 pub use types::{
-    VarlinkApplyReport, VarlinkChangeEntry, VarlinkConflictEntry, VarlinkDaemonStatus,
-    VarlinkDiffOperation, VarlinkFactoryStatus, VarlinkFieldChange, VarlinkPolicy,
-    VarlinkSelector, VarlinkState, VarlinkStateDef, VarlinkStateDiff,
+    VarlinkApplyReport, VarlinkChangeEntry, VarlinkConflictEntry, VarlinkDaemonInfo,
+    VarlinkDaemonStatus, VarlinkDhcpInfo, VarlinkDiffOperation, VarlinkFactoryStatus,
+    VarlinkFieldChange, VarlinkInterfaceInfo, VarlinkPolicy, VarlinkPolicyInfo,
+    VarlinkSelector, VarlinkShowInfo, VarlinkState, VarlinkStateDef, VarlinkStateDiff,
     convert_apply_report_with_conflicts, json_to_state_fields, json_to_value,
     state_fields_to_json, value_to_json,
 };
@@ -61,8 +62,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            method_count, 7,
-            "Interface must define exactly 7 methods (SubmitPolicies, Query, DryRun, GetStatus, GetHistory, GetJournalEntry, Revert), found {method_count}"
+            method_count, 8,
+            "Interface must define exactly 8 methods (SubmitPolicies, Query, DryRun, GetStatus, GetHistory, GetJournalEntry, Revert, GetShowInfo), found {method_count}"
         );
     }
 

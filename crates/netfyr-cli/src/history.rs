@@ -216,10 +216,17 @@ async fn run_history_daemon(
         return Ok(ExitCode::from(0u8));
     }
 
-    let entries: Vec<JournalEntry> = raw_entries
+    let mut entries: Vec<JournalEntry> = raw_entries
         .into_iter()
         .map(|v| serde_json::from_value(v).context("failed to deserialize journal entry"))
         .collect::<Result<Vec<_>>>()?;
+
+    // The Varlink API only accepts a single selector_name filter. When multiple
+    // selectors were provided, apply the remaining ones client-side so daemon
+    // mode is behaviourally identical to local mode.
+    if args.selector.len() > 1 {
+        entries.retain(|e| matches_selector(e, &args.selector));
+    }
 
     print_list(&entries, &args.output, args.absolute_timestamps)?;
     Ok(ExitCode::from(0u8))
@@ -3382,26 +3389,26 @@ mod tests {
 
     // ── format_text_list: column width caps ───────────────────────────────────
 
-    /// AC: Trigger column value exceeding 14 chars is truncated with "…".
+    /// AC: Trigger column value exceeding 24 chars (CAP_TRIG) is truncated with "…".
     #[test]
-    fn test_format_text_list_trigger_column_truncated_at_cap_when_exceeds_14_chars() {
+    fn test_format_text_list_trigger_column_truncated_at_cap_when_exceeds_max_width() {
         let mut entry = make_entry();
         entry.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
-        // Use a policy name that would make the trigger text exceed 14 chars
-        // "apply (very-long-policy-name)" is >14 chars
+        // Use a policy name that would make the trigger text exceed 24 chars
+        // "apply (very-long-policy-name)" is >24 chars
         entry.active_policies = vec![PolicySummary {
-            name: "very-long-policy-name-exceeding-14".to_string(),
+            name: "very-long-policy-name-exceeding-24".to_string(),
             factory_type: "static".to_string(),
             priority: 100,
         }];
         let output = format_text_list(&[entry], false);
         let data_row = output.lines().nth(1).unwrap();
         let plain_row = strip_ansi(data_row);
-        // The trigger column should be capped at 14 chars; if it exceeded, it's truncated with …
+        // The trigger column should be capped at 24 chars; if it exceeded, it's truncated with …
         // The column appears after SEQ and TIMESTAMP columns
         assert!(
             plain_row.contains('…') || plain_row.contains("apply ("),
-            "trigger text exceeding 14 chars should be truncated with '…', got: {}",
+            "trigger text exceeding 24 chars should be truncated with '…', got: {}",
             plain_row
         );
     }
