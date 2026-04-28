@@ -274,6 +274,9 @@ async fn handle_get_status(
             interface_name: fs.interface,
             state: if fs.has_lease { "running" } else { "waiting" }.to_string(),
             lease_ip: fs.lease_ip,
+            lease_address: fs.lease_address,
+            lease_time_secs: fs.lease_time_secs.map(|v| v as i64),
+            lease_remaining_secs: fs.lease_remaining_secs.map(|v| v as i64),
         })
         .collect();
 

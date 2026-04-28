@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use netfyr_backend::{Dhcpv4Factory, FactoryEvent};
+use netfyr_backend::{Dhcpv4Factory, FactoryEvent, LeaseTimingInfo};
 use netfyr_policy::{FactoryType, Policy};
 use netfyr_state::State;
 use tokio::sync::mpsc;
@@ -23,6 +23,12 @@ pub struct FactoryStatus {
     pub has_lease: bool,
     /// The acquired IP address (without prefix length), if a lease is active.
     pub lease_ip: Option<String>,
+    /// Full CIDR address from the lease (e.g., `"192.168.122.63/24"`).
+    pub lease_address: Option<String>,
+    /// Total lease duration in seconds.
+    pub lease_time_secs: Option<u32>,
+    /// Seconds remaining until lease expiry, computed at query time.
+    pub lease_remaining_secs: Option<u64>,
 }
 
 // ── FactoryManager ────────────────────────────────────────────────────────────
@@ -205,16 +211,34 @@ impl FactoryManager {
                     .as_ref()
                     .is_some_and(|s| s.fields.contains_key("addresses"));
                 // Extract the bare IP (without /prefix) from the "addresses" field.
-                let lease_ip = current.and_then(|s| {
+                let lease_ip = current.as_ref().and_then(|s| {
                     let addr_list = s.fields.get("addresses")?.value.as_list()?.first()?.as_str()?;
                     // "10.0.1.50/24" → "10.0.1.50"
                     Some(addr_list.split('/').next().unwrap_or(addr_list).to_string())
                 });
+                // Extract full CIDR address from the "addresses" field.
+                let lease_address = current.and_then(|s| {
+                    let addr_str = s.fields.get("addresses")?.value.as_list()?.first()?.as_str()?;
+                    Some(addr_str.to_string())
+                });
+                // Read lease timing and compute remaining seconds.
+                let timing: Option<LeaseTimingInfo> = factory.lease_timing();
+                let (lease_time_secs, lease_remaining_secs) = match timing {
+                    Some(info) => {
+                        let remaining = (info.lease_time_secs as u64)
+                            .saturating_sub(info.acquired_at.elapsed().as_secs());
+                        (Some(info.lease_time_secs), Some(remaining))
+                    }
+                    None => (None, None),
+                };
                 FactoryStatus {
                     policy_name: name.clone(),
                     interface: factory.interface().to_string(),
                     has_lease,
                     lease_ip,
+                    lease_address,
+                    lease_time_secs,
+                    lease_remaining_secs,
                 }
             })
             .collect()

@@ -11,6 +11,7 @@ pub mod lease;
 pub use lease::DhcpLease;
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use futures::TryStreamExt;
 use rtnetlink::new_connection;
 
@@ -42,6 +43,19 @@ pub async fn interface_exists(interface: &str) -> bool {
         .execute();
 
     matches!(links.try_next().await, Ok(Some(_)))
+}
+
+// ── LeaseTimingInfo ───────────────────────────────────────────────────────────
+
+/// Timing metadata for an active DHCP lease. Stored alongside the produced
+/// `State` so that `GetStatus` can compute how long the lease lasts and how
+/// much time remains without needing to re-parse the `State` fields.
+#[derive(Clone, Copy, Debug)]
+pub struct LeaseTimingInfo {
+    /// Total lease duration in seconds as granted by the DHCP server (option 51).
+    pub lease_time_secs: u32,
+    /// The monotonic instant at which the lease was acquired or last renewed.
+    pub acquired_at: Instant,
 }
 
 // ── FactoryEvent ──────────────────────────────────────────────────────────────
@@ -86,6 +100,9 @@ pub struct Dhcpv4Factory {
     /// Shared reference to the latest produced State, if any.
     /// Updated by the background task; read by `current_state()`.
     state: Arc<Mutex<Option<State>>>,
+    /// Shared reference to the active lease timing info, if any.
+    /// Updated at the same points as `state`; read by `lease_timing()`.
+    lease_timing: Arc<Mutex<Option<LeaseTimingInfo>>>,
     /// One-shot channel sender for sending the stop signal to the background task.
     stop_tx: Option<oneshot::Sender<()>>,
     /// Handle to the background task, used to await clean termination.
@@ -118,9 +135,11 @@ impl Dhcpv4Factory {
         // might leave the interface down.
         let initial_state = Some(pending_state(interface, &policy_name, priority));
         let shared_state: Arc<Mutex<Option<State>>> = Arc::new(Mutex::new(initial_state));
+        let lease_timing: Arc<Mutex<Option<LeaseTimingInfo>>> = Arc::new(Mutex::new(None));
         let (stop_tx, stop_rx) = oneshot::channel();
 
         let task_shared_state = Arc::clone(&shared_state);
+        let task_lease_timing = Arc::clone(&lease_timing);
         let task_interface = interface.to_string();
         let task_policy_name = policy_name.clone();
 
@@ -132,6 +151,7 @@ impl Dhcpv4Factory {
                 state_tx,
                 task_shared_state,
                 stop_rx,
+                task_lease_timing,
             )
             .await;
         });
@@ -139,6 +159,7 @@ impl Dhcpv4Factory {
         Ok(Self {
             interface: interface.to_string(),
             state: shared_state,
+            lease_timing,
             stop_tx: Some(stop_tx),
             task_handle: Some(task_handle),
         })
@@ -170,6 +191,12 @@ impl Dhcpv4Factory {
     /// mutex across caller code (which would require a lock guard in the API).
     pub fn current_state(&self) -> Option<State> {
         self.state.lock().unwrap().clone()
+    }
+
+    /// Returns a copy of the current lease timing info, or `None` if no lease
+    /// has been acquired yet or the factory is in the waiting/expired state.
+    pub fn lease_timing(&self) -> Option<LeaseTimingInfo> {
+        *self.lease_timing.lock().unwrap()
     }
 
     /// Returns the network interface name this factory manages.

@@ -454,6 +454,18 @@ pub struct VarlinkFactoryStatus {
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_ip: Option<String>,
+    /// Full CIDR address from the lease (e.g., `"192.168.122.63/24"`).
+    /// Present when state is `"running"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lease_address: Option<String>,
+    /// Total lease duration in seconds as granted by the DHCP server.
+    /// Present when state is `"running"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lease_time_secs: Option<i64>,
+    /// Seconds until the lease expires, computed at query time.
+    /// Present when state is `"running"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lease_remaining_secs: Option<i64>,
 }
 
 // ── VarlinkDaemonStatus ───────────────────────────────────────────────────────

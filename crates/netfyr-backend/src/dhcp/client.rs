@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use netfyr_state::State;
 
 use crate::dhcp::lease::DhcpLease;
-use crate::dhcp::{lease_to_state, FactoryEvent};
+use crate::dhcp::{lease_to_state, FactoryEvent, LeaseTimingInfo};
 use crate::BackendError;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -53,6 +53,7 @@ pub(crate) async fn run_dhcp_client(
     state_tx: mpsc::Sender<FactoryEvent>,
     shared_state: Arc<Mutex<Option<State>>>,
     stop_rx: oneshot::Receiver<()>,
+    lease_timing: Arc<Mutex<Option<LeaseTimingInfo>>>,
 ) {
     let mut stop_rx = stop_rx;
 
@@ -92,6 +93,7 @@ pub(crate) async fn run_dhcp_client(
         priority,
         state_tx,
         shared_state,
+        lease_timing,
     };
     run_state_machine(ctx, &mut stop_rx).await;
 }
@@ -108,6 +110,7 @@ struct DhcpContext {
     priority: u32,
     state_tx: mpsc::Sender<FactoryEvent>,
     shared_state: Arc<Mutex<Option<State>>>,
+    lease_timing: Arc<Mutex<Option<LeaseTimingInfo>>>,
 }
 
 async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>) {
@@ -119,6 +122,7 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
         priority,
         state_tx,
         shared_state,
+        lease_timing,
     } = ctx;
     let mut backoff = INITIAL_BACKOFF;
 
@@ -295,6 +299,13 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
             let mut guard = shared_state.lock().unwrap();
             *guard = Some(state.clone());
         }
+        {
+            let mut timing_guard = lease_timing.lock().unwrap();
+            *timing_guard = Some(LeaseTimingInfo {
+                lease_time_secs: lease.lease_time,
+                acquired_at: lease.acquired_at,
+            });
+        }
 
         if state_tx
             .send(FactoryEvent::LeaseAcquired {
@@ -316,6 +327,7 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
             priority,
             &state_tx,
             &shared_state,
+            &lease_timing,
             stop_rx,
             lease,
         )
@@ -325,12 +337,18 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
             LeaseMaintOutcome::Stop => {
                 let mut guard = shared_state.lock().unwrap();
                 *guard = None;
+                let mut timing_guard = lease_timing.lock().unwrap();
+                *timing_guard = None;
                 return;
             }
             LeaseMaintOutcome::Expired => {
                 {
                     let mut guard = shared_state.lock().unwrap();
                     *guard = None;
+                }
+                {
+                    let mut timing_guard = lease_timing.lock().unwrap();
+                    *timing_guard = None;
                 }
                 let _ = state_tx
                     .send(FactoryEvent::LeaseExpired {
@@ -359,6 +377,7 @@ async fn run_lease_maintenance(
     priority: u32,
     state_tx: &mpsc::Sender<FactoryEvent>,
     shared_state: &Arc<Mutex<Option<State>>>,
+    lease_timing: &Arc<Mutex<Option<LeaseTimingInfo>>>,
     stop_rx: &mut oneshot::Receiver<()>,
     mut lease: DhcpLease,
 ) -> LeaseMaintOutcome {
@@ -383,6 +402,13 @@ async fn run_lease_maintenance(
                         let mut guard = shared_state.lock().unwrap();
                         *guard = Some(state.clone());
                     }
+                    {
+                        let mut timing_guard = lease_timing.lock().unwrap();
+                        *timing_guard = Some(LeaseTimingInfo {
+                            lease_time_secs: lease.lease_time,
+                            acquired_at: lease.acquired_at,
+                        });
+                    }
                     let _ = state_tx
                         .send(FactoryEvent::LeaseRenewed {
                             policy_name: policy_name.to_string(),
@@ -399,6 +425,13 @@ async fn run_lease_maintenance(
                     {
                         let mut guard = shared_state.lock().unwrap();
                         *guard = Some(state.clone());
+                    }
+                    {
+                        let mut timing_guard = lease_timing.lock().unwrap();
+                        *timing_guard = Some(LeaseTimingInfo {
+                            lease_time_secs: lease.lease_time,
+                            acquired_at: lease.acquired_at,
+                        });
                     }
                     let _ = state_tx
                         .send(FactoryEvent::LeaseRenewed {

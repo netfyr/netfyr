@@ -10,6 +10,7 @@ pub mod diagnose;
 pub mod history;
 pub mod query;
 pub mod revert;
+pub mod show;
 
 pub use apply::run_apply;
 pub use completions::run_completions;
@@ -17,6 +18,7 @@ pub use diagnose::run_diagnose;
 pub use history::run_history;
 pub use query::run_query;
 pub use revert::run_revert;
+pub use show::run_show;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -335,6 +337,12 @@ pub enum Commands {
     /// network problems. Reports findings with severity and suggested
     /// corrective actions.
     Diagnose(diagnose::DiagnoseArgs),
+
+    /// Show system overview
+    ///
+    /// Display daemon status, all network interfaces, and their active
+    /// policies and DHCP lease state. Works with or without the daemon.
+    Show(show::ShowArgs),
 
     /// Generate shell completion scripts
     ///

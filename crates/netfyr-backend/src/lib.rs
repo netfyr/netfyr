@@ -8,7 +8,7 @@ pub mod registry;
 pub mod report;
 pub mod trait_;
 
-pub use dhcp::{interface_exists, lease_to_state, Dhcpv4Factory, DhcpLease, FactoryEvent};
+pub use dhcp::{interface_exists, lease_to_state, Dhcpv4Factory, DhcpLease, FactoryEvent, LeaseTimingInfo};
 pub use registry::BackendRegistry;
 pub use report::{
     AppliedOperation, ApplyReport, DiffOpKind, DryRunReport, FailedOperation, FieldChange,
