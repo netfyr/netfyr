@@ -187,12 +187,14 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
         let policies_vec: Vec<netfyr_policy::Policy> = policy_set.iter().cloned().collect();
         match Journal::open_default() {
             Ok(mut journal) => {
+                let mut serializable_diff = SerializableDiff::from(&reconcile_diff);
+                apply_outcomes(&mut serializable_diff, &apply_report);
                 let entry = JournalEntry {
                     seq: 0,
                     timestamp: chrono::Utc::now(),
                     trigger: Trigger::PolicyApply { source },
                     active_policies: summarize_policies(&policies_vec),
-                    diff: SerializableDiff::from(&reconcile_diff),
+                    diff: serializable_diff,
                     state_after: SerializableStateSet::from(effective_state),
                     outcome: ApplyOutcome::Applied {
                         succeeded: apply_report.succeeded.len() as u32,
@@ -728,6 +730,54 @@ fn display_varlink_diff(diff: &VarlinkStateDiff, is_empty: bool) {
                     );
                 }
                 _ => {}
+            }
+        }
+    }
+}
+
+// ── Journal helpers ───────────────────────────────────────────────────────────
+
+/// Map per-entity apply results onto the field changes in a `SerializableDiff`.
+///
+/// `ApplyReport` tracks outcomes at entity-operation granularity. When an entity
+/// succeeds, all its fields are "applied"; when it fails, all are "failed". Any
+/// diff operation not present in any report category defaults to "skipped".
+fn apply_outcomes(diff: &mut SerializableDiff, report: &ApplyReport) {
+    for applied in &report.succeeded {
+        let key = applied.selector.key();
+        for op in &mut diff.operations {
+            if op.entity_type == applied.entity_type && op.entity_name == key {
+                for fc in &mut op.field_changes {
+                    fc.outcome = Some("applied".to_string());
+                }
+            }
+        }
+    }
+    for failed in &report.failed {
+        let key = failed.selector.key();
+        for op in &mut diff.operations {
+            if op.entity_type == failed.entity_type && op.entity_name == key {
+                for fc in &mut op.field_changes {
+                    fc.outcome = Some("failed".to_string());
+                }
+            }
+        }
+    }
+    for skipped in &report.skipped {
+        let key = skipped.selector.key();
+        for op in &mut diff.operations {
+            if op.entity_type == skipped.entity_type && op.entity_name == key {
+                for fc in &mut op.field_changes {
+                    fc.outcome = Some("skipped".to_string());
+                }
+            }
+        }
+    }
+    // Unmatched operations default to "skipped".
+    for op in &mut diff.operations {
+        for fc in &mut op.field_changes {
+            if fc.outcome.is_none() {
+                fc.outcome = Some("skipped".to_string());
             }
         }
     }
@@ -1274,6 +1324,187 @@ mod tests {
         });
         let conflicts = empty_conflict_report();
         display_apply_report(&report, &conflicts);
+    }
+
+    // ── apply_outcomes tests ──────────────────────────────────────────────────
+    //
+    // AC: apply_outcomes maps per-field results onto diff.
+
+    use netfyr_backend::SkippedOperation;
+    use netfyr_journal::{SerializableDiff, SerializableDiffOp, SerializableFieldChange};
+
+    fn make_skipped(entity_type: &str, name: &str) -> SkippedOperation {
+        SkippedOperation {
+            operation: DiffOpKind::Modify,
+            entity_type: entity_type.to_string(),
+            selector: Selector::with_name(name),
+            reason: "already in desired state".to_string(),
+        }
+    }
+
+    fn make_diff_op(entity_type: &str, entity_name: &str, field_name: &str) -> SerializableDiffOp {
+        SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: entity_type.to_string(),
+            entity_name: entity_name.to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: field_name.to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!(1500u64)),
+                desired: Some(serde_json::json!(9000u64)),
+                outcome: None,
+            }],
+        }
+    }
+
+    /// AC: apply_outcomes sets outcome="applied" for succeeded entities,
+    /// "failed" for failed entities, and "skipped" for skipped entities.
+    #[test]
+    fn test_apply_outcomes_maps_per_entity_results_to_field_outcomes() {
+        let mut diff = SerializableDiff {
+            operations: vec![
+                make_diff_op("ethernet", "eth0", "mtu"),      // will succeed
+                make_diff_op("ethernet", "eth1", "addresses"), // will fail
+                make_diff_op("ethernet", "eth2", "routes"),    // will be skipped
+            ],
+        };
+
+        let mut report = ApplyReport::new();
+        report.succeeded.push(make_applied("ethernet", "eth0"));
+        report.failed.push(make_failed("ethernet", "eth1"));
+        report.skipped.push(make_skipped("ethernet", "eth2"));
+
+        apply_outcomes(&mut diff, &report);
+
+        let eth0_op = diff.operations.iter().find(|op| op.entity_name == "eth0").unwrap();
+        assert_eq!(
+            eth0_op.field_changes[0].outcome.as_deref(),
+            Some("applied"),
+            "eth0 mtu field must have outcome='applied' after succeed"
+        );
+
+        let eth1_op = diff.operations.iter().find(|op| op.entity_name == "eth1").unwrap();
+        assert_eq!(
+            eth1_op.field_changes[0].outcome.as_deref(),
+            Some("failed"),
+            "eth1 addresses field must have outcome='failed' after failure"
+        );
+
+        let eth2_op = diff.operations.iter().find(|op| op.entity_name == "eth2").unwrap();
+        assert_eq!(
+            eth2_op.field_changes[0].outcome.as_deref(),
+            Some("skipped"),
+            "eth2 routes field must have outcome='skipped' after skip"
+        );
+    }
+
+    /// AC: apply_outcomes sets unmatched operations to "skipped" by default.
+    #[test]
+    fn test_apply_outcomes_unmatched_operations_default_to_skipped() {
+        let mut diff = SerializableDiff {
+            operations: vec![make_diff_op("ethernet", "eth99", "mtu")],
+        };
+
+        // Empty report — eth99 not in any result category.
+        let report = ApplyReport::new();
+        apply_outcomes(&mut diff, &report);
+
+        assert_eq!(
+            diff.operations[0].field_changes[0].outcome.as_deref(),
+            Some("skipped"),
+            "unmatched operation (not in any result category) must default to outcome='skipped'"
+        );
+    }
+
+    /// AC: apply_outcomes handles multiple field changes per entity, setting all to the same outcome.
+    #[test]
+    fn test_apply_outcomes_sets_all_field_changes_in_entity_to_same_outcome() {
+        let mut diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1500u64)),
+                        desired: Some(serde_json::json!(9000u64)),
+                        outcome: None,
+                    },
+                    SerializableFieldChange {
+                        field_name: "addresses".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!(["10.0.0.1/24"])),
+                        outcome: None,
+                    },
+                    SerializableFieldChange {
+                        field_name: "routes".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!([])),
+                        outcome: None,
+                    },
+                ],
+            }],
+        };
+
+        let mut report = ApplyReport::new();
+        report.succeeded.push(make_applied("ethernet", "eth0"));
+
+        apply_outcomes(&mut diff, &report);
+
+        for fc in &diff.operations[0].field_changes {
+            assert_eq!(
+                fc.outcome.as_deref(),
+                Some("applied"),
+                "all field changes in a succeeded entity must have outcome='applied', field={}",
+                fc.field_name
+            );
+        }
+    }
+
+    /// AC: apply_outcomes on an empty report with an empty diff produces no panics.
+    #[test]
+    fn test_apply_outcomes_empty_diff_and_empty_report_no_panic() {
+        let mut diff = SerializableDiff { operations: vec![] };
+        let report = ApplyReport::new();
+        apply_outcomes(&mut diff, &report);
+        assert!(diff.operations.is_empty());
+    }
+
+    /// AC: apply_outcomes only matches operations by entity_type AND entity_name.
+    /// Same name but different entity_type must not match.
+    #[test]
+    fn test_apply_outcomes_entity_type_is_used_in_matching() {
+        let mut diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "bond".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![SerializableFieldChange {
+                    field_name: "mtu".to_string(),
+                    change_kind: "set".to_string(),
+                    current: None,
+                    desired: Some(serde_json::json!(9000u64)),
+                    outcome: None,
+                }],
+            }],
+        };
+
+        // Report has "ethernet/eth0" succeeded — but diff has "bond/eth0" → no match.
+        let mut report = ApplyReport::new();
+        report.succeeded.push(make_applied("ethernet", "eth0"));
+
+        apply_outcomes(&mut diff, &report);
+
+        // bond/eth0 was not matched by ethernet/eth0 → defaults to "skipped".
+        assert_eq!(
+            diff.operations[0].field_changes[0].outcome.as_deref(),
+            Some("skipped"),
+            "diff entity with different entity_type must not match a report entry; should default to 'skipped'"
+        );
     }
 
     // ── validate_policies tests ───────────────────────────────────────────────

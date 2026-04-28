@@ -632,6 +632,82 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// AC: Journal write failure does not affect apply exit code.
+    /// Verify that Journal::open() returns Err when the directory is not writable
+    /// so that callers (apply.rs and reconciler.rs) can handle the failure non-fatally.
+    ///
+    /// NOTE: if this test is run as root, the read-only permission is ineffective
+    /// and the test is skipped gracefully to avoid false failures.
+    #[test]
+    fn test_journal_open_returns_error_for_nonwritable_directory() {
+        let dir = temp_dir();
+        let read_only_dir = dir.join("readonly");
+        std::fs::create_dir_all(&read_only_dir).unwrap();
+
+        // Make the directory read-only.
+        let mut perms = std::fs::metadata(&read_only_dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&read_only_dir, perms).unwrap();
+
+        let result = Journal::open(&read_only_dir);
+
+        // Restore permissions so cleanup can proceed.
+        let mut restore = std::fs::metadata(&read_only_dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        restore.set_readonly(false);
+        std::fs::set_permissions(&read_only_dir, restore).ok();
+
+        // If running as root, open may succeed — skip the assertion.
+        if unsafe { libc::getuid() } == 0 {
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        assert!(
+            result.is_err(),
+            "Journal::open() must return Err for a non-writable directory so callers can handle it non-fatally"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: Journal write failure does not affect apply exit code.
+    /// Verify that appending to a journal where the file is not writable returns Err,
+    /// not a panic, so callers can degrade gracefully with a warning.
+    #[test]
+    fn test_journal_append_returns_error_when_file_is_not_writable() {
+        let dir = temp_dir();
+        let mut journal = Journal::open(&dir).unwrap();
+
+        // Write one entry to create current.ndjson.
+        journal.append(make_entry()).unwrap();
+
+        // Make current.ndjson read-only.
+        let current_path = dir.join("current.ndjson");
+        let mut perms = std::fs::metadata(&current_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&current_path, perms).unwrap();
+
+        let result = journal.append(make_entry());
+
+        // Restore permissions so cleanup can proceed.
+        let mut restore = std::fs::metadata(&current_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        restore.set_readonly(false);
+        std::fs::set_permissions(&current_path, restore).ok();
+
+        // If running as root, the write may succeed — skip the assertion.
+        if unsafe { libc::getuid() } == 0 {
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        assert!(
+            result.is_err(),
+            "Journal::append() must return Err when current.ndjson is not writable so callers can degrade gracefully"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// read_recent with count larger than total entries returns all entries.
     #[test]
     fn test_read_recent_with_count_larger_than_total_returns_all() {

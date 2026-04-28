@@ -22,6 +22,8 @@ pub struct SerializableFieldChange {
     pub change_kind: String,
     pub current: Option<serde_json::Value>,
     pub desired: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,18 +115,21 @@ impl From<&ReconcileStateDiff> for SerializableDiff {
                             change_kind: "set".to_string(),
                             current: current.as_ref().map(|fv| value_to_json(&fv.value)),
                             desired: Some(value_to_json(&desired.value)),
+                            outcome: None,
                         },
                         FieldChangeKind::Unset { current } => SerializableFieldChange {
                             field_name: fc.field_name.clone(),
                             change_kind: "unset".to_string(),
                             current: Some(value_to_json(&current.value)),
                             desired: None,
+                            outcome: None,
                         },
                         FieldChangeKind::Unchanged { value } => SerializableFieldChange {
                             field_name: fc.field_name.clone(),
                             change_kind: "unchanged".to_string(),
                             current: Some(value_to_json(&value.value)),
                             desired: None,
+                            outcome: None,
                         },
                     })
                     .collect();
@@ -366,6 +371,68 @@ mod tests {
             op.field_changes[0].desired.is_none(),
             "unchanged field should have no desired value"
         );
+    }
+
+    /// AC: External change entries have no per-field outcomes — all field changes from
+    /// SerializableDiff::from have outcome=None (outcomes are only set by apply_outcomes
+    /// after a real apply; external change entries are never passed through apply_outcomes).
+    #[test]
+    fn test_statediff_conversion_always_sets_outcome_to_none_on_all_field_changes() {
+        let diff = ReconcileStateDiff {
+            operations: vec![
+                DiffOperation {
+                    kind: DiffKind::Add,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("eth0"),
+                    field_changes: vec![FieldChange {
+                        field_name: "mtu".to_string(),
+                        change: FieldChangeKind::Set { current: None, desired: fv(Value::U64(1500)) },
+                    }],
+                },
+                DiffOperation {
+                    kind: DiffKind::Modify,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("eth1"),
+                    field_changes: vec![
+                        FieldChange {
+                            field_name: "mtu".to_string(),
+                            change: FieldChangeKind::Set {
+                                current: Some(fv(Value::U64(1500))),
+                                desired: fv(Value::U64(9000)),
+                            },
+                        },
+                        FieldChange {
+                            field_name: "addresses".to_string(),
+                            change: FieldChangeKind::Unchanged {
+                                value: fv(Value::String("10.0.0.1/24".to_string())),
+                            },
+                        },
+                    ],
+                },
+                DiffOperation {
+                    kind: DiffKind::Remove,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("eth2"),
+                    field_changes: vec![FieldChange {
+                        field_name: "routes".to_string(),
+                        change: FieldChangeKind::Unset { current: fv(Value::U64(0)) },
+                    }],
+                },
+            ],
+        };
+
+        let serializable = SerializableDiff::from(&diff);
+        for op in &serializable.operations {
+            for fc in &op.field_changes {
+                assert!(
+                    fc.outcome.is_none(),
+                    "field change '{}' on '{}' must have outcome=None after conversion from ReconcileStateDiff \
+                     (outcomes are set only by apply_outcomes after a real apply, not during conversion)",
+                    fc.field_name,
+                    op.entity_name
+                );
+            }
+        }
     }
 
     /// AC: entity_name in SerializableDiffOp is the selector's key() value.

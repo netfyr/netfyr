@@ -671,6 +671,7 @@ fn compute_external_field_changes(
                     change_kind: "set".to_string(),
                     current: Some(last_val.clone()), // old value (from journal)
                     desired: Some(current_json),     // new value (from system)
+                    outcome: None,
                 });
             }
             None => {
@@ -680,6 +681,7 @@ fn compute_external_field_changes(
                     change_kind: "set".to_string(),
                     current: None,
                     desired: Some(current_json),
+                    outcome: None,
                 });
             }
         }
@@ -697,6 +699,7 @@ fn compute_external_field_changes(
                     change_kind: "unset".to_string(),
                     current: Some(last_val.clone()),
                     desired: None,
+                    outcome: None,
                 });
             }
         }

@@ -1,0 +1,56 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-show 1  "netfyr-show " 
+.SH NAME
+netfyr\-show \- Show system overview
+.SH SYNOPSIS
+\fBnetfyr\-show\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Show system overview
+.PP
+Display daemon status, all network interfaces, and their active policies and DHCP lease state. Works with or without the daemon.
+.SH OPTIONS
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: text]
+Output format: text (default) or json
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+text
+.IP \(bu 2
+json
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+See
+.BR netfyr-show (1)
+for usage details.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-apply (1),
+.BR netfyr-query (1),
+.BR netfyr-daemon (8),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

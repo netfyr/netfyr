@@ -1614,6 +1614,7 @@ mod tests {
                     change_kind: "set".to_string(),
                     current: Some(serde_json::json!(1500u64)),
                     desired: Some(serde_json::json!(9000u64)),
+                    outcome: None,
                 }],
             }],
         };
@@ -1647,6 +1648,7 @@ mod tests {
                     change_kind: "set".to_string(),
                     current: Some(serde_json::json!(["172.25.12.1/24"])),
                     desired: Some(serde_json::json!(["172.25.12.1/24", "172.25.14.22/32"])),
+                    outcome: None,
                 }],
             }],
         };
@@ -1682,6 +1684,7 @@ mod tests {
                     desired: Some(serde_json::json!([
                         {"destination": "10.0.0.0/8", "metric": 100}
                     ])),
+                    outcome: None,
                 }],
             }],
         };
@@ -1975,6 +1978,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(1500u64)),
                 desired: Some(serde_json::json!(9000u64)),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -1997,6 +2001,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: None,
                 desired: Some(serde_json::json!("10.0.0.1/24")),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2015,6 +2020,7 @@ mod tests {
                 change_kind: "unset".to_string(),
                 current: Some(serde_json::json!("10.0.0.1/24")),
                 desired: None,
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2278,6 +2284,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!([])),
                 desired: Some(serde_json::json!(["10.0.0.1/24", "10.0.0.2/24"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2306,6 +2313,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(["10.0.0.1/24"])),
                 desired: Some(serde_json::json!([])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2329,6 +2337,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(["192.168.1.1/24"])),
                 desired: Some(serde_json::json!(["10.0.0.1/24", "10.0.0.2/24"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2363,6 +2372,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(["10.0.0.1/24"])),
                 desired: Some(serde_json::json!(["10.0.0.1/24"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2959,6 +2969,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!([])),
                 desired: Some(serde_json::json!(["192.168.1.100/24"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -2977,6 +2988,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(["10.0.0.42/24"])),
                 desired: Some(serde_json::json!(["10.0.0.50/24"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3010,6 +3022,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::Value::Array(removed)),
                 desired: Some(serde_json::Value::Array(added)),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3049,6 +3062,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::Value::Array(removed)),
                 desired: Some(serde_json::Value::Array(added)),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3077,6 +3091,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!([])),
                 desired: Some(serde_json::json!(["fe80::1/64", "192.168.1.100/24"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3111,6 +3126,7 @@ mod tests {
                 desired: Some(serde_json::json!([
                     {"destination": "0.0.0.0/0", "gateway": "10.0.0.1"}
                 ])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3137,6 +3153,7 @@ mod tests {
                     {"destination": "172.16.0.0/12", "gateway": "192.168.1.1"},
                     {"destination": "192.168.2.0/24", "gateway": "192.168.1.1"},
                 ])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3161,6 +3178,7 @@ mod tests {
                     {"destination": "192.168.2.0/24", "gateway": "192.168.1.1"},
                     {"destination": "203.0.113.0/24", "gateway": "192.168.1.1"},
                 ])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3191,6 +3209,7 @@ mod tests {
                     {"destination": "0.0.0.0/0", "gateway": "192.168.1.1"}
                 ])),
                 desired: Some(serde_json::json!([])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3215,6 +3234,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!([])),
                 desired: Some(serde_json::json!(["8.8.8.8"])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3237,6 +3257,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(["10.0.0.1"])),
                 desired: Some(serde_json::json!([])),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3260,6 +3281,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!("example.com")),
                 desired: Some(serde_json::json!("corp.local")),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3381,6 +3403,7 @@ mod tests {
                 change_kind: "set".to_string(),
                 current: Some(serde_json::json!(1500u64)),
                 desired: Some(serde_json::json!(9000u64)),
+                outcome: None,
             }],
         }];
         let result = changes_summary(&ops);
@@ -3491,6 +3514,7 @@ mod tests {
                     desired: Some(serde_json::json!([
                         {"destination": "172.25.14.22/32", "metric": 0}
                     ])),
+                    outcome: None,
                 }],
             }],
         };
@@ -3524,6 +3548,7 @@ mod tests {
                     desired: Some(serde_json::json!([
                         {"destination": "10.0.0.0/8", "metric": 100}
                     ])),
+                    outcome: None,
                 }],
             }],
         };
@@ -3621,6 +3646,7 @@ mod tests {
                         change_kind: "set".to_string(),
                         current: Some(serde_json::json!(1500u64)),
                         desired: Some(serde_json::json!(9000u64)),
+                        outcome: None,
                     }],
                 }],
             };

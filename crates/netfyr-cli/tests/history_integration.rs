@@ -380,6 +380,7 @@ fn test_history_show_scalar_diff_lines() {
         change_kind: "set".to_string(),
         current: Some(serde_json::json!(1500u64)),
         desired: Some(serde_json::json!(9000u64)),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &["--show", "1"]);
@@ -403,6 +404,7 @@ fn test_history_show_list_diff_additions() {
         change_kind: "set".to_string(),
         current: Some(serde_json::json!([])),
         desired: Some(serde_json::json!(["172.25.14.22/32"])),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &["--show", "1"]);
@@ -502,6 +504,7 @@ fn test_history_show_color_always_wraps_entire_diff_lines() {
         change_kind: "set".to_string(),
         current: Some(serde_json::json!(1500u64)),
         desired: Some(serde_json::json!(9000u64)),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
 
@@ -563,6 +566,7 @@ fn test_history_show_route_diff_with_metric_readable_format() {
         desired: Some(serde_json::json!([
             {"destination": "10.0.0.0/8", "metric": 100}
         ])),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &["--show", "1"]);
@@ -588,6 +592,7 @@ fn test_history_show_route_diff_zero_metric_omitted() {
         desired: Some(serde_json::json!([
             {"destination": "172.25.14.22/32", "metric": 0}
         ])),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &["--show", "1"]);
@@ -678,6 +683,7 @@ fn test_history_list_changes_column_shows_addr_plus_n_for_list_additions() {
         change_kind: "set".to_string(),
         current: Some(serde_json::json!([])),
         desired: Some(serde_json::json!(["10.0.0.1/24"])),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &[]);
@@ -698,6 +704,7 @@ fn test_history_list_changes_column_shows_tilde_field_for_scalar_changes() {
         change_kind: "set".to_string(),
         current: Some(serde_json::json!(1500u64)),
         desired: Some(serde_json::json!(9000u64)),
+        outcome: None,
     }]);
     let dir = setup_journal(vec![entry]);
     let output = run_history(dir.path(), &[]);

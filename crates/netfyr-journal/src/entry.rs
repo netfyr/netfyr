@@ -82,6 +82,7 @@ mod tests {
                         change_kind: "set".to_string(),
                         current: Some(serde_json::json!(1500u64)),
                         desired: Some(serde_json::json!(9000u64)),
+                        outcome: None,
                     }],
                 }],
             },
