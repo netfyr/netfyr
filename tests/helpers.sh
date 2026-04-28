@@ -186,6 +186,36 @@ wait_for_address() {
     done
 }
 
+# wait_for_no_address IFACE PREFIX TIMEOUT_SECONDS -- Poll until an address matching PREFIX
+# disappears from IFACE, or fail after TIMEOUT_SECONDS.
+#
+# Uses a subshell capture for the `ip addr show` output rather than a direct
+# pipe to `grep -q`, to avoid a false-negative race under `set -o pipefail`
+# that can occur when SIGCHLD from a recently-killed background process
+# interrupts the pipeline's exit-code evaluation.
+wait_for_no_address() {
+    local iface="$1"
+    local prefix="$2"
+    local timeout_sec="$3"
+    local max_iters=$(( timeout_sec * 10 ))
+    local waited=0
+    local _addr_out
+    while true; do
+        _addr_out=$(ip addr show dev "$iface" 2>/dev/null) || true
+        if ! echo "$_addr_out" | grep -qF "$prefix"; then
+            break
+        fi
+        if (( waited >= max_iters )); then
+            echo "FAIL: interface '$iface' still has an address matching '$prefix' after ${timeout_sec}s" >&2
+            echo "      ip addr show $iface:" >&2
+            ip addr show dev "$iface" >&2 || true
+            exit 1
+        fi
+        sleep 0.1
+        (( waited++ )) || true
+    done
+}
+
 # assert_address_count IFACE EXPECTED_COUNT -- Fail if the number of IPv4 (inet)
 # addresses on IFACE does not match EXPECTED_COUNT. Uses "inet " (with trailing
 # space) to exclude inet6 lines.

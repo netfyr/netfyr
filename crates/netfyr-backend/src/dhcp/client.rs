@@ -344,7 +344,7 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
             LeaseMaintOutcome::Expired => {
                 {
                     let mut guard = shared_state.lock().unwrap();
-                    *guard = None;
+                    *guard = Some(super::pending_state(&interface, &policy_name, priority));
                 }
                 {
                     let mut timing_guard = lease_timing.lock().unwrap();

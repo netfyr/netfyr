@@ -295,7 +295,7 @@ pub fn lease_to_state(
 /// The pending state contains only `operstate: "up"` so that the reconciler
 /// brings the interface up while the DHCP client is discovering a server.
 /// Once a lease is acquired, `lease_to_state` replaces this with the full state.
-fn pending_state(interface: &str, policy_name: &str, priority: u32) -> State {
+pub(super) fn pending_state(interface: &str, policy_name: &str, priority: u32) -> State {
     let prov = Provenance::UserConfigured {
         policy_ref: policy_name.to_string(),
     };
