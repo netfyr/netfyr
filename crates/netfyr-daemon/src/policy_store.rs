@@ -911,4 +911,150 @@ mod tests {
             "persisted policy must have state or states present"
         );
     }
+
+    // ── Feature: DHCPv4 policy persistence ───────────────────────────────────
+
+    /// Build a minimal valid DHCPv4 policy with a named-interface selector.
+    fn make_dhcp_policy(name: &str, interface: &str) -> Policy {
+        let yaml = format!(
+            "kind: policy\nname: {name}\nfactory: dhcpv4\npriority: 50\n\
+             selector:\n  name: {interface}\n"
+        );
+        parse_policy_yaml(&yaml).unwrap().into_iter().next().unwrap()
+    }
+
+    /// Scenario: DHCPv4 factory type roundtrips through persistence.
+    /// After persisting a DHCPv4 policy and reloading it, the factory type
+    /// must be `FactoryType::Dhcpv4`.
+    #[test]
+    fn test_dhcpv4_policy_factory_type_roundtrips_through_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PolicyStore::load(dir.path()).unwrap();
+
+        store.replace_all(vec![make_dhcp_policy("dhcp-eth0", "eth0")]).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("dhcp-eth0.yaml")).unwrap();
+        let loaded = parse_policy_yaml(&content).unwrap();
+
+        assert_eq!(
+            loaded[0].factory_type,
+            FactoryType::Dhcpv4,
+            "factory type must be Dhcpv4 after serialization roundtrip"
+        );
+    }
+
+    /// Scenario: DHCPv4 policy selector interface name roundtrips.
+    /// The selector's `name` field (the interface) must survive serialization.
+    #[test]
+    fn test_dhcpv4_policy_selector_interface_name_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PolicyStore::load(dir.path()).unwrap();
+
+        store.replace_all(vec![make_dhcp_policy("dhcp-eth0", "eth0")]).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("dhcp-eth0.yaml")).unwrap();
+        let loaded = parse_policy_yaml(&content).unwrap();
+
+        let selector = loaded[0].selector.as_ref().expect("DHCPv4 policy must have a selector");
+        assert_eq!(
+            selector.name.as_deref(),
+            Some("eth0"),
+            "selector interface name must survive the serialization roundtrip"
+        );
+    }
+
+    /// Scenario: DHCPv4 policy priority roundtrips through persistence.
+    #[test]
+    fn test_dhcpv4_policy_priority_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PolicyStore::load(dir.path()).unwrap();
+
+        store.replace_all(vec![make_dhcp_policy("dhcp-eth0", "eth0")]).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("dhcp-eth0.yaml")).unwrap();
+        let loaded = parse_policy_yaml(&content).unwrap();
+
+        assert_eq!(
+            loaded[0].priority, 50,
+            "priority must survive the serialization roundtrip"
+        );
+    }
+
+    /// Scenario: DHCPv4 policy persisted file is parseable by the policy parser.
+    #[test]
+    fn test_dhcpv4_policy_persisted_file_is_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PolicyStore::load(dir.path()).unwrap();
+
+        store.replace_all(vec![make_dhcp_policy("dhcp-eth0", "eth0")]).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("dhcp-eth0.yaml")).unwrap();
+        let result = parse_policy_yaml(&content);
+
+        assert!(
+            result.is_ok(),
+            "persisted DHCPv4 policy file must be parseable by parse_policy_yaml: {:?}",
+            result.err()
+        );
+    }
+
+    /// Scenario: A PolicyStore loaded from disk with a DHCPv4 policy on restart
+    /// correctly re-loads the factory type.
+    #[test]
+    fn test_dhcpv4_policy_survives_store_reload() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First store instance — persist a DHCPv4 policy.
+        let mut store1 = PolicyStore::load(dir.path()).unwrap();
+        store1.replace_all(vec![make_dhcp_policy("dhcp-eth0", "eth0")]).unwrap();
+        assert_eq!(store1.len(), 1);
+        drop(store1);
+
+        // Second store instance simulates a daemon restart loading from disk.
+        let store2 = PolicyStore::load(dir.path()).unwrap();
+
+        assert_eq!(store2.len(), 1, "reloaded store must have 1 policy");
+        assert_eq!(
+            store2.policies()[0].factory_type,
+            FactoryType::Dhcpv4,
+            "reloaded policy must have Dhcpv4 factory type"
+        );
+        assert_eq!(
+            store2.policies()[0].selector.as_ref().and_then(|s| s.name.as_deref()),
+            Some("eth0"),
+            "reloaded policy must have correct interface selector"
+        );
+    }
+
+    /// Scenario: Mixed static and DHCPv4 policies both persist and reload correctly.
+    #[test]
+    fn test_mixed_static_and_dhcpv4_policies_both_persist_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PolicyStore::load(dir.path()).unwrap();
+
+        store
+            .replace_all(vec![
+                make_policy("static-eth1"),
+                make_dhcp_policy("dhcp-eth0", "eth0"),
+            ])
+            .unwrap();
+
+        // Reload to verify persistence.
+        let reloaded = PolicyStore::load(dir.path()).unwrap();
+        assert_eq!(reloaded.len(), 2, "both policies must be persisted and reloaded");
+
+        let factory_types: std::collections::HashSet<String> = reloaded
+            .policies()
+            .iter()
+            .map(|p| format!("{:?}", p.factory_type))
+            .collect();
+        assert!(
+            factory_types.contains("Static"),
+            "static factory must be present after reload"
+        );
+        assert!(
+            factory_types.contains("Dhcpv4"),
+            "DHCPv4 factory must be present after reload"
+        );
+    }
 }
