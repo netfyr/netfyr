@@ -214,7 +214,12 @@ pub fn lease_to_state(
         fv(Value::List(vec![Value::String(cidr)])),
     );
 
-    // Routes field: [{destination: "0.0.0.0/0", gateway: "gw_ip"}]
+    // Routes field: [{destination: "0.0.0.0/0", gateway: "gw_ip", metric: 0}]
+    // The metric field must be present to match the format produced by the
+    // query layer (build_route_value). Without it, the diff engine sees two
+    // different route objects for the same destination and generates a
+    // simultaneous add+remove — the add is skipped (EEXIST) and the remove
+    // succeeds, deleting the default route.
     if let Some(gateway) = lease.gateway {
         let mut route_map = IndexMap::new();
         route_map.insert(
@@ -224,6 +229,10 @@ pub fn lease_to_state(
         route_map.insert(
             "gateway".to_string(),
             Value::String(gateway.to_string()),
+        );
+        route_map.insert(
+            "metric".to_string(),
+            Value::U64(0),
         );
         fields.insert(
             "routes".to_string(),
@@ -350,7 +359,7 @@ mod tests {
 
     // ── lease_to_state: routes field ─────────────────────────────────────────
 
-    /// Scenario: State has routes with destination="0.0.0.0/0" gateway="10.0.1.1"
+    /// Scenario: State has routes with destination="0.0.0.0/0" gateway="10.0.1.1" metric=0
     #[test]
     fn test_lease_to_state_routes_contain_default_gateway() {
         let state = lease_to_state(&make_full_lease(), "eth0", "test-policy", 100);
@@ -377,6 +386,11 @@ mod tests {
             route_map.get("gateway").and_then(Value::as_str),
             Some("10.0.1.1"),
             "gateway must match lease gateway"
+        );
+        assert_eq!(
+            route_map.get("metric").and_then(Value::as_u64),
+            Some(0),
+            "metric must be 0 to match query layer format"
         );
     }
 
@@ -779,6 +793,11 @@ mod tests {
                     route_map.get("gateway").and_then(Value::as_str),
                     Some("10.0.1.1"),
                     "default route gateway must match lease gateway"
+                );
+                assert_eq!(
+                    route_map.get("metric").and_then(Value::as_u64),
+                    Some(0),
+                    "default route metric must be 0"
                 );
                 // operstate must be "up"
                 assert_eq!(
