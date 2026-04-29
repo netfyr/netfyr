@@ -205,7 +205,7 @@ impl FactoryManager {
             .map(|(name, factory)| {
                 let current = factory.current_state();
                 // With pending state, current_state() returns Some(State) even before a
-                // lease is acquired (containing only operstate:up). Check for the
+                // lease is acquired (containing only enabled: true). Check for the
                 // "addresses" field to distinguish a real lease from a pending state.
                 let has_lease = current
                     .as_ref()

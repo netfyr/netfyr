@@ -7,7 +7,7 @@ use futures::TryStreamExt;
 use indexmap::IndexMap;
 use netfyr_state::{FieldValue, Provenance, Selector, State, StateMetadata, StateSet, Value};
 use netlink_packet_route::link::{
-    InfoKind, LinkAttribute, LinkInfo, LinkLayerType, LinkMessage,
+    InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkLayerType, LinkMessage,
 };
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
 use rtnetlink::Handle;
@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::BackendError;
 use super::query::{
-    build_discovered_selector, operstate_to_str, read_sysfs_driver,
+    build_discovered_selector, read_sysfs_driver,
     read_sysfs_pci_path, read_sysfs_speed,
 };
 
@@ -93,13 +93,8 @@ fn extract_link_carrier(msg: &LinkMessage) -> Option<u8> {
     None
 }
 
-fn extract_link_operstate(msg: &LinkMessage) -> u8 {
-    for attr in &msg.attributes {
-        if let LinkAttribute::OperState(state) = attr {
-            return u8::from(*state);
-        }
-    }
-    0 // IF_OPER_UNKNOWN
+fn extract_link_enabled(msg: &LinkMessage) -> bool {
+    msg.header.flags.contains(LinkFlags::Up)
 }
 
 /// Extract the `IFLA_INFO_KIND` from a link's `IFLA_LINKINFO` nested attribute.
@@ -582,7 +577,7 @@ pub async fn query_ethernet(
         mac: Option<[u8; 6]>,
         mtu: Option<u32>,
         carrier: Option<u8>,
-        operstate: u8,
+        enabled: bool,
     }
 
     let mut ethernet_links: Vec<LinkInfo2> = Vec::new();
@@ -614,7 +609,7 @@ pub async fn query_ethernet(
             mac: extract_link_mac(msg),
             mtu: extract_link_mtu(msg),
             carrier: extract_link_carrier(msg),
-            operstate: extract_link_operstate(msg),
+            enabled: extract_link_enabled(msg),
         });
     }
 
@@ -678,8 +673,8 @@ pub async fn query_ethernet(
         );
 
         fields.insert(
-            "operstate".to_string(),
-            kd(Value::String(operstate_to_str(link.operstate).to_owned())),
+            "enabled".to_string(),
+            kd(Value::Bool(link.enabled)),
         );
 
         if let Some(spd) = speed {

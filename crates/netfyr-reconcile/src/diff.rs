@@ -882,7 +882,7 @@ mod tests {
     fn test_unmanaged_entity_in_actual_not_desired_generates_no_operations() {
         // Scenario: Unmanaged entity in actual but not desired is left alone
         // Given desired StateSet does not contain ethernet/eth1
-        // And actual StateSet contains ethernet/eth1 with mtu=1500, operstate=up
+        // And actual StateSet contains ethernet/eth1 with mtu=1500, enabled=true
         // And managed_entities does NOT contain ethernet/eth1
         // Then the StateDiff contains no operations for ethernet/eth1
         let desired = StateSet::new();
@@ -892,7 +892,7 @@ mod tests {
             "eth1",
             vec![
                 ("mtu", Value::U64(1500)),
-                ("operstate", Value::String("up".to_string())),
+                ("enabled", Value::Bool(true)),
             ],
         ));
         let schema = SchemaRegistry::new();

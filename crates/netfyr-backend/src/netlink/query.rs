@@ -87,56 +87,12 @@ pub fn read_sysfs_pci_path(name: &str) -> Option<String> {
     target.file_name().map(|s| s.to_string_lossy().into_owned())
 }
 
-/// Map the kernel's `IF_OPER_*` u8 constants to lowercase string names.
-pub fn operstate_to_str(state: u8) -> &'static str {
-    match state {
-        0 => "unknown",
-        1 => "not_present",
-        2 => "down",
-        3 => "lower_layer_down",
-        4 => "testing",
-        5 => "dormant",
-        6 => "up",
-        _ => "unknown",
-    }
-}
-
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use netfyr_state::MacAddr;
-
-    // ── operstate_to_str ──────────────────────────────────────────────────────
-
-    /// Scenario: All known IF_OPER_* values map to their documented strings.
-    #[test]
-    fn test_operstate_to_str_all_known_values() {
-        assert_eq!(operstate_to_str(0), "unknown",         "0 => unknown");
-        assert_eq!(operstate_to_str(1), "not_present",     "1 => not_present");
-        assert_eq!(operstate_to_str(2), "down",            "2 => down");
-        assert_eq!(operstate_to_str(3), "lower_layer_down","3 => lower_layer_down");
-        assert_eq!(operstate_to_str(4), "testing",         "4 => testing");
-        assert_eq!(operstate_to_str(5), "dormant",         "5 => dormant");
-        assert_eq!(operstate_to_str(6), "up",              "6 => up");
-    }
-
-    /// Values outside the 0–6 range must map to "unknown".
-    #[test]
-    fn test_operstate_to_str_out_of_range_maps_to_unknown() {
-        assert_eq!(operstate_to_str(7), "unknown");
-        assert_eq!(operstate_to_str(255), "unknown");
-        assert_eq!(operstate_to_str(100), "unknown");
-    }
-
-    /// operstate_to_str returns a non-empty string for every value in 0..=6.
-    #[test]
-    fn test_operstate_to_str_non_empty_for_all_defined_values() {
-        for v in 0u8..=6 {
-            assert!(!operstate_to_str(v).is_empty(), "operstate {v} must return non-empty string");
-        }
-    }
 
     // ── build_discovered_selector ─────────────────────────────────────────────
 

@@ -75,10 +75,10 @@
       "description": "Kernel driver name",
       "x-netfyr-writable": false
     },
-    "operstate": {
-      "type": "string",
-      "description": "Operational state of the interface (up/down/unknown)",
-      "x-netfyr-writable": false
+    "enabled": {
+      "type": "boolean",
+      "description": "Whether the interface is administratively enabled",
+      "x-netfyr-writable": true
     },
     "dns_servers": {
       "type": "array",

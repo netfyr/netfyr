@@ -812,3 +812,45 @@ fn test_history_show_zero_returns_not_found() {
         "--show 0 must report 'not found'; got:\n{text}"
     );
 }
+
+// ── Feature: enabled and carrier state changes in CHANGES column ────────────
+
+/// AC: CHANGES column shows "enabled true→false" for admin-state changes.
+#[test]
+fn test_history_list_changes_column_shows_enabled_state_change() {
+    let entry = make_entry_with_diff("eth0", vec![SerializableFieldChange {
+        field_name: "enabled".to_string(),
+        change_kind: "set".to_string(),
+        current: Some(serde_json::json!(true)),
+        desired: Some(serde_json::json!(false)),
+        outcome: None,
+    }]);
+    let dir = setup_journal(vec![entry]);
+    let output = run_history(dir.path(), &[]);
+    assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("enabled true\u{2192}false") || text.contains("enabled true→false"),
+        "CHANGES column must show 'enabled true→false'; got:\n{text}"
+    );
+}
+
+/// AC: CHANGES column shows "carrier true→false" for carrier state changes.
+#[test]
+fn test_history_list_changes_column_shows_carrier_state_change() {
+    let entry = make_entry_with_diff("eth0", vec![SerializableFieldChange {
+        field_name: "carrier".to_string(),
+        change_kind: "set".to_string(),
+        current: Some(serde_json::json!(true)),
+        desired: Some(serde_json::json!(false)),
+        outcome: None,
+    }]);
+    let dir = setup_journal(vec![entry]);
+    let output = run_history(dir.path(), &[]);
+    assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("carrier true\u{2192}false") || text.contains("carrier true→false"),
+        "CHANGES column must show 'carrier true→false'; got:\n{text}"
+    );
+}

@@ -654,7 +654,7 @@ mod tests {
             "eth1",
             vec![
                 ("mtu", Value::U64(1500)),
-                ("operstate", Value::String("up".to_string())),
+                ("enabled", Value::Bool(true)),
             ],
         ));
         let schema = SchemaRegistry::new();

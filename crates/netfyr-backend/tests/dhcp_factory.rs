@@ -324,7 +324,7 @@ async fn test_factory_retries_on_discovery_timeout() {
 
 /// Scenario: current_state returns full state after lease
 ///
-/// Verifies every field the spec mandates: operstate=up, addresses, routes,
+/// Verifies every field the spec mandates: enabled=true, addresses, routes,
 /// and dns_servers are all present once a lease has been acquired.
 ///
 /// This is the integration-level counterpart of the unit tests in `mod.rs`
@@ -350,17 +350,17 @@ async fn test_current_state_full_fields_after_lease_acquired() {
         .expect("current_state() must return Some after LeaseAcquired");
 
     // Scenario: current_state returns full state after lease
-    // Then it returns Some(State) with operstate=up, addresses, routes, and dns
+    // Then it returns Some(State) with enabled=true, addresses, routes, and dns
 
-    // operstate=up is always required.
-    let operstate = state
+    // enabled=true is always required.
+    let enabled = state
         .fields
-        .get("operstate")
-        .expect("operstate field must be present after lease acquisition")
+        .get("enabled")
+        .expect("enabled field must be present after lease acquisition")
         .value
-        .as_str()
-        .expect("operstate must be a string value");
-    assert_eq!(operstate, "up", "operstate must be 'up' in the post-lease state");
+        .as_bool()
+        .expect("enabled must be a bool value");
+    assert!(enabled, "enabled must be true in the post-lease state");
 
     // addresses must be present and non-empty.
     let addresses = state

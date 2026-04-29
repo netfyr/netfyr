@@ -129,7 +129,7 @@ impl Dhcpv4Factory {
     ) -> Result<Self, BackendError> {
         // Immediately populate a pending state so that current_state() returns
         // Some(State) before any lease is acquired. This ensures reconciliation
-        // brings the interface UP (operstate: up) before DHCP discovery begins,
+        // brings the interface UP (enabled: true) before DHCP discovery begins,
         // solving the chicken-and-egg problem: DHCP needs the interface UP to
         // send broadcast packets, but without produced state the reconciler
         // might leave the interface down.
@@ -232,7 +232,7 @@ pub fn lease_to_state(
     let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
 
     // Interface must stay up — this is always present regardless of lease options.
-    fields.insert("operstate".to_string(), fv(Value::String("up".to_string())));
+    fields.insert("enabled".to_string(), fv(Value::Bool(true)));
 
     // Addresses field: ["ip/prefix"]
     let cidr = format!("{}/{}", lease.ip, lease.subnet_mask_to_prefix());
@@ -292,7 +292,7 @@ pub fn lease_to_state(
 /// Build a minimal `State` that ensures the interface is brought UP before a
 /// lease is acquired. Stored in `Dhcpv4Factory::state` immediately on start.
 ///
-/// The pending state contains only `operstate: "up"` so that the reconciler
+/// The pending state contains only `enabled: true` so that the reconciler
 /// brings the interface up while the DHCP client is discovering a server.
 /// Once a lease is acquired, `lease_to_state` replaces this with the full state.
 pub(super) fn pending_state(interface: &str, policy_name: &str, priority: u32) -> State {
@@ -301,9 +301,9 @@ pub(super) fn pending_state(interface: &str, policy_name: &str, priority: u32) -
     };
     let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
     fields.insert(
-        "operstate".to_string(),
+        "enabled".to_string(),
         FieldValue {
-            value: Value::String("up".to_string()),
+            value: Value::Bool(true),
             provenance: prov,
         },
     );
@@ -546,41 +546,37 @@ mod tests {
         assert_eq!(state.priority, 200);
     }
 
-    /// Scenario: Produced state always contains operstate=up regardless of lease options.
-    ///
-    /// The spec states: "operstate: up is always present regardless of lease options."
-    /// Verify this holds for both the full lease (with gateway and DNS) and the
-    /// minimal lease (no gateway, no DNS servers).
+    /// Scenario: Produced state always contains enabled=true regardless of lease options.
     #[test]
-    fn test_lease_to_state_operstate_is_always_up_full_lease() {
+    fn test_lease_to_state_enabled_is_always_true_full_lease() {
         let state = lease_to_state(&make_full_lease(), "eth0", "test-policy", 100);
-        let operstate = state
+        let enabled = state
             .fields
-            .get("operstate")
-            .expect("operstate field must always be present in lease_to_state output")
+            .get("enabled")
+            .expect("enabled field must always be present in lease_to_state output")
             .value
-            .as_str()
-            .expect("operstate must be a string");
-        assert_eq!(
-            operstate, "up",
-            "operstate must be 'up' in the full-lease state"
+            .as_bool()
+            .expect("enabled must be a bool");
+        assert!(
+            enabled,
+            "enabled must be true in the full-lease state"
         );
     }
 
     /// Same as above for the minimal lease (no gateway, no DNS).
     #[test]
-    fn test_lease_to_state_operstate_is_always_up_minimal_lease() {
+    fn test_lease_to_state_enabled_is_always_true_minimal_lease() {
         let state = lease_to_state(&make_minimal_lease(), "eth0", "test-policy", 100);
-        let operstate = state
+        let enabled = state
             .fields
-            .get("operstate")
-            .expect("operstate field must always be present even without gateway/dns")
+            .get("enabled")
+            .expect("enabled field must always be present even without gateway/dns")
             .value
-            .as_str()
-            .expect("operstate must be a string");
-        assert_eq!(
-            operstate, "up",
-            "operstate must be 'up' in the minimal-lease state (no gateway, no dns)"
+            .as_bool()
+            .expect("enabled must be a bool");
+        assert!(
+            enabled,
+            "enabled must be true in the minimal-lease state (no gateway, no dns)"
         );
     }
 
@@ -589,7 +585,7 @@ mod tests {
     /// Scenario: current_state returns pending state before lease
     /// Given a newly started factory on interface "nonexistent-iface-xyz99"
     /// When current_state() is called before any lease is acquired
-    /// Then it returns Some(State) with operstate=up and no addresses/routes
+    /// Then it returns Some(State) with enabled=true and no addresses/routes
     #[tokio::test]
     async fn test_current_state_returns_pending_state_before_lease_acquired() {
         let (tx, _rx) = mpsc::channel::<FactoryEvent>(10);
@@ -613,15 +609,15 @@ mod tests {
             "selector name must match interface"
         );
 
-        // Must have operstate=up
-        let operstate = state
+        // Must have enabled=true
+        let enabled = state
             .fields
-            .get("operstate")
-            .expect("pending state must have operstate field")
+            .get("enabled")
+            .expect("pending state must have enabled field")
             .value
-            .as_str()
-            .expect("operstate must be a string");
-        assert_eq!(operstate, "up", "pending state operstate must be 'up'");
+            .as_bool()
+            .expect("enabled must be a bool");
+        assert!(enabled, "pending state enabled must be true");
 
         // Must NOT have addresses, routes, or dns_servers
         assert!(
@@ -666,7 +662,7 @@ mod tests {
     /// Scenario: Factory sends LeaseRenewed on renewal
     ///
     /// Verify that FactoryEvent::LeaseRenewed carries the correct policy_name
-    /// and a State with the expected fields (operstate, addresses).
+    /// and a State with the expected fields (enabled, addresses).
     #[test]
     fn test_factory_event_lease_renewed_has_policy_name_and_state() {
         let state = lease_to_state(&make_full_lease(), "eth0", "renew-policy", 100);
@@ -683,9 +679,9 @@ mod tests {
                     "LeaseRenewed state must contain addresses"
                 );
                 assert_eq!(
-                    ev_state.fields.get("operstate").and_then(|fv| fv.value.as_str()),
-                    Some("up"),
-                    "LeaseRenewed state must have operstate=up"
+                    ev_state.fields.get("enabled").and_then(|fv| fv.value.as_bool()),
+                    Some(true),
+                    "LeaseRenewed state must have enabled=true"
                 );
             }
             _ => panic!("expected FactoryEvent::LeaseRenewed variant"),
@@ -718,17 +714,17 @@ mod tests {
     ///
     /// Verifies that the state produced by lease_to_state (which becomes the
     /// factory's current_state once a lease is acquired) simultaneously satisfies
-    /// ALL four required fields: operstate=up, addresses, routes, dns_servers.
+    /// ALL four required fields: enabled=true, addresses, routes, dns_servers.
     /// This is a holistic check — individual field tests exist above.
     #[test]
     fn test_lease_to_state_satisfies_scenario8_all_required_fields_present() {
         let state = lease_to_state(&make_full_lease(), "eth0", "test-policy", 100);
 
-        // operstate must be "up"
+        // enabled must be true
         assert_eq!(
-            state.fields.get("operstate").and_then(|fv| fv.value.as_str()),
-            Some("up"),
-            "full lease state must have operstate=up"
+            state.fields.get("enabled").and_then(|fv| fv.value.as_bool()),
+            Some(true),
+            "full lease state must have enabled=true"
         );
 
         // addresses must be present and non-empty
@@ -771,7 +767,7 @@ mod tests {
     ///  And the produced State contains the default gateway route"
     ///
     /// Verifies that FactoryEvent::LeaseAcquired carries the correct policy_name
-    /// and a State with operstate=up, addresses, and routes populated — matching
+    /// and a State with enabled=true, addresses, and routes populated — matching
     /// the same shape the background task would produce after a real DORA handshake.
     #[test]
     fn test_factory_event_lease_acquired_has_policy_name_and_state() {
@@ -826,11 +822,11 @@ mod tests {
                     Some(0),
                     "default route metric must be 0"
                 );
-                // operstate must be "up"
+                // enabled must be true
                 assert_eq!(
-                    ev_state.fields.get("operstate").and_then(|fv| fv.value.as_str()),
-                    Some("up"),
-                    "LeaseAcquired state must have operstate=up"
+                    ev_state.fields.get("enabled").and_then(|fv| fv.value.as_bool()),
+                    Some(true),
+                    "LeaseAcquired state must have enabled=true"
                 );
             }
             _ => panic!("expected FactoryEvent::LeaseAcquired variant"),
@@ -843,7 +839,7 @@ mod tests {
     ///
     /// Verifies that the pending state (returned by current_state() before any
     /// lease is acquired) carries the correct policy_ref so that the reconciler
-    /// can attribute the operstate=up field to the correct policy.
+    /// can attribute the enabled=true field to the correct policy.
     #[tokio::test]
     async fn test_pending_state_policy_ref_matches_policy_name() {
         let (tx, _rx) = mpsc::channel::<FactoryEvent>(10);

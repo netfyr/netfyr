@@ -658,17 +658,17 @@ async fn test_apply_remove_operation_deconfigures_but_keeps_interface() {
         "veth-rmdec0 must still exist (physical interfaces are never deleted)"
     );
 
-    // Operstate must not be "up" — link was set down.
+    // enabled must be false — link was set down.
     let state = query_state("veth-rmdec0").await;
     if let Some(s) = state {
-        let operstate = s
+        let enabled = s
             .fields
-            .get("operstate")
-            .and_then(|fv| fv.value.as_str())
-            .unwrap_or("unknown");
-        assert_ne!(
-            operstate, "up",
-            "Interface must not be operstate 'up' after Remove op, got: {operstate}"
+            .get("enabled")
+            .and_then(|fv| fv.value.as_bool())
+            .unwrap_or(false);
+        assert!(
+            !enabled,
+            "Interface must not be enabled after Remove op"
         );
     }
 }
@@ -676,7 +676,7 @@ async fn test_apply_remove_operation_deconfigures_but_keeps_interface() {
 /// Scenario: Field changes within an entity are applied in correct order
 ///
 /// Given veth-ord0 with mtu=1500, no addresses, link down:
-/// When apply is called with mtu=1400, operstate="up", address "10.99.6.1/24",
+/// When apply is called with mtu=1400, enabled=true, address "10.99.6.1/24",
 /// and route "0.0.0.0/0 via 10.99.6.2":
 /// - Link is set up first (phase 1)
 /// - Then MTU (phase 1)
@@ -702,7 +702,7 @@ async fn test_apply_field_order_link_mtu_addresses_routes() {
 
     let mut changed_fields = IndexMap::new();
     changed_fields.insert("mtu".to_string(), kd(Value::U64(1400)));
-    changed_fields.insert("operstate".to_string(), kd(Value::String("up".to_string())));
+    changed_fields.insert("enabled".to_string(), kd(Value::Bool(true)));
     changed_fields.insert(
         "addresses".to_string(),
         kd(Value::List(vec![Value::String("10.99.6.1/24".to_string())])),

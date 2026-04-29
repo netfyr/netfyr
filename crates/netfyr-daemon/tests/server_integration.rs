@@ -1103,7 +1103,7 @@ async fn netns_external_mtu_change_creates_external_change_journal_entry() {
 /// NOTE: The current implementation may fail this test. After `reconcile_and_apply`
 /// completes, the self-generated netlink events arrive ~500ms later (after debounce).
 /// By then `is_applying()` is false, so the events are processed. The journal
-/// comparison then finds fields (mac, operstate, carrier, etc.) that are in the
+/// comparison then finds fields (mac, enabled, carrier, etc.) that are in the
 /// actual backend state but absent from the journal snapshot (which only stores
 /// desired state). This causes spurious ExternalChange entries for those fields.
 /// The fix is to store the actual post-apply state in the journal, not just the
@@ -2588,3 +2588,4 @@ async fn netns_daemon_handles_dhcp_policy_acquires_lease() {
         parts[3]
     );
 }
+

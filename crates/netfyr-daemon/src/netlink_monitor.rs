@@ -77,7 +77,7 @@ const RECV_BUF_CAPACITY: usize = 65536;
 /// Classifies the kind of netlink notification received.
 #[derive(Debug, Clone)]
 pub enum ChangeKind {
-    /// A link attribute changed (MTU, operstate, flags, etc.).
+    /// A link attribute changed (MTU, enabled, carrier, etc.).
     LinkChanged,
     /// An IPv4 address was added to an interface.
     AddressAdded,

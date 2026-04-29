@@ -11,7 +11,7 @@ use netfyr_backend::netlink::query::establish_connection;
 use netfyr_backend::{BackendError, NetlinkBackend, NetworkBackend};
 use netfyr_state::{MacAddr, Provenance, Selector};
 use netfyr_test_utils::netns::{
-    add_address, create_veth_pair, get_link_index, set_link_up, set_mtu, NetnsGuard,
+    add_address, create_veth_pair, get_link_index, set_link_down, set_link_up, set_mtu, NetnsGuard,
 };
 use rtnetlink::{LinkBond, LinkBridge, LinkVlan, RouteMessageBuilder};
 use std::net::Ipv4Addr;
@@ -909,14 +909,12 @@ async fn test_routes_field_is_always_a_list() {
     );
 }
 
-// ── Test 25: operstate field is present with a valid string value ─────────────
+// ── Test 25: enabled field is present with a valid bool value ─────────────────
 
-/// Scenario: The "operstate" field must be present in every returned State and
-/// must hold a lowercase string matching one of the documented operstate names.
-///
-/// Validates the spec field mapping "operstate: IFLA_OPERSTATE → Enum: Up, Down, ...".
+/// Scenario: The "enabled" field must be present in every returned State and
+/// must hold a boolean derived from the IFF_UP link flag.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_operstate_field_is_present_and_is_valid_string() {
+async fn test_enabled_field_is_present_and_is_valid_bool() {
     require_netns!(_guard);
 
     create_veth_pair("veth-ops0", "veth-ops1").await.unwrap();
@@ -928,34 +926,22 @@ async fn test_operstate_field_is_present_and_is_valid_string() {
     assert_eq!(result.len(), 1);
     let state = result.get("ethernet", "veth-ops0").unwrap();
 
-    let operstate_fv = state
+    let enabled_fv = state
         .fields
-        .get("operstate")
-        .expect("operstate field must always be present");
+        .get("enabled")
+        .expect("enabled field must always be present");
 
-    // operstate must be a string.
-    let operstate_str = operstate_fv
+    // enabled must be a bool.
+    enabled_fv
         .value
-        .as_str()
-        .expect("operstate must be Value::String");
-
-    // Must be one of the documented operstate values.
-    let valid_states = [
-        "unknown", "not_present", "down", "lower_layer_down",
-        "testing", "dormant", "up",
-    ];
-    assert!(
-        valid_states.contains(&operstate_str),
-        "operstate '{}' must be one of: {:?}",
-        operstate_str,
-        valid_states
-    );
+        .as_bool()
+        .expect("enabled must be Value::Bool");
 
     // Must have KernelDefault provenance.
     assert_eq!(
-        operstate_fv.provenance,
+        enabled_fv.provenance,
         Provenance::KernelDefault,
-        "operstate field must have KernelDefault provenance"
+        "enabled field must have KernelDefault provenance"
     );
 }
 
@@ -1026,7 +1012,7 @@ async fn test_netlinkbackend_trait_query_with_name_selector() {
     assert!(state.fields.contains_key("name"), "name field must be present");
     assert!(state.fields.contains_key("mtu"),  "mtu field must be present");
     assert!(state.fields.contains_key("mac"),  "mac field must be present");
-    assert!(state.fields.contains_key("operstate"), "operstate field must be present");
+    assert!(state.fields.contains_key("enabled"), "enabled field must be present");
     assert!(state.fields.contains_key("carrier"),   "carrier field must be present");
 }
 
@@ -1173,4 +1159,88 @@ async fn test_query_by_mac_selects_second_veth_excludes_first() {
         result.get("ethernet", "veth-mac2a").is_none(),
         "veth-mac2a must be excluded when filtering by veth-mac2b's MAC"
     );
+}
+
+// ── enabled/carrier state combinations ──────────────────────────────────────
+
+/// Both down: newly created veth pair without set_link_up → enabled=false, carrier=false.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_enabled_false_carrier_false_when_both_down() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-ec-a0", "veth-ec-a1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-ec-a0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+    let state = result.get("ethernet", "veth-ec-a0").unwrap();
+
+    let enabled = state.fields.get("enabled").unwrap().value.as_bool().unwrap();
+    let carrier = state.fields.get("carrier").unwrap().value.as_bool().unwrap();
+
+    assert!(!enabled, "enabled must be false when link is not brought up");
+    assert!(!carrier, "carrier must be false when link is down");
+}
+
+/// Admin up, no carrier: only one end of the veth pair is up → enabled=true, carrier=false.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_enabled_true_carrier_false_when_peer_down() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-ec-b0", "veth-ec-b1").await.unwrap();
+    set_link_up("veth-ec-b0").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-ec-b0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+    let state = result.get("ethernet", "veth-ec-b0").unwrap();
+
+    let enabled = state.fields.get("enabled").unwrap().value.as_bool().unwrap();
+    let carrier = state.fields.get("carrier").unwrap().value.as_bool().unwrap();
+
+    assert!(enabled, "enabled must be true when link is brought up");
+    assert!(!carrier, "carrier must be false when peer is still down");
+}
+
+/// Both up, carrier present: both ends of the veth pair are up → enabled=true, carrier=true.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_enabled_true_carrier_true_when_both_up() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-ec-c0", "veth-ec-c1").await.unwrap();
+    set_link_up("veth-ec-c0").await.unwrap();
+    set_link_up("veth-ec-c1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-ec-c0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+    let state = result.get("ethernet", "veth-ec-c0").unwrap();
+
+    let enabled = state.fields.get("enabled").unwrap().value.as_bool().unwrap();
+    let carrier = state.fields.get("carrier").unwrap().value.as_bool().unwrap();
+
+    assert!(enabled, "enabled must be true when link is up");
+    assert!(carrier, "carrier must be true when both veth endpoints are up");
+}
+
+/// Admin down after carrier: bring both up then bring one down → enabled=false, carrier=false.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_enabled_false_carrier_false_after_admin_down() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-ec-d0", "veth-ec-d1").await.unwrap();
+    set_link_up("veth-ec-d0").await.unwrap();
+    set_link_up("veth-ec-d1").await.unwrap();
+    set_link_down("veth-ec-d0").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-ec-d0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+    let state = result.get("ethernet", "veth-ec-d0").unwrap();
+
+    let enabled = state.fields.get("enabled").unwrap().value.as_bool().unwrap();
+    let carrier = state.fields.get("carrier").unwrap().value.as_bool().unwrap();
+
+    assert!(!enabled, "enabled must be false after set_link_down");
+    assert!(!carrier, "carrier must be false when interface is admin-down");
 }

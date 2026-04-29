@@ -410,14 +410,14 @@ async fn apply_remove(
         .execute()
         .await
     {
-        Ok(()) => fields_changed.push("operstate".to_string()),
+        Ok(()) => fields_changed.push("enabled".to_string()),
         Err(e) => {
             return fail_op(
                 DiffOpKind::Remove,
                 entity_type,
                 selector,
                 map_netlink_error(e, &format!("set link down on {name}")),
-                vec!["operstate".to_string()],
+                vec!["enabled".to_string()],
             );
         }
     }
@@ -440,7 +440,7 @@ async fn apply_remove(
 /// Apply field changes to an interface. Returns `(fields_changed, failures, skipped)`.
 ///
 /// Field changes are applied in prescribed order:
-/// 1. Link-level (mtu, operstate)
+/// 1. Link-level (mtu, enabled)
 /// 2. Addresses (remove before add to preserve YAML ordering)
 /// 3. Routes
 ///
@@ -508,47 +508,45 @@ async fn apply_modify_fields(
         }
     }
 
-    if let Some(fv) = changed_fields.get("operstate") {
-        if let Some(desired) = fv.value.as_str() {
-            match desired {
-                "up" => {
-                    match handle
-                        .link()
-                        .change(LinkUnspec::new_with_index(index).up().build())
-                        .execute()
-                        .await
-                    {
-                        Ok(()) => fields_changed.push("operstate".to_string()),
-                        Err(e) => failures.push(make_field_failure(
-                            name,
-                            map_netlink_error(e, &format!("set link up on {name}")),
-                            "operstate",
-                        )),
-                    }
+    if let Some(fv) = changed_fields.get("enabled") {
+        match fv.value.as_bool() {
+            Some(true) => {
+                match handle
+                    .link()
+                    .change(LinkUnspec::new_with_index(index).up().build())
+                    .execute()
+                    .await
+                {
+                    Ok(()) => fields_changed.push("enabled".to_string()),
+                    Err(e) => failures.push(make_field_failure(
+                        name,
+                        map_netlink_error(e, &format!("set link up on {name}")),
+                        "enabled",
+                    )),
                 }
-                "down" => {
-                    match handle
-                        .link()
-                        .change(LinkUnspec::new_with_index(index).down().build())
-                        .execute()
-                        .await
-                    {
-                        Ok(()) => fields_changed.push("operstate".to_string()),
-                        Err(e) => failures.push(make_field_failure(
-                            name,
-                            map_netlink_error(e, &format!("set link down on {name}")),
-                            "operstate",
-                        )),
-                    }
+            }
+            Some(false) => {
+                match handle
+                    .link()
+                    .change(LinkUnspec::new_with_index(index).down().build())
+                    .execute()
+                    .await
+                {
+                    Ok(()) => fields_changed.push("enabled".to_string()),
+                    Err(e) => failures.push(make_field_failure(
+                        name,
+                        map_netlink_error(e, &format!("set link down on {name}")),
+                        "enabled",
+                    )),
                 }
-                other => {
-                    skipped.push(SkippedOperation {
-                        operation: DiffOpKind::Modify,
-                        entity_type: "ethernet".to_string(),
-                        selector: Selector::with_name(name),
-                        reason: format!("cannot set operstate to {other}"),
-                    });
-                }
+            }
+            None => {
+                skipped.push(SkippedOperation {
+                    operation: DiffOpKind::Modify,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name(name),
+                    reason: "enabled field must be a boolean".to_string(),
+                });
             }
         }
     }
@@ -1504,8 +1502,8 @@ mod tests {
             .fields
             .insert("mtu".to_string(), kd(Value::U64(1500)));
         current.fields.insert(
-            "operstate".to_string(),
-            kd(Value::String("up".to_string())),
+            "enabled".to_string(),
+            kd(Value::Bool(true)),
         );
 
         let changes = build_planned_changes(&op, &current);

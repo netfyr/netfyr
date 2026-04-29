@@ -117,6 +117,22 @@ pub async fn set_link_up(
     Ok(())
 }
 
+/// Bring an interface to admin-down state.
+pub async fn set_link_down(
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (conn, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(conn);
+
+    let index = get_link_index(name).await?;
+    handle
+        .link()
+        .change(LinkUnspec::new_with_index(index).down().build())
+        .execute()
+        .await?;
+    Ok(())
+}
+
 /// Set the MTU of an interface.
 pub async fn set_mtu(
     name: &str,
