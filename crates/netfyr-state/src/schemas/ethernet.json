@@ -59,6 +59,10 @@
             "type": "integer",
             "minimum": 0,
             "description": "Route metric (lower is preferred)"
+          },
+          "protocol": {
+            "type": "string",
+            "description": "Route protocol (kernel, static, dhcp, etc.)"
           }
         }
       },

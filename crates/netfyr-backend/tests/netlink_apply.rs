@@ -126,6 +126,36 @@ async fn interface_exists(name: &str) -> bool {
     get_link_index(name).await.is_ok()
 }
 
+fn has_route_with_dst(routes: &[Value], dst: &str) -> bool {
+    routes.iter().any(|r| {
+        r.as_map()
+            .and_then(|m| m.get("destination"))
+            .and_then(|v| v.as_str())
+            .map(|s| s == dst)
+            .unwrap_or(false)
+    })
+}
+
+fn has_route_with_dst_and_gw(routes: &[Value], dst: &str, gw: &str) -> bool {
+    routes.iter().any(|r| {
+        let map = match r.as_map() {
+            Some(m) => m,
+            None => return false,
+        };
+        let dst_match = map
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .map(|s| s == dst)
+            .unwrap_or(false);
+        let gw_match = map
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .map(|s| s == gw)
+            .unwrap_or(false);
+        dst_match && gw_match
+    })
+}
+
 // ── Helper: add a static route via rtnetlink ──────────────────────────────────
 
 async fn add_static_route(
@@ -1624,5 +1654,185 @@ async fn test_dry_run_planned_mtu_change_has_correct_field_change_kind() {
         mtu_fc.kind,
         FieldChangeKind::Modify,
         "kind must be Modify when mtu field exists in current state"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Kernel prefix route preservation
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Applying a static policy's routes must not delete the kernel-generated
+/// prefix route for the interface's address.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_preserves_kernel_prefix_route_static_policy() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-krs0", "veth-krs1").await.unwrap();
+    set_link_up("veth-krs0").await.unwrap();
+    add_address("veth-krs0", "10.99.50.1/24").await.unwrap();
+
+    // Precondition: kernel should have auto-added 10.99.50.0/24.
+    let routes_before = query_routes("veth-krs0").await;
+    assert!(
+        has_route_with_dst(&routes_before, "10.99.50.0/24"),
+        "Precondition: kernel prefix route 10.99.50.0/24 must exist. Got: {routes_before:?}"
+    );
+
+    // Apply a static policy: only a default route, addresses unchanged.
+    let mut route_map = IndexMap::new();
+    route_map.insert(
+        "destination".to_string(),
+        Value::String("0.0.0.0/0".to_string()),
+    );
+    route_map.insert(
+        "gateway".to_string(),
+        Value::String("10.99.50.254".to_string()),
+    );
+
+    let diff = make_diff(vec![modify_op(
+        "veth-krs0",
+        one_field("routes", Value::List(vec![Value::Map(route_map)])),
+        vec![],
+    )]);
+
+    let handle = establish_connection().await.unwrap();
+    let report = apply_ethernet(&handle, &diff).await.unwrap();
+    assert!(
+        report.is_success(),
+        "Apply must succeed: {}",
+        report.summary()
+    );
+
+    let routes_after = query_routes("veth-krs0").await;
+
+    assert!(
+        has_route_with_dst(&routes_after, "10.99.50.0/24"),
+        "Kernel prefix route 10.99.50.0/24 must survive apply. Got: {routes_after:?}"
+    );
+    assert!(
+        has_route_with_dst(&routes_after, "0.0.0.0/0"),
+        "Default route must be present after apply. Got: {routes_after:?}"
+    );
+}
+
+/// Applying a DHCP-produced desired state must not delete the kernel prefix
+/// route for the leased address.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_preserves_kernel_prefix_route_dhcp_policy() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-krd0", "veth-krd1").await.unwrap();
+    set_link_up("veth-krd0").await.unwrap();
+    add_address("veth-krd0", "10.99.60.100/24").await.unwrap();
+
+    // Precondition: kernel prefix route exists.
+    let routes_before = query_routes("veth-krd0").await;
+    assert!(
+        has_route_with_dst(&routes_before, "10.99.60.0/24"),
+        "Precondition: kernel prefix route must exist. Got: {routes_before:?}"
+    );
+
+    // Simulate DHCP-produced desired state: default gateway only.
+    let mut route_map = IndexMap::new();
+    route_map.insert(
+        "destination".to_string(),
+        Value::String("0.0.0.0/0".to_string()),
+    );
+    route_map.insert(
+        "gateway".to_string(),
+        Value::String("10.99.60.1".to_string()),
+    );
+    route_map.insert("metric".to_string(), Value::U64(0));
+
+    let diff = make_diff(vec![modify_op(
+        "veth-krd0",
+        one_field("routes", Value::List(vec![Value::Map(route_map)])),
+        vec![],
+    )]);
+
+    let handle = establish_connection().await.unwrap();
+    let report = apply_ethernet(&handle, &diff).await.unwrap();
+    assert!(
+        report.is_success(),
+        "Apply must succeed: {}",
+        report.summary()
+    );
+
+    let routes_after = query_routes("veth-krd0").await;
+
+    assert!(
+        has_route_with_dst(&routes_after, "10.99.60.0/24"),
+        "Kernel prefix route 10.99.60.0/24 must survive DHCP apply. Got: {routes_after:?}"
+    );
+    assert!(
+        has_route_with_dst(&routes_after, "0.0.0.0/0"),
+        "Default route must exist after DHCP apply. Got: {routes_after:?}"
+    );
+}
+
+/// When a static policy's address changes, the old kernel prefix route must
+/// disappear (kernel removes it) and the new one must appear.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_prefix_route_updates_on_static_address_change() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-kru0", "veth-kru1").await.unwrap();
+    set_link_up("veth-kru0").await.unwrap();
+    add_address("veth-kru0", "10.99.70.1/24").await.unwrap();
+    add_static_route("veth-kru0", "0.0.0.0/0", "10.99.70.254")
+        .await
+        .unwrap();
+
+    // Precondition: old prefix route and default route exist.
+    let routes_before = query_routes("veth-kru0").await;
+    assert!(
+        has_route_with_dst(&routes_before, "10.99.70.0/24"),
+        "Precondition: old prefix route must exist. Got: {routes_before:?}"
+    );
+
+    // Apply new address and new default gateway (simulating policy update).
+    let mut route_map = IndexMap::new();
+    route_map.insert(
+        "destination".to_string(),
+        Value::String("0.0.0.0/0".to_string()),
+    );
+    route_map.insert(
+        "gateway".to_string(),
+        Value::String("10.99.71.254".to_string()),
+    );
+
+    let mut changed_fields = IndexMap::new();
+    changed_fields.insert(
+        "addresses".to_string(),
+        kd(Value::List(vec![Value::String("10.99.71.1/24".to_string())])),
+    );
+    changed_fields.insert(
+        "routes".to_string(),
+        kd(Value::List(vec![Value::Map(route_map)])),
+    );
+
+    let diff = make_diff(vec![modify_op("veth-kru0", changed_fields, vec![])]);
+
+    let handle = establish_connection().await.unwrap();
+    let report = apply_ethernet(&handle, &diff).await.unwrap();
+    assert!(
+        report.is_success(),
+        "Apply must succeed: {}",
+        report.summary()
+    );
+
+    let routes_after = query_routes("veth-kru0").await;
+
+    assert!(
+        !has_route_with_dst(&routes_after, "10.99.70.0/24"),
+        "Old prefix route 10.99.70.0/24 must be gone (kernel removed it). Got: {routes_after:?}"
+    );
+    assert!(
+        has_route_with_dst(&routes_after, "10.99.71.0/24"),
+        "New prefix route 10.99.71.0/24 must exist (kernel added it). Got: {routes_after:?}"
+    );
+    assert!(
+        has_route_with_dst_and_gw(&routes_after, "0.0.0.0/0", "10.99.71.254"),
+        "New default route via 10.99.71.254 must exist. Got: {routes_after:?}"
     );
 }

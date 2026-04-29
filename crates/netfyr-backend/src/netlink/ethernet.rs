@@ -9,7 +9,9 @@ use netfyr_state::{FieldValue, Provenance, Selector, State, StateMetadata, State
 use netlink_packet_route::link::{
     InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkLayerType, LinkMessage,
 };
-use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+use netlink_packet_route::route::{
+    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol,
+};
 use rtnetlink::Handle;
 use tracing::warn;
 
@@ -131,10 +133,22 @@ fn route_address_to_ip(addr: &RouteAddress) -> Option<IpAddr> {
     }
 }
 
+fn route_protocol_str(proto: RouteProtocol) -> &'static str {
+    match proto {
+        RouteProtocol::Kernel => "kernel",
+        RouteProtocol::Boot => "boot",
+        RouteProtocol::Static => "static",
+        RouteProtocol::Dhcp => "dhcp",
+        RouteProtocol::Ra => "ra",
+        _ => "other",
+    }
+}
+
 fn build_route_value(
     destination: &str,
     gateway: Option<&str>,
     metric: u32,
+    protocol: Option<&str>,
 ) -> Value {
     let mut map = IndexMap::new();
     map.insert("destination".to_string(), Value::String(destination.to_owned()));
@@ -142,6 +156,9 @@ fn build_route_value(
         map.insert("gateway".to_string(), Value::String(gw.to_owned()));
     }
     map.insert("metric".to_string(), Value::U64(metric as u64));
+    if let Some(proto) = protocol {
+        map.insert("protocol".to_string(), Value::String(proto.to_owned()));
+    }
     Value::Map(map)
 }
 
@@ -274,10 +291,12 @@ fn parse_route_message(
     };
 
     let gateway_str = gateway_ip.map(|ip| ip.to_string());
+    let protocol = route_protocol_str(msg.header.protocol);
     Some(build_route_value(
         &destination,
         gateway_str.as_deref(),
         metric,
+        Some(protocol),
     ))
 }
 
@@ -396,11 +415,12 @@ mod tests {
     /// build_route_value without gateway produces a map with destination and metric.
     #[test]
     fn test_build_route_value_without_gateway() {
-        let val = build_route_value("10.0.0.0/24", None, 100);
+        let val = build_route_value("10.0.0.0/24", None, 100, None);
         let map = val.as_map().expect("build_route_value must return Value::Map");
         assert!(map.contains_key("destination"), "map must have 'destination' key");
         assert!(map.contains_key("metric"),      "map must have 'metric' key");
         assert!(!map.contains_key("gateway"),    "map must NOT have 'gateway' key when not provided");
+        assert!(!map.contains_key("protocol"),   "map must NOT have 'protocol' key when not provided");
         assert_eq!(map["destination"].as_str(), Some("10.0.0.0/24"));
         assert_eq!(map["metric"].as_u64(), Some(100));
     }
@@ -408,20 +428,22 @@ mod tests {
     /// build_route_value with gateway produces a map with destination, gateway, and metric.
     #[test]
     fn test_build_route_value_with_gateway() {
-        let val = build_route_value("0.0.0.0/0", Some("192.168.1.1"), 0);
+        let val = build_route_value("0.0.0.0/0", Some("192.168.1.1"), 0, Some("static"));
         let map = val.as_map().expect("build_route_value must return Value::Map");
         assert!(map.contains_key("destination"), "map must have 'destination' key");
         assert!(map.contains_key("gateway"),     "map must have 'gateway' key when provided");
         assert!(map.contains_key("metric"),      "map must have 'metric' key");
+        assert!(map.contains_key("protocol"),    "map must have 'protocol' key when provided");
         assert_eq!(map["destination"].as_str(), Some("0.0.0.0/0"));
         assert_eq!(map["gateway"].as_str(), Some("192.168.1.1"));
         assert_eq!(map["metric"].as_u64(), Some(0));
+        assert_eq!(map["protocol"].as_str(), Some("static"));
     }
 
     /// build_route_value gateway field is only present when Some(_) is passed.
     #[test]
     fn test_build_route_value_gateway_field_absent_when_none() {
-        let val = build_route_value("::/0", None, 512);
+        let val = build_route_value("::/0", None, 512, None);
         let map = val.as_map().unwrap();
         assert!(!map.contains_key("gateway"), "gateway must be absent when None");
         assert_eq!(map["metric"].as_u64(), Some(512));
@@ -430,9 +452,10 @@ mod tests {
     /// build_route_value preserves the metric value exactly.
     #[test]
     fn test_build_route_value_metric_preserved() {
-        let val = build_route_value("10.99.0.0/24", None, 1024);
+        let val = build_route_value("10.99.0.0/24", None, 1024, Some("kernel"));
         let map = val.as_map().unwrap();
         assert_eq!(map["metric"].as_u64(), Some(1024));
+        assert_eq!(map["protocol"].as_str(), Some("kernel"));
     }
 
     // ── route_address_to_ip ───────────────────────────────────────────────────

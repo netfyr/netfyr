@@ -700,6 +700,7 @@ async fn apply_modify_fields(
         let to_remove: Vec<&Value> = current_routes
             .iter()
             .filter(|r| !desired_routes.contains(r))
+            .filter(|r| !is_kernel_route(r))
             .collect();
 
         // Add new routes.
@@ -1090,6 +1091,15 @@ fn value_to_str(v: &Value) -> Option<String> {
         Value::IpAddr(ip) => Some(ip.to_string()),
         _ => None,
     }
+}
+
+fn is_kernel_route(route_val: &Value) -> bool {
+    route_val
+        .as_map()
+        .and_then(|m| m.get("protocol"))
+        .and_then(|v| v.as_str())
+        .map(|s| s == "kernel")
+        .unwrap_or(false)
 }
 
 /// Extract destination and optional gateway from a route `Value::Map`.
