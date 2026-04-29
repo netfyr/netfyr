@@ -609,3 +609,152 @@ async fn test_lease_expired_event_when_dhcp_server_stops() {
     // After LeaseExpired, the factory re-enters DORA. Stop it cleanly.
     factory.stop().await.expect("stop() must succeed");
 }
+
+// ── Scenario: Unicast renewal after server restart ──────────────────────────
+
+/// Scenario: Unicast renewal succeeds after DHCP server restart
+///
+/// Given an active DHCP lease (120s, T1=60s)
+/// When the DHCP server is killed and restarted before T1
+/// Then the RENEWING unicast at T1 reaches the restarted server
+///   and a LeaseRenewed event is received
+///
+/// Timeline (120s lease, T1=60s, T2=105s):
+///   t=0   → lease acquired, dnsmasq killed
+///   t=30  → dnsmasq restarted (well before T1)
+///   t=60  → RENEWING: unicast to server → ACK
+///   t≈60  → LeaseRenewed
+#[tokio::test]
+async fn test_renew_succeeds_after_server_restart() {
+    require_netns!(_ns);
+    setup_veth_pair().await;
+
+    let dnsmasq =
+        match DnsmasqGuard::start(VETH_SERVER, SERVER_IP, RANGE_START, RANGE_END, "120s") {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping: dnsmasq unavailable: {e}");
+                return;
+            }
+        };
+
+    let (tx, mut rx) = mpsc::channel::<FactoryEvent>(16);
+    let mut factory =
+        Dhcpv4Factory::start(VETH_CLIENT, "test-renew-restart".to_string(), 100, tx)
+            .await
+            .expect("start() must succeed");
+
+    assert!(
+        wait_for_lease_acquired(&mut rx).await,
+        "must acquire initial lease"
+    );
+
+    // Kill dnsmasq and restart after 30 seconds. The server is offline for
+    // a significant portion of the lease but returns well before T1 (60s).
+    drop(dnsmasq);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let _dnsmasq2 =
+        DnsmasqGuard::start(VETH_SERVER, SERVER_IP, RANGE_START, RANGE_END, "120s")
+            .expect("dnsmasq restart must succeed");
+
+    // Unicast renewal at T1 (60s) should succeed since the server is alive.
+    let renewed = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            match rx.recv().await {
+                Some(FactoryEvent::LeaseRenewed { .. }) => return true,
+                Some(FactoryEvent::LeaseExpired { .. }) => return false,
+                Some(FactoryEvent::Error { error, .. }) => {
+                    eprintln!("DHCP error (may retry): {error}");
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(renewed, "LeaseRenewed must be received after server restart");
+
+    factory.stop().await.expect("stop() must succeed");
+}
+
+// ── Scenario: Broadcast rebind after server restart ─────────────────────────
+
+/// Scenario: Broadcast rebind succeeds after server is temporarily unavailable
+///
+/// Given an active DHCP lease (120s, T1=60s, T2=105s)
+/// When the DHCP server is killed and restarted at t≈70s (after T1, before T2)
+/// Then the RENEWING unicast fails (server was dead when the request was sent)
+///   and the REBINDING broadcast at T2 succeeds (server is alive)
+///   resulting in a LeaseRenewed event
+///
+/// This validates the RENEWING → REBINDING transition per RFC 2131 §4.4.5.
+///
+/// Timeline (120s lease, T1=60s, T2=105s):
+///   t=0    → lease acquired, dnsmasq killed
+///   t=60   → RENEWING: unicast to dead server (timeout=45s)
+///   t=70   → dnsmasq restarted
+///   t=105  → unicast times out; REBINDING: broadcast → server alive → ACK
+///   t≈105  → LeaseRenewed
+#[tokio::test]
+async fn test_rebind_succeeds_after_server_restart() {
+    require_netns!(_ns);
+    setup_veth_pair().await;
+
+    let dnsmasq =
+        match DnsmasqGuard::start(VETH_SERVER, SERVER_IP, RANGE_START, RANGE_END, "120s") {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping: dnsmasq unavailable: {e}");
+                return;
+            }
+        };
+
+    let (tx, mut rx) = mpsc::channel::<FactoryEvent>(16);
+    let mut factory = Dhcpv4Factory::start(VETH_CLIENT, "test-rebind".to_string(), 100, tx)
+        .await
+        .expect("start() must succeed");
+
+    assert!(
+        wait_for_lease_acquired(&mut rx).await,
+        "must acquire initial lease before testing rebind"
+    );
+
+    // Kill dnsmasq — server unreachable. The RENEWING unicast at T1 (60s)
+    // will be sent to a dead server, so the request is lost. The client
+    // waits 45s (half the remaining time to T2) for an ACK that never comes.
+    drop(dnsmasq);
+
+    // Restart dnsmasq 70s after lease acquisition — past T1 (60s) but well
+    // before T2 (105s). The server will be alive when the client transitions
+    // to REBINDING and broadcasts a DHCPREQUEST.
+    tokio::time::sleep(Duration::from_secs(70)).await;
+    let _dnsmasq2 =
+        DnsmasqGuard::start(VETH_SERVER, SERVER_IP, RANGE_START, RANGE_END, "120s")
+            .expect("dnsmasq restart must succeed");
+
+    // REBINDING broadcast expected at T2 ≈ 105s. Allow 60s after restart.
+    let renewed = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match rx.recv().await {
+                Some(FactoryEvent::LeaseRenewed { .. }) => return true,
+                Some(FactoryEvent::LeaseExpired { .. }) => return false,
+                Some(FactoryEvent::Error { error, .. }) => {
+                    eprintln!("DHCP error (expected during outage): {error}");
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        renewed,
+        "LeaseRenewed must be received via REBINDING broadcast after server restart"
+    );
+
+    factory.stop().await.expect("stop() must succeed");
+}

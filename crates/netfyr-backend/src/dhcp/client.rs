@@ -37,6 +37,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_SERVER_PORT: u16 = 67;
 
+// RFC 2131 §4.4.5: minimum interval between retransmissions during
+// RENEWING and REBINDING states.
+const MIN_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
 // Bounded drain after DHCPACK before dropping the packet socket.
 const DRAIN_LIMIT: usize = 10;
 
@@ -383,69 +387,90 @@ async fn run_lease_maintenance(
 ) -> LeaseMaintOutcome {
     loop {
         let renewal_wait = lease.time_until_renewal();
-        let rebind_wait = lease.time_until_rebind();
-        let expiry_wait = lease.time_until_expiry();
-
-        tokio::select! {
-            biased;
-
-            _ = &mut *stop_rx => {
-                send_release(socket, mac, lease.ip, lease.server_id).await;
-                return LeaseMaintOutcome::Stop;
-            }
-
-            _ = tokio::time::sleep(renewal_wait), if !renewal_wait.is_zero() => {
-                if let Some(updated) = attempt_renewal(socket, mac, &lease, false).await {
-                    lease = updated;
-                    let state = lease_to_state(&lease, interface, policy_name, priority);
-                    {
-                        let mut guard = shared_state.lock().unwrap();
-                        *guard = Some(state.clone());
-                    }
-                    {
-                        let mut timing_guard = lease_timing.lock().unwrap();
-                        *timing_guard = Some(LeaseTimingInfo {
-                            lease_time_secs: lease.lease_time,
-                            acquired_at: lease.acquired_at,
-                        });
-                    }
-                    let _ = state_tx
-                        .send(FactoryEvent::LeaseRenewed {
-                            policy_name: policy_name.to_string(),
-                            state,
-                        })
-                        .await;
+        if !renewal_wait.is_zero() {
+            tokio::select! {
+                biased;
+                _ = &mut *stop_rx => {
+                    send_release(socket, mac, lease.ip, lease.server_id).await;
+                    return LeaseMaintOutcome::Stop;
                 }
-            }
-
-            _ = tokio::time::sleep(rebind_wait), if !rebind_wait.is_zero() => {
-                if let Some(updated) = attempt_renewal(socket, mac, &lease, true).await {
-                    lease = updated;
-                    let state = lease_to_state(&lease, interface, policy_name, priority);
-                    {
-                        let mut guard = shared_state.lock().unwrap();
-                        *guard = Some(state.clone());
-                    }
-                    {
-                        let mut timing_guard = lease_timing.lock().unwrap();
-                        *timing_guard = Some(LeaseTimingInfo {
-                            lease_time_secs: lease.lease_time,
-                            acquired_at: lease.acquired_at,
-                        });
-                    }
-                    let _ = state_tx
-                        .send(FactoryEvent::LeaseRenewed {
-                            policy_name: policy_name.to_string(),
-                            state,
-                        })
-                        .await;
-                }
-            }
-
-            _ = tokio::time::sleep(expiry_wait) => {
-                return LeaseMaintOutcome::Expired;
+                _ = tokio::time::sleep(renewal_wait) => {}
             }
         }
+
+        // RFC 2131 §4.4.5: In RENEWING, retransmit DHCPREQUEST (unicast)
+        // at one-half the remaining time until T2, min 60 seconds. On
+        // reaching T2 without an ACK, transition to REBINDING and
+        // retransmit (broadcast) at one-half the remaining lease time,
+        // min 60 seconds, until the lease expires.
+        let renewed = 'renewal: {
+            // RENEWING: unicast to the original server.
+            loop {
+                let remaining = lease.time_until_rebind();
+                if remaining.is_zero() {
+                    break;
+                }
+                let timeout = (remaining / 2).max(MIN_RETRY_INTERVAL).min(remaining);
+                let result = tokio::select! {
+                    biased;
+                    _ = &mut *stop_rx => {
+                        send_release(socket, mac, lease.ip, lease.server_id).await;
+                        return LeaseMaintOutcome::Stop;
+                    }
+                    r = attempt_renewal(socket, mac, &lease, false, timeout) => r,
+                };
+                if let Some(updated) = result {
+                    lease = updated;
+                    break 'renewal true;
+                }
+            }
+
+            // REBINDING: broadcast to any server.
+            loop {
+                let remaining = lease.time_until_expiry();
+                if remaining.is_zero() {
+                    break;
+                }
+                let timeout = (remaining / 2).max(MIN_RETRY_INTERVAL).min(remaining);
+                let result = tokio::select! {
+                    biased;
+                    _ = &mut *stop_rx => {
+                        send_release(socket, mac, lease.ip, lease.server_id).await;
+                        return LeaseMaintOutcome::Stop;
+                    }
+                    r = attempt_renewal(socket, mac, &lease, true, timeout) => r,
+                };
+                if let Some(updated) = result {
+                    lease = updated;
+                    break 'renewal true;
+                }
+            }
+
+            false
+        };
+
+        if !renewed {
+            return LeaseMaintOutcome::Expired;
+        }
+
+        let state = lease_to_state(&lease, interface, policy_name, priority);
+        {
+            let mut guard = shared_state.lock().unwrap();
+            *guard = Some(state.clone());
+        }
+        {
+            let mut timing_guard = lease_timing.lock().unwrap();
+            *timing_guard = Some(LeaseTimingInfo {
+                lease_time_secs: lease.lease_time,
+                acquired_at: lease.acquired_at,
+            });
+        }
+        let _ = state_tx
+            .send(FactoryEvent::LeaseRenewed {
+                policy_name: policy_name.to_string(),
+                state,
+            })
+            .await;
     }
 }
 
@@ -458,6 +483,7 @@ async fn attempt_renewal(
     mac: [u8; 6],
     lease: &DhcpLease,
     broadcast: bool,
+    timeout: Duration,
 ) -> Option<DhcpLease> {
     let xid: u32 = rand::random();
     let request = build_renew_request(xid, mac, lease.ip, lease.server_id);
@@ -471,7 +497,7 @@ async fn attempt_renewal(
 
     socket.send_to(&encoded, dest).await.ok()?;
 
-    recv_dhcp_response(socket, xid, MessageType::Ack, DISCOVER_TIMEOUT)
+    recv_dhcp_response(socket, xid, MessageType::Ack, timeout)
         .await
         .ok()
         .and_then(|ack| parse_ack(&ack).ok())
