@@ -317,11 +317,21 @@ impl Reconciler {
 
         if state_diff.is_empty() {
             tracing::debug!("Reconciliation: no changes needed");
+            let journal_state = filter_stable_fields(&managed_actual);
+            let (journal_diff, journal_state) =
+                if let Some(iface) = dhcp_trigger_interface(&trigger, policy_store) {
+                    (
+                        filter_diff_for_interface(&reconcile_diff, iface),
+                        filter_state_for_interface(&journal_state, iface),
+                    )
+                } else {
+                    (reconcile_diff.clone(), journal_state)
+                };
             self.append_journal_entry(
                 policy_store,
                 &trigger,
-                &reconcile_diff,
-                &filter_stable_fields(&managed_actual),
+                &journal_diff,
+                &journal_state,
                 ApplyOutcome::Applied {
                     succeeded: 0,
                     failed: 0,
@@ -364,11 +374,20 @@ impl Reconciler {
             }
         };
 
+        let (journal_diff, journal_state) =
+            if let Some(iface) = dhcp_trigger_interface(&trigger, policy_store) {
+                (
+                    filter_diff_for_interface(&reconcile_diff, iface),
+                    filter_state_for_interface(&post_apply_state, iface),
+                )
+            } else {
+                (reconcile_diff, post_apply_state)
+            };
         self.append_journal_entry(
             policy_store,
             &trigger,
-            &reconcile_diff,
-            &post_apply_state,
+            &journal_diff,
+            &journal_state,
             ApplyOutcome::Applied {
                 succeeded: report.succeeded.len() as u32,
                 failed: report.failed.len() as u32,
@@ -699,6 +718,46 @@ fn annotate_diff_outcomes(diff: &mut SerializableDiff, report: &ApplyReport) {
             }
         }
     }
+}
+
+/// Resolve the interface name for a DHCP trigger from the policy store.
+fn dhcp_trigger_interface<'a>(trigger: &Trigger, policy_store: &'a PolicyStore) -> Option<&'a str> {
+    if let Trigger::DhcpEvent { ref policy_name, .. } = trigger {
+        policy_store
+            .policies()
+            .iter()
+            .find(|p| p.name == *policy_name)
+            .and_then(|p| p.selector.as_ref())
+            .and_then(|s| s.name.as_deref())
+    } else {
+        None
+    }
+}
+
+/// Filter a reconcile diff to keep only operations for `iface_name`.
+fn filter_diff_for_interface(
+    diff: &ReconcileStateDiff,
+    iface_name: &str,
+) -> ReconcileStateDiff {
+    ReconcileStateDiff {
+        operations: diff
+            .operations
+            .iter()
+            .filter(|op| op.selector.key() == iface_name)
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Filter a state set to keep only the entity matching `iface_name`.
+fn filter_state_for_interface(state: &StateSet, iface_name: &str) -> StateSet {
+    let mut filtered = StateSet::new();
+    for s in state.iter() {
+        if s.selector.key() == iface_name {
+            filtered.insert(s.clone());
+        }
+    }
+    filtered
 }
 
 /// Return a copy of `set` with all `STABLE_FIELDS` removed from every state.
