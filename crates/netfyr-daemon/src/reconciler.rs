@@ -308,12 +308,10 @@ impl Reconciler {
         // Restrict the actual state to only the entities present in the effective
         // desired state before computing the diff. This prevents the daemon from
         // generating Remove operations for interfaces not covered by any policy.
-        let mut managed_actual = StateSet::new();
-        for (entity_type, selector_key) in effective_state.entities() {
-            if let Some(state) = actual_state.get(&entity_type, &selector_key) {
-                managed_actual.insert(state.clone());
-            }
-        }
+        // Additionally, drop fields marked keep-when-absent that are not in the
+        // desired state — these have a kernel default and should not be unset
+        // just because no policy manages them.
+        let managed_actual = self.restrict_to_managed(&actual_state, &effective_state);
 
         let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state);
 
@@ -432,12 +430,7 @@ impl Reconciler {
         );
 
         // Restrict actual state to only entities present in the target snapshot.
-        let mut managed_actual = StateSet::new();
-        for (entity_type, selector_key) in target_state.entities() {
-            if let Some(state) = actual_state.get(&entity_type, &selector_key) {
-                managed_actual.insert(state.clone());
-            }
-        }
+        let managed_actual = self.restrict_to_managed(&actual_state, target_state);
 
         let state_diff = netfyr_state::diff::diff(&managed_actual, target_state);
 
@@ -638,6 +631,32 @@ impl Reconciler {
         }
 
         inputs
+    }
+
+    /// Restrict `actual` to managed entities and filter out fields marked
+    /// `keep-when-absent` that are not present in the desired state. This
+    /// ensures the apply diff (which has no schema access) does not generate
+    /// spurious removed-field entries for kernel-defaulted fields like `mtu`.
+    fn restrict_to_managed(&self, actual: &StateSet, desired: &StateSet) -> StateSet {
+        let mut filtered = StateSet::new();
+        for (entity_type, selector_key) in desired.entities() {
+            if let Some(actual_state) = actual.get(&entity_type, &selector_key) {
+                let desired_state = desired
+                    .get(&entity_type, &selector_key)
+                    .expect("entity returned by entities() must exist");
+                let mut s = actual_state.clone();
+                s.fields.retain(|name, _| {
+                    desired_state.fields.contains_key(name)
+                        || !self
+                            .schema_registry
+                            .field_info(&entity_type, name)
+                            .map(|info| info.keep_when_absent)
+                            .unwrap_or(false)
+                });
+                filtered.insert(s);
+            }
+        }
+        filtered
     }
 }
 

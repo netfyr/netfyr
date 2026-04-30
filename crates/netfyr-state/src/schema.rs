@@ -55,6 +55,10 @@ pub struct FieldSchemaInfo {
     pub required: bool,
     /// `true` = can be set in policies; `false` = read-only (query output only).
     pub writable: bool,
+    /// `true` = when this field is absent from the desired state, keep the
+    /// current kernel value instead of unsetting it. Used for fields like
+    /// `mtu` that have a kernel default and are not always managed by policies.
+    pub keep_when_absent: bool,
     pub constraints: Option<FieldConstraints>,
     pub description: Option<String>,
 }
@@ -443,13 +447,15 @@ fn parse_field_metadata(schema: &serde_json::Value) -> HashMap<String, FieldSche
         // `x-netfyr-writable` defaults to `false` (read-only) when absent.
         let writable =
             field_schema.get("x-netfyr-writable").and_then(|v| v.as_bool()).unwrap_or(false);
+        let keep_when_absent =
+            field_schema.get("x-netfyr-keep-when-absent").and_then(|v| v.as_bool()).unwrap_or(false);
         let description =
             field_schema.get("description").and_then(|v| v.as_str()).map(String::from);
         let constraints = parse_constraints(field_schema);
 
         fields.insert(
             field_name.clone(),
-            FieldSchemaInfo { field_type, required, writable, constraints, description },
+            FieldSchemaInfo { field_type, required, writable, keep_when_absent, constraints, description },
         );
     }
 

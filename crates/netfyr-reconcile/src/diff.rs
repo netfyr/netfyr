@@ -231,6 +231,17 @@ pub fn generate_diff(
                     }
                 } else {
                     // Field in desired but not actual — field is being added.
+                    // Skip non-writable fields: they cannot be applied by the
+                    // backend so reporting them as changes is misleading
+                    // (e.g. dns_servers from a DHCP lease).
+                    let is_read_only = schema
+                        .field_info(&entity_type, field_name)
+                        .map(|info| !info.writable)
+                        .unwrap_or(false);
+                    if is_read_only {
+                        continue;
+                    }
+
                     field_changes.push(FieldChange {
                         field_name: field_name.clone(),
                         change: FieldChangeKind::Set { current: None, desired: desired_fv.clone() },
@@ -246,15 +257,18 @@ pub fn generate_diff(
                     continue;
                 }
 
-                // Check whether this field is read-only per the schema.
-                // If so, skip it — read-only fields are informational and not
-                // part of the desired-state contract.
-                let is_read_only = schema
+                // Check whether this field should be skipped per the schema:
+                // - read-only fields are informational, not part of the
+                //   desired-state contract;
+                // - fields marked keep-when-absent have a kernel default and
+                //   should not be unset just because no policy manages them
+                //   (e.g. mtu on a DHCP-managed interface).
+                let skip = schema
                     .field_info(&entity_type, field_name)
-                    .map(|info| !info.writable)
-                    .unwrap_or(false); // unknown fields treated as writable
+                    .map(|info| !info.writable || info.keep_when_absent)
+                    .unwrap_or(false);
 
-                if is_read_only {
+                if skip {
                     continue;
                 }
 
@@ -846,6 +860,37 @@ mod tests {
         assert!(
             diff.is_empty(),
             "mac is read-only and must not generate a Modify operation"
+        );
+    }
+
+    // ── Scenario: Non-writable field in desired-not-actual excluded from diff ─
+
+    #[test]
+    fn test_read_only_dns_servers_in_desired_not_actual_excluded_from_diff() {
+        // dns_servers is x-netfyr-writable: false in the ethernet schema.
+        // When present in desired but absent from actual (the kernel cannot
+        // report DNS), it must NOT generate a Set change.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![
+                ("enabled", Value::Bool(true)),
+                ("dns_servers", Value::List(vec![Value::String("10.0.0.1".to_string())])),
+            ],
+        ));
+
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("enabled", Value::Bool(true))]));
+
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "dns_servers is read-only and must not generate a Set operation when in desired but not actual"
         );
     }
 

@@ -10,7 +10,8 @@
       "minimum": 68,
       "maximum": 65535,
       "description": "Maximum transmission unit",
-      "x-netfyr-writable": true
+      "x-netfyr-writable": true,
+      "x-netfyr-keep-when-absent": true
     },
     "addresses": {
       "type": "array",
