@@ -6,11 +6,15 @@
 
 use std::net::IpAddr;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use netfyr_state::{DiffOp, FieldValue, Selector, State, StateDiff, Value};
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+use netlink_packet_route::RouteNetlinkMessage;
+use rtnetlink::packet_core::{
+    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST,
+};
 use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
 use tracing::warn;
 
@@ -26,6 +30,9 @@ use super::ethernet::query_ethernet;
 
 /// Fields reported by the query layer that cannot be set via netlink.
 const READONLY_FIELDS: &[&str] = &["carrier", "speed", "mac", "driver", "name"];
+
+/// Default route metric applied when the desired state does not specify one.
+const DEFAULT_ROUTE_METRIC: u32 = 100;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
@@ -707,8 +714,8 @@ async fn apply_modify_fields(
         for route_val in &to_add {
             if let Some(map) = route_val.as_map() {
                 match extract_route_fields(map) {
-                    Ok((dst_ip, dst_prefix, gateway)) => {
-                        match add_route(handle, index, dst_ip, dst_prefix, gateway).await {
+                    Ok((dst_ip, dst_prefix, gateway, metric)) => {
+                        match add_route(handle, index, dst_ip, dst_prefix, gateway, metric).await {
                             Ok(()) => fields_changed.push("routes".to_string()),
                             Err(ref e) if is_eexist_backend(e) => {
                                 skipped.push(SkippedOperation {
@@ -735,7 +742,7 @@ async fn apply_modify_fields(
                     for route_val in &to_remove {
                         if let Some(map) = route_val.as_map() {
                             match extract_route_fields(map) {
-                                Ok((dst_ip, dst_prefix, gateway)) => {
+                                Ok((dst_ip, dst_prefix, gateway, _metric)) => {
                                     match find_route_message(
                                         &route_msgs,
                                         dst_ip,
@@ -968,26 +975,28 @@ fn route_address_to_string(addr: &RouteAddress) -> Option<String> {
 
 // ── Route add ─────────────────────────────────────────────────────────────────
 
-/// Issue a netlink route-add for the given destination/gateway/OIF.
+/// Issue a netlink route-add for the given destination/gateway/OIF/metric.
 ///
 /// Uses `RouteMessageBuilder<IpAddr>` (rtnetlink 0.20) which sets the correct
 /// defaults: RT_TABLE_MAIN, RTPROT_STATIC, RT_SCOPE_UNIVERSE, RTN_UNICAST.
+///
+/// Sends the message with `NLM_F_APPEND` (equivalent to `ip route append`)
+/// so that multiple routes with the same destination and metric but different
+/// gateways can coexist in the routing table.
 async fn add_route(
     handle: &Handle,
     index: u32,
     dst_ip: IpAddr,
     dst_prefix: u8,
     gateway: Option<IpAddr>,
+    metric: u32,
 ) -> Result<(), BackendError> {
-    // Build the route message with correct kernel-required header fields.
     let builder = RouteMessageBuilder::<IpAddr>::new();
 
-    // Set destination prefix (required even for default route 0.0.0.0/0).
     let builder = builder
         .destination_prefix(dst_ip, dst_prefix)
         .map_err(|e| BackendError::Internal(format!("invalid route destination: {e}")))?;
 
-    // Set optional gateway.
     let builder = if let Some(gw) = gateway {
         builder
             .gateway(gw)
@@ -996,14 +1005,28 @@ async fn add_route(
         builder
     };
 
-    let msg = builder.output_interface(index).build();
+    let msg = builder
+        .output_interface(index)
+        .priority(metric)
+        .build();
 
-    handle
-        .route()
-        .add(msg)
-        .execute()
-        .await
-        .map_err(|e| map_netlink_error(e, &format!("add route via index {index}")))
+    // Bypass RouteAddRequest to use NLM_F_APPEND instead of NLM_F_EXCL.
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(msg));
+    req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND;
+
+    let mut handle = handle.clone();
+    let mut response = handle
+        .request(req)
+        .map_err(|e| map_netlink_error(e, &format!("add route via index {index}")))?;
+    while let Some(message) = response.next().await {
+        if let NetlinkPayload::Error(err) = message.payload {
+            return Err(map_netlink_error(
+                rtnetlink::Error::NetlinkError(err),
+                &format!("add route via index {index}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── Error classification ──────────────────────────────────────────────────────
@@ -1102,10 +1125,10 @@ fn is_kernel_route(route_val: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Extract destination and optional gateway from a route `Value::Map`.
+/// Extract destination, optional gateway, and metric from a route `Value::Map`.
 fn extract_route_fields(
     map: &IndexMap<String, Value>,
-) -> Result<(IpAddr, u8, Option<IpAddr>), BackendError> {
+) -> Result<(IpAddr, u8, Option<IpAddr>, u32), BackendError> {
     let destination = map
         .get("destination")
         .and_then(value_to_str)
@@ -1122,7 +1145,13 @@ fn extract_route_fields(
         })
         .transpose()?;
 
-    Ok((dst_ip, dst_prefix, gateway))
+    let metric = map
+        .get("metric")
+        .and_then(|v| v.as_u64())
+        .map(|m| m as u32)
+        .unwrap_or(DEFAULT_ROUTE_METRIC);
+
+    Ok((dst_ip, dst_prefix, gateway, metric))
 }
 
 // ── Dry-run helpers ───────────────────────────────────────────────────────────
@@ -1286,11 +1315,12 @@ mod tests {
             Value::String("10.99.0.1".to_string()),
         );
 
-        let (dst, prefix, gw) = extract_route_fields(&map).expect("valid route map must parse");
+        let (dst, prefix, gw, metric) = extract_route_fields(&map).expect("valid route map must parse");
         assert_eq!(dst.to_string(), "10.100.0.0");
         assert_eq!(prefix, 24);
         let gw = gw.expect("gateway must be Some");
         assert_eq!(gw.to_string(), "10.99.0.1");
+        assert_eq!(metric, DEFAULT_ROUTE_METRIC, "metric must default to DEFAULT_ROUTE_METRIC when absent");
     }
 
     /// Route map without a gateway must parse with gateway == None.
@@ -1302,9 +1332,10 @@ mod tests {
             Value::String("10.100.0.0/24".to_string()),
         );
 
-        let (_, _, gw) =
+        let (_, _, gw, metric) =
             extract_route_fields(&map).expect("route without gateway must parse");
         assert!(gw.is_none(), "gateway must be None when absent from map");
+        assert_eq!(metric, DEFAULT_ROUTE_METRIC);
     }
 
     /// Route map with default destination 0.0.0.0/0 and gateway must parse.
@@ -1320,7 +1351,7 @@ mod tests {
             Value::String("10.0.0.1".to_string()),
         );
 
-        let (dst, prefix, gw) =
+        let (dst, prefix, gw, _metric) =
             extract_route_fields(&map).expect("default route map must parse");
         assert!(dst.is_unspecified());
         assert_eq!(prefix, 0);
@@ -1351,6 +1382,21 @@ mod tests {
 
         let result = extract_route_fields(&map);
         assert!(result.is_err(), "Invalid destination CIDR must return error");
+    }
+
+    /// Explicit metric in route map is returned instead of the default.
+    #[test]
+    fn test_extract_route_fields_explicit_metric() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "destination".to_string(),
+            Value::String("10.100.0.0/24".to_string()),
+        );
+        map.insert("metric".to_string(), Value::U64(200));
+
+        let (_, _, _, metric) =
+            extract_route_fields(&map).expect("route with explicit metric must parse");
+        assert_eq!(metric, 200, "explicit metric must be returned");
     }
 
     /// Invalid gateway IP must return an error.
