@@ -720,11 +720,32 @@ pub async fn query_ethernet(
             .unwrap_or_default();
         fields.insert("addresses".to_string(), kd(Value::List(addr_list)));
 
-        // Routes
+        // Routes — exclude kernel-managed routes (proto kernel) so they
+        // never appear in state snapshots or diffs, and strip the protocol
+        // field from the remaining routes so the values match the desired
+        // state produced by policy factories (which omit protocol).
         let route_list: Vec<Value> = route_map
             .get(&link.index)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                r.as_map()
+                    .and_then(|m| m.get("protocol"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s != "kernel")
+                    .unwrap_or(true)
+            })
+            .map(|r| {
+                match r {
+                    Value::Map(mut m) => {
+                        m.shift_remove("protocol");
+                        Value::Map(m)
+                    }
+                    other => other,
+                }
+            })
+            .collect();
         fields.insert("routes".to_string(), kd(Value::List(route_list)));
 
         let state = State {
