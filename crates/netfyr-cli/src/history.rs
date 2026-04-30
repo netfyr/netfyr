@@ -398,6 +398,14 @@ fn entity_display_name(op: &SerializableDiffOp) -> String {
     }
 }
 
+fn state_entity_display_name(state: &SerializableState) -> String {
+    if SYSTEM_ENTITY_TYPES.contains(&state.entity_type.as_str()) {
+        format!("sys:{}", state.entity_type)
+    } else {
+        state.selector_name.clone()
+    }
+}
+
 fn format_timestamp(ts: DateTime<Utc>, now: DateTime<Utc>, absolute: bool) -> String {
     if absolute {
         return ts.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -702,7 +710,7 @@ fn format_text_list_with_width(
         .map(|e| RowCells {
             seq: e.seq.to_string(),
             ts: format_timestamp(e.timestamp, now, absolute_timestamps),
-            entities: entities_summary(&e.diff.operations),
+            entities: entities_summary_with_state(&e.diff.operations, &e.state_after.entities),
             changes: changes_column(e),
             is_daemon_startup: matches!(e.trigger, Trigger::DaemonStartup),
         })
@@ -760,7 +768,7 @@ fn format_text_list_with_width(
 
     for (i, (row, entry)) in rows.iter().zip(entries.iter()).enumerate() {
         let trigger_fitted = format_trigger_column_fitted(entry, w_trig);
-        let entities_fitted = entities_summary_fitted(&entry.diff.operations, w_ent);
+        let entities_fitted = entities_summary_fitted(&entry.diff.operations, &entry.state_after.entities, w_ent);
         let changes_plain = truncate_with_ellipsis(&row.changes, w_changes);
         let changes = colorize_changes(&changes_plain);
         out.push_str(&format!(
@@ -956,8 +964,23 @@ pub fn outcome_detail(outcome: &ApplyOutcome) -> String {
 }
 
 pub fn entities_summary(ops: &[SerializableDiffOp]) -> String {
+    entities_summary_with_state(ops, &[])
+}
+
+fn entities_summary_with_state(ops: &[SerializableDiffOp], state_entities: &[SerializableState]) -> String {
     if ops.is_empty() {
-        return "(none)".to_string();
+        if state_entities.is_empty() {
+            return "(none)".to_string();
+        }
+        let names: Vec<String> = state_entities
+            .iter()
+            .filter(|s| !SYSTEM_ENTITY_TYPES.contains(&s.entity_type.as_str()))
+            .map(|s| state_entity_display_name(s))
+            .collect();
+        if names.is_empty() {
+            return "(none)".to_string();
+        }
+        return names.join(", ");
     }
 
     let items: Vec<(String, bool)> = ops
@@ -1004,8 +1027,8 @@ pub fn entities_summary(ops: &[SerializableDiffOp]) -> String {
     format!("{} entities", parts.join(", "))
 }
 
-fn entities_summary_fitted(ops: &[SerializableDiffOp], max_width: usize) -> String {
-    let full = entities_summary(ops);
+fn entities_summary_fitted(ops: &[SerializableDiffOp], state_entities: &[SerializableState], max_width: usize) -> String {
+    let full = entities_summary_with_state(ops, state_entities);
     if full.chars().count() <= max_width {
         return full;
     }
@@ -4848,7 +4871,7 @@ mod tests {
             SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth0".to_string(), field_changes: vec![] },
             SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth1".to_string(), field_changes: vec![] },
         ];
-        let result = entities_summary_fitted(&ops, 40);
+        let result = entities_summary_fitted(&ops, &[], 40);
         assert_eq!(result, "eth0, eth1");
     }
 
@@ -4859,7 +4882,7 @@ mod tests {
             SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth1".to_string(), field_changes: vec![] },
             SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "wlan0".to_string(), field_changes: vec![] },
         ];
-        let result = entities_summary_fitted(&ops, 14);
+        let result = entities_summary_fitted(&ops, &[], 14);
         assert!(
             result.contains("+1…") || result.contains("+2…"),
             "should degrade to fewer items with +N, got: {}",
@@ -4878,7 +4901,7 @@ mod tests {
                 field_changes: vec![],
             })
             .collect();
-        let result = entities_summary_fitted(&ops, 14);
+        let result = entities_summary_fitted(&ops, &[], 14);
         assert!(
             result.contains("entities") || result.contains("+"),
             "narrow budget should show aggregate or count, got: {}",
@@ -4898,7 +4921,7 @@ mod tests {
             })
             .collect();
         let full = entities_summary(&ops);
-        let result = entities_summary_fitted(&ops, 40);
+        let result = entities_summary_fitted(&ops, &[], 40);
         assert_eq!(result, full, "compact output should pass through unchanged");
     }
 
