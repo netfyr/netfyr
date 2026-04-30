@@ -439,6 +439,78 @@ fn format_trigger_column(entry: &JournalEntry) -> String {
     }
 }
 
+fn format_trigger_column_fitted(entry: &JournalEntry, max_width: usize) -> String {
+    if let Trigger::PolicyApply { .. } = &entry.trigger {
+        let policies = &entry.active_policies;
+        let total = policies.len();
+        if total > 1 {
+            let prefix = "apply (";
+            for show in (1..=total).rev() {
+                let names: Vec<&str> = policies[..show].iter().map(|p| p.name.as_str()).collect();
+                let rest = total - show;
+                let candidate = if rest == 0 {
+                    format!("{}{})", prefix, names.join(", "))
+                } else {
+                    format!("{}{}, +{})", prefix, names.join(", "), rest)
+                };
+                if candidate.chars().count() <= max_width {
+                    return candidate;
+                }
+            }
+            let first_with_count = format!("apply ({}, +{})", policies[0].name, total - 1);
+            if first_with_count.chars().count() > max_width {
+                let suffix = format!(", +{})", total - 1);
+                let name_budget = max_width.saturating_sub(prefix.len() + suffix.len());
+                if name_budget >= 2 {
+                    let name_chars: Vec<char> = policies[0].name.chars().collect();
+                    let fitted_name = format!(
+                        "{}…",
+                        name_chars[..name_budget - 1].iter().collect::<String>()
+                    );
+                    let candidate = format!("{}{}{}", prefix, fitted_name, suffix);
+                    if candidate.chars().count() <= max_width {
+                        return candidate;
+                    }
+                }
+            }
+            let count_only = format!("apply (+{})", total);
+            if count_only.chars().count() <= max_width {
+                return count_only;
+            }
+        } else if total == 1 {
+            let full = format!("apply ({})", policies[0].name);
+            if full.chars().count() <= max_width {
+                return full;
+            }
+            let prefix = "apply (";
+            let suffix = ")";
+            let name_budget = max_width.saturating_sub(prefix.len() + suffix.len());
+            if name_budget >= 2 {
+                let name_chars: Vec<char> = policies[0].name.chars().collect();
+                let fitted_name = format!(
+                    "{}…",
+                    name_chars[..name_budget - 1].iter().collect::<String>()
+                );
+                let candidate = format!("{}{}{}", prefix, fitted_name, suffix);
+                if candidate.chars().count() <= max_width {
+                    return candidate;
+                }
+            }
+            let count_only = format!("apply (+{})", total);
+            if count_only.chars().count() <= max_width {
+                return count_only;
+            }
+        } else {
+            return "apply".to_string();
+        }
+    }
+    let full = format_trigger_column(entry);
+    if full.chars().count() <= max_width {
+        return full;
+    }
+    pad_or_truncate(&full, max_width)
+}
+
 fn pad_or_truncate(s: &str, width: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() > width {
@@ -603,27 +675,33 @@ fn format_dns_changes(added: Vec<&str>, removed: Vec<&str>) -> Vec<String> {
 struct RowCells {
     seq: String,
     ts: String,
-    trigger: String,
     entities: String,
     changes: String,
     is_daemon_startup: bool,
 }
 
 pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> String {
-    const CAP_SEQ: usize = 7;
-    const CAP_TS: usize = 20;
-    const CAP_TRIG: usize = 24;
-    const CAP_ENT: usize = 24;
+    format_text_list_with_width(entries, absolute_timestamps, get_terminal_width())
+}
 
+fn format_text_list_with_width(
+    entries: &[JournalEntry],
+    absolute_timestamps: bool,
+    term_width: usize,
+) -> String {
+    const MAX_TERM_WIDTH: usize = 200;
+    const MIN_TRIG: usize = 12;
+    const MIN_ENT: usize = 10;
+    const MIN_CHANGES: usize = 15;
+
+    let effective_width = term_width.min(MAX_TERM_WIDTH);
     let now = Utc::now();
 
-    // Pass 1: compute raw cell values
     let rows: Vec<RowCells> = entries
         .iter()
         .map(|e| RowCells {
             seq: e.seq.to_string(),
             ts: format_timestamp(e.timestamp, now, absolute_timestamps),
-            trigger: format_trigger_column(e),
             entities: entities_summary(&e.diff.operations),
             changes: changes_column(e),
             is_daemon_startup: matches!(e.trigger, Trigger::DaemonStartup),
@@ -632,24 +710,44 @@ pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> 
 
     let cw = |s: &str| s.chars().count();
 
-    // Pass 2: compute dynamic display widths capped at column maxima
-    let w_seq = cw("SEQ")
-        .max(rows.iter().map(|r| cw(&r.seq)).max().unwrap_or(0))
-        .min(CAP_SEQ);
-    let w_ts = cw("TIMESTAMP")
-        .max(rows.iter().map(|r| cw(&r.ts)).max().unwrap_or(0))
-        .min(CAP_TS);
-    let w_trig = cw("TRIGGER")
-        .max(rows.iter().map(|r| cw(&r.trigger)).max().unwrap_or(0))
-        .min(CAP_TRIG);
-    let w_ent = cw("ENTITIES")
-        .max(rows.iter().map(|r| cw(&r.entities)).max().unwrap_or(0))
-        .min(CAP_ENT);
+    let w_seq = cw("SEQ").max(rows.iter().map(|r| cw(&r.seq)).max().unwrap_or(0));
+    let w_ts = cw("TIMESTAMP").max(rows.iter().map(|r| cw(&r.ts)).max().unwrap_or(0));
 
-    let fixed_overhead = w_seq + 2 + w_ts + 2 + w_trig + 2 + w_ent + 2;
-    let max_changes = get_terminal_width().saturating_sub(fixed_overhead).max(10);
+    let ideal_trig = cw("TRIGGER").max(
+        entries
+            .iter()
+            .map(|e| cw(&format_trigger_column_fitted(e, usize::MAX)))
+            .max()
+            .unwrap_or(0),
+    );
+    let ideal_ent = cw("ENTITIES").max(rows.iter().map(|r| cw(&r.entities)).max().unwrap_or(0));
+    let ideal_changes = cw("CHANGES").max(rows.iter().map(|r| cw(&r.changes)).max().unwrap_or(0));
 
-    // Pass 3: format
+    let separator_overhead = 4 * 2; // 4 separators of 2 spaces each
+    let available = effective_width
+        .saturating_sub(w_seq + w_ts + separator_overhead)
+        .max(MIN_TRIG + MIN_ENT + MIN_CHANGES);
+
+    let ideal_total = ideal_trig + ideal_ent + ideal_changes;
+    let (w_trig, w_ent, w_changes) = if ideal_total <= available {
+        (ideal_trig, ideal_ent, ideal_changes)
+    } else {
+        let remaining = available.saturating_sub(MIN_TRIG + MIN_ENT + MIN_CHANGES);
+        let excess_trig = ideal_trig.saturating_sub(MIN_TRIG);
+        let excess_ent = ideal_ent.saturating_sub(MIN_ENT);
+        let excess_chg = ideal_changes.saturating_sub(MIN_CHANGES);
+        let excess_total = excess_trig + excess_ent + excess_chg;
+        if excess_total > 0 {
+            let t = MIN_TRIG + (remaining * excess_trig / excess_total);
+            let e = MIN_ENT + (remaining * excess_ent / excess_total);
+            let c = available - t - e;
+            (t, e, c)
+        } else {
+            let third = available / 3;
+            (third, third, available - 2 * third)
+        }
+    };
+
     let mut out = String::new();
     out.push_str(&format!(
         "{}  {}  {}  {}  {}\n",
@@ -660,15 +758,17 @@ pub fn format_text_list(entries: &[JournalEntry], absolute_timestamps: bool) -> 
         "CHANGES",
     ));
 
-    for (i, row) in rows.iter().enumerate() {
-        let changes_plain = truncate_with_ellipsis(&row.changes, max_changes);
+    for (i, (row, entry)) in rows.iter().zip(entries.iter()).enumerate() {
+        let trigger_fitted = format_trigger_column_fitted(entry, w_trig);
+        let entities_fitted = entities_summary_fitted(&entry.diff.operations, w_ent);
+        let changes_plain = truncate_with_ellipsis(&row.changes, w_changes);
         let changes = colorize_changes(&changes_plain);
         out.push_str(&format!(
             "{}  {}  {}  {}  {}\n",
             pad_or_truncate(&row.seq, w_seq),
             pad_or_truncate(&row.ts, w_ts),
-            pad_or_truncate(&row.trigger, w_trig),
-            pad_or_truncate(&row.entities, w_ent),
+            pad_or_truncate(&trigger_fitted, w_trig),
+            pad_or_truncate(&entities_fitted, w_ent),
             changes,
         ));
         if row.is_daemon_startup && i + 1 < rows.len() {
@@ -902,6 +1002,46 @@ pub fn entities_summary(ops: &[SerializableDiffOp]) -> String {
         parts.push(format!("-{}", remove_count));
     }
     format!("{} entities", parts.join(", "))
+}
+
+fn entities_summary_fitted(ops: &[SerializableDiffOp], max_width: usize) -> String {
+    let full = entities_summary(ops);
+    if full.chars().count() <= max_width {
+        return full;
+    }
+
+    let items: Vec<String> = ops
+        .iter()
+        .map(|op| {
+            let prefix = match op.kind.as_str() {
+                "add" => "+",
+                "remove" => "-",
+                _ => "",
+            };
+            format!("{}{}", prefix, entity_display_name(op))
+        })
+        .collect();
+
+    let count = items.len();
+    if count == 0 {
+        return full;
+    }
+
+    for show in (1..count).rev() {
+        let shown: Vec<&str> = items[..show].iter().map(|s| s.as_str()).collect();
+        let rest = count - show;
+        let candidate = format!("{}, +{}…", shown.join(", "), rest);
+        if candidate.chars().count() <= max_width {
+            return candidate;
+        }
+    }
+
+    let aggregate = format!("({} entities)", count);
+    if aggregate.chars().count() <= max_width {
+        return aggregate;
+    }
+
+    pad_or_truncate(&full, max_width)
 }
 
 pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
@@ -3464,28 +3604,24 @@ mod tests {
         assert_eq!(result, "mtu 1500→9000");
     }
 
-    // ── format_text_list: column width caps ───────────────────────────────────
+    // ── format_text_list: adaptive column widths ────────────────────────────────
 
-    /// AC: Trigger column value exceeding 24 chars (CAP_TRIG) is truncated with "…".
+    /// AC: Long trigger is smart-truncated when terminal is narrow.
     #[test]
-    fn test_format_text_list_trigger_column_truncated_at_cap_when_exceeds_max_width() {
+    fn test_format_text_list_trigger_column_truncated_when_exceeds_allocated_width() {
         let mut entry = make_entry();
         entry.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
-        // Use a policy name that would make the trigger text exceed 24 chars
-        // "apply (very-long-policy-name)" is >24 chars
         entry.active_policies = vec![PolicySummary {
             name: "very-long-policy-name-exceeding-24".to_string(),
             factory_type: "static".to_string(),
             priority: 100,
         }];
-        let output = format_text_list(&[entry], false);
+        let output = format_text_list_with_width(&[entry], false, 60);
         let data_row = output.lines().nth(1).unwrap();
         let plain_row = strip_ansi(data_row);
-        // The trigger column should be capped at 24 chars; if it exceeded, it's truncated with …
-        // The column appears after SEQ and TIMESTAMP columns
         assert!(
-            plain_row.contains('…') || plain_row.contains("apply ("),
-            "trigger text exceeding 24 chars should be truncated with '…', got: {}",
+            plain_row.contains("apply (") && plain_row.contains('…'),
+            "trigger should be smart-truncated on narrow terminal, got: {}",
             plain_row
         );
     }
@@ -4425,26 +4561,23 @@ mod tests {
         }
     }
 
-    /// AC: Column widths respect maximum caps — trigger column truncated at 24 chars.
-    ///
-    /// A policy name longer than fits in the 24-char TRIGGER cap results in "…".
+    /// AC: On a narrow terminal, a long trigger is smart-truncated with the policy name
+    /// shortened or reduced to a count, rather than cut mid-word.
     #[test]
-    fn test_format_text_list_trigger_column_capped_at_24_chars() {
+    fn test_format_text_list_trigger_column_smart_truncated_on_narrow_terminal() {
         let mut entry = make_entry();
         entry.trigger = Trigger::PolicyApply { source: "test.yaml".to_string() };
-        // "apply (very-long-policy-name-exceeding)" > 24 chars → truncated with "…"
         entry.active_policies = vec![PolicySummary {
             name: "a-very-long-policy-name-that-exceeds".to_string(),
             factory_type: "static".to_string(),
             priority: 100,
         }];
-        let output = format_text_list(&[entry], false);
+        let output = format_text_list_with_width(&[entry], false, 60);
         let data_row = output.lines().nth(1).unwrap();
         let plain = strip_ansi(data_row);
-        // The trigger column must be at most 24 chars wide; truncated with "…"
         assert!(
-            plain.contains('…'),
-            "trigger column exceeding 24 chars must be truncated with '…', got: {}",
+            plain.contains("apply (") && plain.contains("…"),
+            "long trigger on narrow terminal should be smart-truncated, got: {}",
             plain
         );
     }
@@ -4622,6 +4755,240 @@ mod tests {
             result.len(),
             1,
             "combined --since 1h --trigger apply -s name=eth0 must use AND logic, returning only 1 entry"
+        );
+    }
+
+    // ── format_trigger_column_fitted ──────────────────────────────────────────
+
+    #[test]
+    fn test_format_trigger_column_fitted_returns_full_when_fits() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![PolicySummary {
+            name: "short".to_string(),
+            factory_type: "static".to_string(),
+            priority: 100,
+        }];
+        let result = format_trigger_column_fitted(&entry, 40);
+        assert_eq!(result, "apply (short)");
+    }
+
+    #[test]
+    fn test_format_trigger_column_fitted_single_policy_truncates_name() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![PolicySummary {
+            name: "very-long-policy-name-that-wont-fit".to_string(),
+            factory_type: "static".to_string(),
+            priority: 100,
+        }];
+        let result = format_trigger_column_fitted(&entry, 20);
+        assert!(
+            result.contains("apply (") && result.contains("…") && result.ends_with(')'),
+            "should truncate policy name with ellipsis inside parens, got: {}",
+            result
+        );
+        assert!(result.chars().count() <= 20, "must fit in 20 chars, got: {}", result);
+    }
+
+    #[test]
+    fn test_format_trigger_column_fitted_multiple_policies_shows_count() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![
+            PolicySummary { name: "server-network".to_string(), factory_type: "static".to_string(), priority: 100 },
+            PolicySummary { name: "server-network2".to_string(), factory_type: "static".to_string(), priority: 90 },
+            PolicySummary { name: "server-network3".to_string(), factory_type: "static".to_string(), priority: 80 },
+        ];
+        let result = format_trigger_column_fitted(&entry, 24);
+        assert!(
+            result.contains("+2)"),
+            "should show +2 for hidden policies, got: {}",
+            result
+        );
+        assert!(result.chars().count() <= 24, "must fit in 24 chars, got: {}", result);
+    }
+
+    #[test]
+    fn test_format_trigger_column_fitted_multiple_policies_expands_when_room() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![
+            PolicySummary { name: "server-network".to_string(), factory_type: "static".to_string(), priority: 100 },
+            PolicySummary { name: "server-network2".to_string(), factory_type: "static".to_string(), priority: 90 },
+        ];
+        let result = format_trigger_column_fitted(&entry, 80);
+        assert_eq!(
+            result, "apply (server-network, server-network2)",
+            "with enough room, all policy names should be shown"
+        );
+    }
+
+    #[test]
+    fn test_format_trigger_column_fitted_very_narrow_falls_back() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![PolicySummary {
+            name: "x".to_string(),
+            factory_type: "static".to_string(),
+            priority: 100,
+        }];
+        let result = format_trigger_column_fitted(&entry, 8);
+        assert!(result.chars().count() <= 8, "must fit in 8 chars, got: {}", result);
+    }
+
+    #[test]
+    fn test_format_trigger_column_fitted_non_apply_unchanged() {
+        let mut entry = make_entry();
+        entry.trigger = Trigger::DaemonStartup;
+        let result = format_trigger_column_fitted(&entry, 40);
+        assert_eq!(result, "daemon-startup");
+    }
+
+    // ── entities_summary_fitted ──────────────────────────────────────────────
+
+    #[test]
+    fn test_entities_summary_fitted_returns_full_when_fits() {
+        let ops = vec![
+            SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth0".to_string(), field_changes: vec![] },
+            SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth1".to_string(), field_changes: vec![] },
+        ];
+        let result = entities_summary_fitted(&ops, 40);
+        assert_eq!(result, "eth0, eth1");
+    }
+
+    #[test]
+    fn test_entities_summary_fitted_three_entities_degrades_to_two_plus_count() {
+        let ops = vec![
+            SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth0".to_string(), field_changes: vec![] },
+            SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "eth1".to_string(), field_changes: vec![] },
+            SerializableDiffOp { kind: "modify".to_string(), entity_type: "ethernet".to_string(), entity_name: "wlan0".to_string(), field_changes: vec![] },
+        ];
+        let result = entities_summary_fitted(&ops, 14);
+        assert!(
+            result.contains("+1…") || result.contains("+2…"),
+            "should degrade to fewer items with +N, got: {}",
+            result
+        );
+        assert!(result.chars().count() <= 14, "must fit in 14 chars, got: {}", result);
+    }
+
+    #[test]
+    fn test_entities_summary_fitted_narrow_degrades_to_pure_count() {
+        let ops: Vec<SerializableDiffOp> = (0..5)
+            .map(|i| SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: format!("eth{}", i),
+                field_changes: vec![],
+            })
+            .collect();
+        let result = entities_summary_fitted(&ops, 14);
+        assert!(
+            result.contains("entities") || result.contains("+"),
+            "narrow budget should show aggregate or count, got: {}",
+            result
+        );
+        assert!(result.chars().count() <= 14, "must fit in 14 chars, got: {}", result);
+    }
+
+    #[test]
+    fn test_entities_summary_fitted_already_compact_passes_through() {
+        let ops: Vec<SerializableDiffOp> = (0..8)
+            .map(|i| SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: format!("eth{}", i),
+                field_changes: vec![],
+            })
+            .collect();
+        let full = entities_summary(&ops);
+        let result = entities_summary_fitted(&ops, 40);
+        assert_eq!(result, full, "compact output should pass through unchanged");
+    }
+
+    // ── format_text_list_with_width ──────────────────────────────────────────
+
+    #[test]
+    fn test_format_text_list_with_width_narrow_terminal_all_columns_present() {
+        let entry = make_entry_with_entity("eth0");
+        let output = format_text_list_with_width(&[entry], false, 60);
+        let header = output.lines().next().unwrap();
+        assert!(header.contains("SEQ"), "header missing SEQ");
+        assert!(header.contains("TIMESTAMP"), "header missing TIMESTAMP");
+        assert!(header.contains("TRIGGER"), "header missing TRIGGER");
+        assert!(header.contains("ENTITIES"), "header missing ENTITIES");
+        assert!(header.contains("CHANGES"), "header missing CHANGES");
+    }
+
+    #[test]
+    fn test_format_text_list_with_width_wide_terminal_no_truncation() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![PolicySummary {
+            name: "server-network".to_string(),
+            factory_type: "static".to_string(),
+            priority: 100,
+        }];
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![],
+            }],
+        };
+        let output = format_text_list_with_width(&[entry], false, 200);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+        assert!(
+            plain.contains("apply (server-network)"),
+            "wide terminal should show full trigger, got: {}",
+            plain
+        );
+        assert!(!plain.contains('…'), "wide terminal should not truncate, got: {}", plain);
+    }
+
+    #[test]
+    fn test_format_text_list_with_width_trigger_gets_more_space_on_wide_terminal() {
+        let mut entry = make_entry();
+        entry.active_policies = vec![PolicySummary {
+            name: "a-moderately-long-policy-name".to_string(),
+            factory_type: "static".to_string(),
+            priority: 100,
+        }];
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![],
+            }],
+        };
+        // "apply (a-moderately-long-policy-name)" = 38 chars, exceeds old 24-char cap
+        let output = format_text_list_with_width(&[entry], false, 160);
+        let data_row = output.lines().nth(1).unwrap();
+        let plain = strip_ansi(data_row);
+        assert!(
+            plain.contains("a-moderately-long-policy-name"),
+            "160-col terminal should show full policy name that exceeds old 24-char cap, got: {}",
+            plain
+        );
+    }
+
+    #[test]
+    fn test_format_text_list_with_width_200_cap_respected() {
+        let mut entry = make_entry();
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![],
+            }],
+        };
+        let output_200 = format_text_list_with_width(&[entry.clone()], false, 200);
+        let output_300 = format_text_list_with_width(&[entry], false, 300);
+        let row_200 = strip_ansi(output_200.lines().nth(1).unwrap());
+        let row_300 = strip_ansi(output_300.lines().nth(1).unwrap());
+        assert_eq!(
+            row_200.trim_end().len(),
+            row_300.trim_end().len(),
+            "terminal widths beyond 200 should produce the same output"
         );
     }
 }
