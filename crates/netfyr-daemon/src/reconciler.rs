@@ -19,7 +19,7 @@ use netfyr_reconcile::{
     generate_diff, merge, ConflictReport, EntityKey, PolicyId, PolicyInput,
     StateDiff as ReconcileStateDiff,
 };
-use netfyr_state::{SchemaRegistry, Selector, StateSet};
+use netfyr_state::{DiffOp, SchemaRegistry, Selector, StateSet};
 
 use crate::factory_manager::FactoryManager;
 use crate::policy_store::PolicyStore;
@@ -313,7 +313,8 @@ impl Reconciler {
         // just because no policy manages them.
         let managed_actual = self.restrict_to_managed(&actual_state, &effective_state);
 
-        let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state);
+        let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state, &self.schema_registry);
+        let state_diff = inject_dhcp_addresses(&trigger, policy_store, &effective_state, state_diff);
 
         if state_diff.is_empty() {
             tracing::debug!("Reconciliation: no changes needed");
@@ -451,7 +452,7 @@ impl Reconciler {
         // Restrict actual state to only entities present in the target snapshot.
         let managed_actual = self.restrict_to_managed(&actual_state, target_state);
 
-        let state_diff = netfyr_state::diff::diff(&managed_actual, target_state);
+        let state_diff = netfyr_state::diff::diff(&managed_actual, target_state, &self.schema_registry);
 
         if dry_run {
             return Ok(RevertResult {
@@ -718,6 +719,84 @@ fn annotate_diff_outcomes(diff: &mut SerializableDiff, report: &ApplyReport) {
             }
         }
     }
+}
+
+/// On DHCP events, inject the addresses field into the diff even when the CIDR
+/// hasn't changed — the kernel lifetime needs refreshing via `ip addr replace`.
+fn inject_dhcp_addresses(
+    trigger: &Trigger,
+    policy_store: &PolicyStore,
+    effective_state: &StateSet,
+    diff: netfyr_state::StateDiff,
+) -> netfyr_state::StateDiff {
+    let iface = match dhcp_trigger_interface(trigger, policy_store) {
+        Some(name) => name,
+        None => return diff,
+    };
+
+    // Find the desired addresses with lifetime attributes.
+    let mut addr_fv_for_iface = None;
+    let mut entity_type_for_iface = None;
+    let mut selector_for_iface = None;
+    for (entity_type, selector_key) in effective_state.entities() {
+        let state = effective_state.get(&entity_type, &selector_key).unwrap();
+        if state.selector.name.as_deref() != Some(iface) {
+            continue;
+        }
+        if let Some(addr_fv) = state.fields.get("addresses") {
+            let has_lifetime = addr_fv.value.as_list().map_or(false, |list| {
+                list.iter().any(|v| v.as_map().and_then(|m| m.get("valid_lft")).is_some())
+            });
+            if has_lifetime {
+                addr_fv_for_iface = Some(addr_fv.clone());
+                entity_type_for_iface = Some(entity_type);
+                selector_for_iface = Some(state.selector.clone());
+            }
+        }
+        break;
+    }
+
+    let (addr_fv, entity_type, selector) = match (addr_fv_for_iface, entity_type_for_iface, selector_for_iface) {
+        (Some(a), Some(e), Some(s)) => (a, e, s),
+        _ => return diff,
+    };
+
+    // Check if the diff already includes addresses for this interface.
+    let already_has_addresses = diff.ops().iter().any(|op| {
+        if let DiffOp::Modify { selector: s, changed_fields, .. } = op {
+            s.name.as_deref() == Some(iface) && changed_fields.contains_key("addresses")
+        } else {
+            false
+        }
+    });
+    if already_has_addresses {
+        return diff;
+    }
+
+    tracing::debug!(interface = %iface, "injecting DHCP addresses for lifetime refresh");
+
+    // Merge into existing Modify op for this interface, or append a new one.
+    let mut ops = diff.into_ops();
+    let mut merged = false;
+    for op in &mut ops {
+        if let DiffOp::Modify { selector: s, changed_fields, .. } = op {
+            if s.name.as_deref() == Some(iface) {
+                changed_fields.insert("addresses".to_string(), addr_fv.clone());
+                merged = true;
+                break;
+            }
+        }
+    }
+    if !merged {
+        let changed = std::iter::once(("addresses".to_string(), addr_fv)).collect();
+        ops.push(DiffOp::Modify {
+            entity_type,
+            selector,
+            changed_fields: changed,
+            removed_fields: vec![],
+        });
+    }
+    netfyr_state::StateDiff::new(ops)
 }
 
 /// Resolve the interface name for a DHCP trigger from the policy store.

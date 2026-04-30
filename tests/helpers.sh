@@ -216,6 +216,74 @@ wait_for_no_address() {
     done
 }
 
+# get_valid_lft IFACE CIDR_PREFIX -- Extract the valid_lft value for the first
+# inet address matching CIDR_PREFIX on IFACE.  Returns the raw value
+# (e.g. "120sec" or "forever").  Exits 1 if no matching address found.
+get_valid_lft() {
+    local iface="$1"
+    local prefix="$2"
+    local output
+    output=$(ip addr show dev "$iface" 2>&1)
+    local found=0
+    while IFS= read -r line; do
+        if [[ $found -eq 1 ]]; then
+            local vlft
+            vlft=$(echo "$line" | grep -oP 'valid_lft \K\S+') || true
+            if [[ -n "$vlft" ]]; then
+                echo "$vlft"
+                return 0
+            fi
+            found=0
+        fi
+        if echo "$line" | grep -q "inet " && echo "$line" | grep -qF "$prefix"; then
+            found=1
+        fi
+    done <<< "$output"
+    echo "FAIL: get_valid_lft: no address matching '$prefix' on '$iface'" >&2
+    return 1
+}
+
+# get_valid_lft_secs IFACE CIDR_PREFIX -- Like get_valid_lft but returns the
+# numeric seconds (strips the "sec" suffix).  Returns 1 if the value is
+# "forever" or no matching address is found.
+get_valid_lft_secs() {
+    local raw
+    raw=$(get_valid_lft "$1" "$2") || return 1
+    if [[ "$raw" == "forever" ]]; then
+        echo "FAIL: get_valid_lft_secs: valid_lft is 'forever', expected numeric" >&2
+        return 1
+    fi
+    echo "${raw%sec}"
+}
+
+# assert_valid_lft_finite IFACE CIDR_PREFIX -- Fail if the address's valid_lft
+# is "forever" rather than a finite value.
+assert_valid_lft_finite() {
+    local iface="$1"
+    local prefix="$2"
+    local vlft
+    vlft=$(get_valid_lft "$iface" "$prefix")
+    if [[ "$vlft" == "forever" ]]; then
+        echo "FAIL: address matching '$prefix' on '$iface' has valid_lft forever, expected finite" >&2
+        ip addr show dev "$iface" >&2 || true
+        exit 1
+    fi
+}
+
+# assert_valid_lft_forever IFACE CIDR_PREFIX -- Fail if the address's valid_lft
+# is not "forever".
+assert_valid_lft_forever() {
+    local iface="$1"
+    local prefix="$2"
+    local vlft
+    vlft=$(get_valid_lft "$iface" "$prefix")
+    if [[ "$vlft" != "forever" ]]; then
+        echo "FAIL: address matching '$prefix' on '$iface' has valid_lft '$vlft', expected forever" >&2
+        ip addr show dev "$iface" >&2 || true
+        exit 1
+    fi
+}
+
 # assert_address_count IFACE EXPECTED_COUNT -- Fail if the number of IPv4 (inet)
 # addresses on IFACE does not match EXPECTED_COUNT. Uses "inet " (with trailing
 # space) to exclude inet6 lines.

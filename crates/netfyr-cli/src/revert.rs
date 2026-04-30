@@ -139,7 +139,7 @@ async fn run_revert_standalone(args: RevertArgs) -> Result<ExitCode> {
         }
     }
 
-    let state_diff = compute_state_diff(&managed_actual, &target_state);
+    let state_diff = compute_state_diff(&managed_actual, &target_state, &schema);
 
     if args.dry_run {
         if state_diff.is_empty() {

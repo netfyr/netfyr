@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use netfyr_state::{FieldValue, SchemaRegistry, Selector, StateSet, Value};
+use netfyr_state::{FieldValue, SchemaRegistry, Selector, StateSet, Value, values_eq_for_field};
 use serde::Serialize;
 
 use crate::{EntityKey, FieldName};
@@ -211,8 +211,12 @@ pub fn generate_diff(
 
             // Walk desired fields: compare against actual.
             for (field_name, desired_fv) in &desired_state.fields {
+                let cmp_keys = schema
+                    .field_info(&entity_type, field_name)
+                    .map(|info| info.comparison_keys)
+                    .unwrap_or_default();
                 if let Some(actual_fv) = actual_state.fields.get(field_name) {
-                    if desired_fv.value == actual_fv.value {
+                    if values_eq_for_field(&desired_fv.value, &actual_fv.value, &cmp_keys) {
                         // Same value — Unchanged (for context in reports).
                         field_changes.push(FieldChange {
                             field_name: field_name.clone(),

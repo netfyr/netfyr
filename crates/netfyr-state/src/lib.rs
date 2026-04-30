@@ -388,6 +388,38 @@ impl Value {
     }
 }
 
+/// Compares two `Value`s using schema-declared comparison keys.
+///
+/// When `comparison_keys` is empty, falls back to `PartialEq`.
+/// When non-empty and both values are `List`, items are compared pairwise
+/// using only the specified keys from map items.
+pub fn values_eq_for_field(a: &Value, b: &Value, comparison_keys: &[String]) -> bool {
+    if comparison_keys.is_empty() {
+        return a == b;
+    }
+    match (a, b) {
+        (Value::List(la), Value::List(lb)) => {
+            if la.len() != lb.len() {
+                return false;
+            }
+            la.iter().zip(lb.iter()).all(|(ia, ib)| item_eq(ia, ib, comparison_keys))
+        }
+        _ => a == b,
+    }
+}
+
+fn item_eq(a: &Value, b: &Value, comparison_keys: &[String]) -> bool {
+    match (a, b) {
+        (Value::Map(ma), Value::Map(mb)) => {
+            comparison_keys.iter().all(|k| ma.get(k) == mb.get(k))
+        }
+        (Value::Map(m), Value::String(s)) | (Value::String(s), Value::Map(m)) => {
+            comparison_keys.first().and_then(|k| m.get(k).and_then(Value::as_str)) == Some(s.as_str())
+        }
+        _ => a == b,
+    }
+}
+
 // ── Provenance ────────────────────────────────────────────────────────────────
 
 /// Tracks where a field value originated.
@@ -1321,5 +1353,71 @@ mod tests {
         assert!(m.labels.is_empty());
         assert!(m.description.is_none());
         assert_eq!(m.id.get_version_num(), 7);
+    }
+
+    // ── values_eq_for_field tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_values_eq_empty_keys_delegates_to_partial_eq() {
+        let a = Value::String("10.0.1.50/24".to_string());
+        let b = Value::String("10.0.1.50/24".to_string());
+        assert!(values_eq_for_field(&a, &b, &[]));
+
+        let c = Value::String("10.0.1.51/24".to_string());
+        assert!(!values_eq_for_field(&a, &c, &[]));
+    }
+
+    #[test]
+    fn test_values_eq_map_vs_string_matches_on_comparison_key() {
+        let keys = vec!["address".to_string()];
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("valid_lft".to_string(), Value::U64(3600));
+        let map_val = Value::List(vec![Value::Map(m)]);
+        let str_val = Value::List(vec![Value::String("10.0.1.50/24".to_string())]);
+        assert!(values_eq_for_field(&map_val, &str_val, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_map_vs_string_mismatch() {
+        let keys = vec!["address".to_string()];
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.51/24".to_string()));
+        let map_val = Value::List(vec![Value::Map(m)]);
+        let str_val = Value::List(vec![Value::String("10.0.1.50/24".to_string())]);
+        assert!(!values_eq_for_field(&map_val, &str_val, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_map_vs_map_ignores_extra_keys() {
+        let keys = vec!["address".to_string()];
+        let mut m1 = IndexMap::new();
+        m1.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m1.insert("valid_lft".to_string(), Value::U64(3600));
+        let mut m2 = IndexMap::new();
+        m2.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m2.insert("valid_lft".to_string(), Value::U64(7200));
+        let a = Value::List(vec![Value::Map(m1)]);
+        let b = Value::List(vec![Value::Map(m2)]);
+        assert!(values_eq_for_field(&a, &b, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_list_length_mismatch() {
+        let keys = vec!["address".to_string()];
+        let a = Value::List(vec![Value::String("10.0.1.50/24".to_string())]);
+        let b = Value::List(vec![
+            Value::String("10.0.1.50/24".to_string()),
+            Value::String("10.0.1.51/24".to_string()),
+        ]);
+        assert!(!values_eq_for_field(&a, &b, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_non_list_with_keys_falls_back_to_partial_eq() {
+        let keys = vec!["address".to_string()];
+        let a = Value::U64(1500);
+        let b = Value::U64(1500);
+        assert!(values_eq_for_field(&a, &b, &keys));
     }
 }

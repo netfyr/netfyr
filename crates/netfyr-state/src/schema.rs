@@ -61,6 +61,9 @@ pub struct FieldSchemaInfo {
     pub keep_when_absent: bool,
     pub constraints: Option<FieldConstraints>,
     pub description: Option<String>,
+    /// When this field is a list of maps, two items are considered equal if they
+    /// agree on these keys, regardless of other keys. Empty means use PartialEq.
+    pub comparison_keys: Vec<String>,
 }
 
 // ── ValidationErrorKind ───────────────────────────────────────────────────────
@@ -452,10 +455,15 @@ fn parse_field_metadata(schema: &serde_json::Value) -> HashMap<String, FieldSche
         let description =
             field_schema.get("description").and_then(|v| v.as_str()).map(String::from);
         let constraints = parse_constraints(field_schema);
+        let comparison_keys = field_schema
+            .get("x-netfyr-comparison-keys")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
 
         fields.insert(
             field_name.clone(),
-            FieldSchemaInfo { field_type, required, writable, keep_when_absent, constraints, description },
+            FieldSchemaInfo { field_type, required, writable, keep_when_absent, constraints, description, comparison_keys },
         );
     }
 
@@ -1085,6 +1093,22 @@ mod tests {
         let info =
             registry.field_info("ethernet", "routes").expect("routes should have field info");
         assert!(info.writable, "routes should be writable (x-netfyr-writable: true)");
+    }
+
+    /// addresses field has comparison_keys = ["address"]
+    #[test]
+    fn test_field_info_addresses_has_comparison_keys() {
+        let registry = SchemaRegistry::new();
+        let info = registry.field_info("ethernet", "addresses").expect("addresses should have field info");
+        assert_eq!(info.comparison_keys, vec!["address"], "addresses must have comparison_keys=[\"address\"]");
+    }
+
+    /// mtu field has empty comparison_keys (default)
+    #[test]
+    fn test_field_info_mtu_has_empty_comparison_keys() {
+        let registry = SchemaRegistry::new();
+        let info = registry.field_info("ethernet", "mtu").expect("mtu should have field info");
+        assert!(info.comparison_keys.is_empty(), "mtu should have empty comparison_keys");
     }
 
     // ── Feature: Unknown entity type handling ─────────────────────────────────

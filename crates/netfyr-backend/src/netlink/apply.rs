@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use netfyr_state::{DiffOp, FieldValue, Selector, State, StateDiff, Value};
-use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::address::{AddressAttribute, AddressMessage, CacheInfo};
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
 use netlink_packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_core::{
@@ -565,16 +565,13 @@ async fn apply_modify_fields(
 
     if addr_in_changed || addr_in_removed {
         // Full desired address list; empty when field is being removed.
-        // Use value_to_str to handle both Value::String (from kernel queries)
-        // and Value::IpNetwork (from YAML policy files).
-        let desired_addrs: Vec<String> = if let Some(fv) = changed_fields.get("addresses") {
-            fv.value
-                .as_list()
-                .map(|list| list.iter().filter_map(value_to_str).collect())
-                .unwrap_or_default()
+        // Keep original Value items so we can extract lifetimes when adding.
+        let desired_items: Vec<&Value> = if let Some(fv) = changed_fields.get("addresses") {
+            fv.value.as_list().map(|list| list.iter().collect()).unwrap_or_default()
         } else {
             vec![]
         };
+        let desired_addrs: Vec<String> = desired_items.iter().filter_map(|v| addr_to_cidr(v)).collect();
 
         let current_addrs: Vec<String> = current_state
             .fields
@@ -582,18 +579,27 @@ async fn apply_modify_fields(
             .and_then(|fv| fv.value.as_list())
             .map(|list| {
                 list.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .filter_map(|v| addr_to_cidr(v))
                     .collect()
             })
             .unwrap_or_default();
 
-        let to_add: Vec<&String> = desired_addrs
+        let to_add: Vec<(usize, &String)> = desired_addrs
             .iter()
-            .filter(|a| !current_addrs.contains(a))
+            .enumerate()
+            .filter(|(_, a)| !current_addrs.contains(a))
             .collect();
         let to_remove: Vec<&String> = current_addrs
             .iter()
             .filter(|a| !desired_addrs.contains(a))
+            .collect();
+        let to_replace: Vec<(usize, &String)> = desired_addrs
+            .iter()
+            .enumerate()
+            .filter(|(idx, a)| {
+                current_addrs.contains(a)
+                    && desired_items.get(*idx).and_then(|v| addr_valid_lft(v)).is_some()
+            })
             .collect();
 
         // Remove unwanted addresses first, then add new ones in desired order.
@@ -655,10 +661,21 @@ async fn apply_modify_fields(
         }
 
         // Add new addresses in the order they appear in the desired state.
-        for cidr in &to_add {
+        for (idx, cidr) in &to_add {
             match parse_cidr(cidr) {
                 Ok((ip, prefix)) => {
-                    match handle.address().add(index, ip, prefix).execute().await {
+                    let mut req = handle.address().add(index, ip, prefix);
+                    if let Some(orig_value) = desired_items.get(*idx) {
+                        if let (Some(valid), Some(preferred)) = (addr_valid_lft(orig_value), addr_preferred_lft(orig_value)) {
+                            let mut ci = CacheInfo::default();
+                            ci.ifa_preferred = preferred;
+                            ci.ifa_valid = valid;
+                            req.message_mut().attributes.push(
+                                AddressAttribute::CacheInfo(ci),
+                            );
+                        }
+                    }
+                    match req.execute().await {
                         Ok(()) => fields_changed.push("addresses".to_string()),
                         Err(ref e) if is_eexist(e) => {
                             skipped.push(SkippedOperation {
@@ -671,6 +688,35 @@ async fn apply_modify_fields(
                         Err(e) => failures.push(make_field_failure(
                             name,
                             map_netlink_error(e, &format!("add address {cidr} on {name}")),
+                            "addresses",
+                        )),
+                    }
+                }
+                Err(e) => failures.push(make_field_failure(name, e, "addresses")),
+            }
+        }
+
+        // Replace existing addresses that carry lifetime attributes.
+        // Uses `ip addr replace` semantics to update CacheInfo in-place.
+        for (idx, cidr) in &to_replace {
+            match parse_cidr(cidr) {
+                Ok((ip, prefix)) => {
+                    let mut req = handle.address().add(index, ip, prefix).replace();
+                    if let Some(orig_value) = desired_items.get(*idx) {
+                        if let (Some(valid), Some(preferred)) = (addr_valid_lft(orig_value), addr_preferred_lft(orig_value)) {
+                            let mut ci = CacheInfo::default();
+                            ci.ifa_preferred = preferred;
+                            ci.ifa_valid = valid;
+                            req.message_mut().attributes.push(
+                                AddressAttribute::CacheInfo(ci),
+                            );
+                        }
+                    }
+                    match req.execute().await {
+                        Ok(()) => fields_changed.push("addresses".to_string()),
+                        Err(e) => failures.push(make_field_failure(
+                            name,
+                            map_netlink_error(e, &format!("replace address {cidr} on {name}")),
                             "addresses",
                         )),
                     }
@@ -1114,6 +1160,24 @@ fn value_to_str(v: &Value) -> Option<String> {
         Value::IpAddr(ip) => Some(ip.to_string()),
         _ => None,
     }
+}
+
+fn addr_to_cidr(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Map(m) => m.get("address")?.as_str().map(str::to_owned),
+        Value::IpNetwork(net) => Some(net.to_string()),
+        Value::IpAddr(ip) => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+fn addr_valid_lft(v: &Value) -> Option<u32> {
+    v.as_map()?.get("valid_lft")?.as_u64().map(|n| n as u32)
+}
+
+fn addr_preferred_lft(v: &Value) -> Option<u32> {
+    v.as_map()?.get("preferred_lft")?.as_u64().map(|n| n as u32)
 }
 
 fn is_kernel_route(route_val: &Value) -> bool {
@@ -1701,6 +1765,36 @@ mod tests {
             Some(String::new()),
             "Value::String(\"\") must return Some(\"\")"
         );
+    }
+
+    // ── addr_to_cidr ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_addr_to_cidr_from_string() {
+        let v = Value::String("10.0.1.50/24".to_string());
+        assert_eq!(addr_to_cidr(&v), Some("10.0.1.50/24".to_string()));
+    }
+
+    #[test]
+    fn test_addr_to_cidr_from_map() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("valid_lft".to_string(), Value::U64(3600));
+        let v = Value::Map(m);
+        assert_eq!(addr_to_cidr(&v), Some("10.0.1.50/24".to_string()));
+    }
+
+    #[test]
+    fn test_addr_to_cidr_from_ip_addr() {
+        let ip = std::net::Ipv4Addr::new(10, 0, 1, 1);
+        let v = Value::IpAddr(ip);
+        assert_eq!(addr_to_cidr(&v), Some("10.0.1.1".to_string()));
+    }
+
+    #[test]
+    fn test_addr_to_cidr_from_non_address() {
+        let v = Value::U64(1500);
+        assert_eq!(addr_to_cidr(&v), None);
     }
 }
 

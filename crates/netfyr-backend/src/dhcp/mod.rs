@@ -234,11 +234,15 @@ pub fn lease_to_state(
     // Interface must stay up — this is always present regardless of lease options.
     fields.insert("enabled".to_string(), fv(Value::Bool(true)));
 
-    // Addresses field: ["ip/prefix"]
+    // Addresses field: [{address: "ip/prefix", valid_lft: N, preferred_lft: N}]
     let cidr = format!("{}/{}", lease.ip, lease.subnet_mask_to_prefix());
+    let mut addr_map = IndexMap::new();
+    addr_map.insert("address".to_string(), Value::String(cidr));
+    addr_map.insert("valid_lft".to_string(), Value::U64(lease.lease_time as u64));
+    addr_map.insert("preferred_lft".to_string(), Value::U64(lease.lease_time as u64));
     fields.insert(
         "addresses".to_string(),
-        fv(Value::List(vec![Value::String(cidr)])),
+        fv(Value::List(vec![Value::Map(addr_map)])),
     );
 
     // Routes field: [{destination: "0.0.0.0/0", gateway: "gw_ip", metric: 100}]
@@ -363,7 +367,7 @@ mod tests {
     // ── lease_to_state: addresses field ──────────────────────────────────────
 
     /// Scenario: Lease produces correct State fields
-    /// Given IP=10.0.1.50, mask=255.255.255.0 → addresses=["10.0.1.50/24"]
+    /// Given IP=10.0.1.50, mask=255.255.255.0 → addresses=[{address: "10.0.1.50/24", ...}]
     #[test]
     fn test_lease_to_state_addresses_contains_cidr() {
         let state = lease_to_state(&make_full_lease(), "eth0", "test-policy", 100);
@@ -377,10 +381,21 @@ mod tests {
             .expect("addresses must be a list");
 
         assert_eq!(addresses.len(), 1, "must have exactly one address");
+        let addr_map = addresses[0].as_map().expect("address must be a map");
         assert_eq!(
-            addresses[0].as_str(),
+            addr_map.get("address").and_then(|v| v.as_str()),
             Some("10.0.1.50/24"),
-            "address must be formatted as ip/prefix"
+            "address key must be formatted as ip/prefix"
+        );
+        assert_eq!(
+            addr_map.get("valid_lft").and_then(|v| v.as_u64()),
+            Some(3600),
+            "valid_lft must equal lease_time"
+        );
+        assert_eq!(
+            addr_map.get("preferred_lft").and_then(|v| v.as_u64()),
+            Some(3600),
+            "preferred_lft must equal lease_time"
         );
     }
 
@@ -792,8 +807,10 @@ mod tests {
                     .as_list()
                     .expect("addresses must be a list");
                 assert!(!addresses.is_empty(), "addresses must be non-empty");
+                let addr_map = addresses[0].as_map()
+                    .expect("LeaseAcquired address must be a map");
                 assert_eq!(
-                    addresses[0].as_str(),
+                    addr_map.get("address").and_then(|v| v.as_str()),
                     Some("10.0.1.50/24"),
                     "LeaseAcquired address must include leased IP with correct prefix"
                 );

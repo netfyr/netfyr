@@ -144,7 +144,7 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
             managed_actual.insert(state.clone());
         }
     }
-    let state_diff: StateDiffState = compute_state_diff(&managed_actual, effective_state);
+    let state_diff: StateDiffState = compute_state_diff(&managed_actual, effective_state, &schema);
 
     // 8. Dry-run: display planned changes and exit without applying.
     if args.dry_run {

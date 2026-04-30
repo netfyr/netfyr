@@ -2,7 +2,8 @@
 
 use indexmap::IndexMap;
 
-use crate::{FieldValue, Selector};
+use crate::{FieldValue, Selector, values_eq_for_field};
+use crate::schema::SchemaRegistry;
 use crate::set::StateSet;
 
 // ── DiffOp ────────────────────────────────────────────────────────────────────
@@ -56,6 +57,11 @@ impl StateDiff {
     /// Returns the list of operations as a slice.
     pub fn ops(&self) -> &[DiffOp] {
         &self.ops
+    }
+
+    /// Consumes the diff and returns the operations vector.
+    pub fn into_ops(self) -> Vec<DiffOp> {
+        self.ops
     }
 
     /// Returns `true` if there are no operations (the two state sets are identical).
@@ -114,7 +120,7 @@ impl DiffOp {
 /// Operations are emitted in two passes:
 /// 1. Entities in `to` → `Add` (if absent in `from`) or `Modify` (if different).
 /// 2. Entities in `from` absent in `to` → `Remove`.
-pub fn diff(from: &StateSet, to: &StateSet) -> StateDiff {
+pub fn diff(from: &StateSet, to: &StateSet, schema: &SchemaRegistry) -> StateDiff {
     let mut ops: Vec<DiffOp> = Vec::new();
 
     // ── Pass 1: entities in `to` ─────────────────────────────────────────────
@@ -130,8 +136,12 @@ pub fn diff(from: &StateSet, to: &StateSet) -> StateDiff {
 
             // Fields in `to`: new or changed relative to `from`.
             for (field_name, fv_to) in &state_to.fields {
+                let cmp_keys = schema
+                    .field_info(&entity_type, field_name)
+                    .map(|info| info.comparison_keys)
+                    .unwrap_or_default();
                 match state_from.fields.get(field_name) {
-                    Some(fv_from) if fv_from.value != fv_to.value => {
+                    Some(fv_from) if !values_eq_for_field(&fv_from.value, &fv_to.value, &cmp_keys) => {
                         changed_fields.insert(field_name.clone(), fv_to.clone());
                     }
                     None => {
@@ -191,6 +201,7 @@ pub fn diff(from: &StateSet, to: &StateSet) -> StateDiff {
 mod tests {
     use super::*;
     use crate::set::StateSet;
+    use crate::schema::SchemaRegistry;
     use crate::{FieldValue, Provenance, Selector, State, StateMetadata, Value};
     use indexmap::IndexMap;
 
@@ -226,7 +237,7 @@ mod tests {
         let mut to = StateSet::new();
         to.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))], 100));
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert_eq!(result.ops().len(), 1);
         match &result.ops()[0] {
             DiffOp::Add { entity_type, selector, fields } => {
@@ -245,7 +256,7 @@ mod tests {
         from.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))], 100));
         let to = StateSet::new();
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert_eq!(result.ops().len(), 1);
         match &result.ops()[0] {
             DiffOp::Remove { entity_type, selector } => {
@@ -265,7 +276,7 @@ mod tests {
         let mut to = StateSet::new();
         to.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))], 100));
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert_eq!(result.ops().len(), 1);
         match &result.ops()[0] {
             DiffOp::Modify { entity_type, selector, changed_fields, removed_fields } => {
@@ -298,7 +309,7 @@ mod tests {
             100,
         ));
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert_eq!(result.ops().len(), 1);
         match &result.ops()[0] {
             DiffOp::Modify { changed_fields, removed_fields, .. } => {
@@ -331,7 +342,7 @@ mod tests {
         let mut to = StateSet::new();
         to.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))], 100));
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert!(result.is_empty(), "Identical sets should produce empty diff");
         assert_eq!(result.ops().len(), 0);
     }
@@ -341,7 +352,7 @@ mod tests {
     fn test_diff_of_two_empty_sets_is_empty() {
         let from = StateSet::new();
         let to = StateSet::new();
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert!(result.is_empty());
     }
 
@@ -372,7 +383,7 @@ mod tests {
         let mut to = StateSet::new();
         to.insert(to_state);
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert!(
             result.is_empty(),
             "Diff is value-only; same value with different provenance must not generate Modify"
@@ -397,7 +408,7 @@ mod tests {
         to.insert(make_state("vlan", "vlan10", vec![("id", Value::U64(10))], 100));
         // to_remove absent from `to` → Remove
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         let summary = result.summary();
         assert_eq!(
             summary, "2 added, 1 modified, 1 removed",
@@ -410,7 +421,7 @@ mod tests {
     fn test_statediff_summary_all_zeros_for_empty_diff() {
         let from = StateSet::new();
         let to = StateSet::new();
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert_eq!(result.summary(), "0 added, 0 modified, 0 removed");
     }
 
@@ -419,7 +430,7 @@ mod tests {
     fn test_statediff_is_empty_returns_true_for_no_ops() {
         let from = StateSet::new();
         let to = StateSet::new();
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert!(result.is_empty());
     }
 
@@ -430,7 +441,63 @@ mod tests {
         let mut to = StateSet::new();
         to.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))], 100));
 
-        let result = diff(&from, &to);
+        let result = diff(&from, &to, &SchemaRegistry::new());
         assert!(!result.is_empty());
+    }
+
+    /// DHCP map address vs kernel string address produces no diff when CIDRs match.
+    #[test]
+    fn test_diff_dhcp_map_address_vs_kernel_string_no_diff() {
+        let mut from = StateSet::new();
+        // Kernel query produces string addresses
+        from.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())]))],
+            100,
+        ));
+
+        let mut to = StateSet::new();
+        // DHCP factory produces map addresses with lifetime
+        let mut addr_map = IndexMap::new();
+        addr_map.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        addr_map.insert("valid_lft".to_string(), Value::U64(3600));
+        addr_map.insert("preferred_lft".to_string(), Value::U64(3600));
+        to.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("addresses", Value::List(vec![Value::Map(addr_map)]))],
+            100,
+        ));
+
+        let result = diff(&from, &to, &SchemaRegistry::new());
+        assert!(result.is_empty(), "DHCP map address with same CIDR as kernel string should produce no diff");
+    }
+
+    /// DHCP map address vs kernel string address produces Modify when CIDRs differ.
+    #[test]
+    fn test_diff_dhcp_map_address_vs_kernel_string_different_cidr() {
+        let mut from = StateSet::new();
+        from.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())]))],
+            100,
+        ));
+
+        let mut to = StateSet::new();
+        let mut addr_map = IndexMap::new();
+        addr_map.insert("address".to_string(), Value::String("10.0.1.51/24".to_string()));
+        addr_map.insert("valid_lft".to_string(), Value::U64(3600));
+        to.insert(make_state(
+            "ethernet",
+            "eth0",
+            vec![("addresses", Value::List(vec![Value::Map(addr_map)]))],
+            100,
+        ));
+
+        let result = diff(&from, &to, &SchemaRegistry::new());
+        assert_eq!(result.ops().len(), 1, "different CIDRs should produce a Modify");
+        assert!(matches!(result.ops()[0], DiffOp::Modify { .. }));
     }
 }
