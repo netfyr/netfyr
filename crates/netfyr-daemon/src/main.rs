@@ -37,9 +37,18 @@ async fn main() -> Result<()> {
 
     // 1. Initialize structured logging (write to stderr; stdout is reserved for
     //    the "netfyr" identity line printed above).
-    //    RUST_LOG overrides the default "info" level when set.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    //    NETFYR_LOG sets the level for all netfyr crates (e.g. NETFYR_LOG=debug).
+    //    RUST_LOG still works for fine-grained control. Falls back to "info".
+    let env_filter = if let Ok(level) = std::env::var("NETFYR_LOG") {
+        tracing_subscriber::EnvFilter::new(format!(
+            "netfyr_daemon={level},netfyr_backend={level},netlink_packet_route=error"
+        ))
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(
+                "info,netlink_packet_route=error",
+            ))
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(env_filter)
