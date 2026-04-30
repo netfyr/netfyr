@@ -23,6 +23,8 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
+use tracing::{debug, info};
+
 use netfyr_state::State;
 
 use crate::dhcp::lease::DhcpLease;
@@ -163,6 +165,7 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
         };
 
         let frame = build_ip_udp_frame(&encoded);
+        debug!(%interface, "sending DHCPDISCOVER");
         if let Err(e) = send_via_packet_socket(&pkt_sock, ifindex, &frame).await {
             let _ = state_tx
                 .send(FactoryEvent::Error {
@@ -205,6 +208,7 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
 
         let offered_ip = offer.yiaddr();
         let server_id = extract_server_id(offer.opts()).unwrap_or_else(|| offer.siaddr());
+        debug!(%interface, %offered_ip, server = %server_id, "received DHCPOFFER");
 
         // ── Request phase ─────────────────────────────────────────────────────
         let request = build_request(xid, mac, offered_ip, server_id);
@@ -222,6 +226,7 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
         };
 
         let frame = build_ip_udp_frame(&encoded);
+        debug!(%interface, ip = %offered_ip, server = %server_id, "sending DHCPREQUEST");
         if let Err(e) = send_via_packet_socket(&pkt_sock, ifindex, &frame).await {
             let _ = state_tx
                 .send(FactoryEvent::Error {
@@ -278,6 +283,8 @@ async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>
                 continue;
             }
         };
+        debug!(%interface, "received DHCPACK");
+        log_lease_details(&interface, "acquired", &lease, &ack);
 
         // DHCPACK received — drain packet socket then transition to UDP socket.
         drain_packet_socket(&pkt_sock);
@@ -403,6 +410,7 @@ async fn run_lease_maintenance(
         // reaching T2 without an ACK, transition to REBINDING and
         // retransmit (broadcast) at one-half the remaining lease time,
         // min 60 seconds, until the lease expires.
+        debug!(%interface, ip = %lease.ip, server = %lease.server_id, "entering RENEWING state");
         let renewed = 'renewal: {
             // RENEWING: unicast to the original server.
             loop {
@@ -426,6 +434,7 @@ async fn run_lease_maintenance(
             }
 
             // REBINDING: broadcast to any server.
+            debug!(%interface, ip = %lease.ip, "entering REBINDING state");
             loop {
                 let remaining = lease.time_until_expiry();
                 if remaining.is_zero() {
@@ -450,9 +459,19 @@ async fn run_lease_maintenance(
         };
 
         if !renewed {
+            info!(%interface, "lease expired, restarting discovery");
             return LeaseMaintOutcome::Expired;
         }
 
+        info!(
+            %interface,
+            ip = %lease.ip,
+            server = %lease.server_id,
+            lease_time = lease.lease_time,
+            t1 = lease.renewal_time,
+            t2 = lease.rebind_time,
+            "lease renewed",
+        );
         let state = lease_to_state(&lease, interface, policy_name, priority);
         {
             let mut guard = shared_state.lock().unwrap();
@@ -489,6 +508,9 @@ async fn attempt_renewal(
     let request = build_renew_request(xid, mac, lease.ip, lease.server_id);
     let encoded = encode_message(&request).ok()?;
 
+    let mode = if broadcast { "broadcast" } else { "unicast" };
+    debug!(ip = %lease.ip, server = %lease.server_id, %mode, "sending renewal DHCPREQUEST");
+
     let dest: SocketAddr = if broadcast {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, DHCP_SERVER_PORT))
     } else {
@@ -505,6 +527,7 @@ async fn attempt_renewal(
 
 /// Send a DHCPRELEASE to the server.
 async fn send_release(socket: &UdpSocket, mac: [u8; 6], client_ip: Ipv4Addr, server_id: Ipv4Addr) {
+    debug!(ip = %client_ip, server = %server_id, "sending DHCPRELEASE");
     let release = build_release(mac, client_ip, server_id);
     if let Ok(encoded) = encode_message(&release) {
         let dest: SocketAddr = SocketAddr::V4(SocketAddrV4::new(server_id, DHCP_SERVER_PORT));
@@ -659,6 +682,55 @@ fn extract_server_id(opts: &dhcproto::v4::DhcpOptions) -> Option<Ipv4Addr> {
     match opts.get(OptionCode::ServerIdentifier) {
         Some(DhcpOption::ServerIdentifier(ip)) => Some(*ip),
         _ => None,
+    }
+}
+
+// ── Lease logging ────────────────────────────────────────────────────────────
+
+fn log_lease_details(interface: &str, event: &str, lease: &DhcpLease, ack: &Message) {
+    let prefix = lease.subnet_mask_to_prefix();
+    let gw = lease
+        .gateway
+        .map_or_else(|| "none".to_string(), |gw| gw.to_string());
+    let dns = if lease.dns_servers.is_empty() {
+        "none".to_string()
+    } else {
+        lease
+            .dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let search = match ack.opts().get(OptionCode::DomainName) {
+        Some(DhcpOption::DomainName(name)) => name.clone(),
+        _ => String::new(),
+    };
+    if search.is_empty() {
+        info!(
+            %interface,
+            address = %format_args!("{}/{prefix}", lease.ip),
+            server = %lease.server_id,
+            lease_time = lease.lease_time,
+            t1 = lease.renewal_time,
+            t2 = lease.rebind_time,
+            %gw,
+            %dns,
+            "lease {event}",
+        );
+    } else {
+        info!(
+            %interface,
+            address = %format_args!("{}/{prefix}", lease.ip),
+            server = %lease.server_id,
+            lease_time = lease.lease_time,
+            t1 = lease.renewal_time,
+            t2 = lease.rebind_time,
+            %gw,
+            %dns,
+            %search,
+            "lease {event}",
+        );
     }
 }
 
