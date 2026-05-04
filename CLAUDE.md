@@ -23,7 +23,15 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
 
 ## Bug fix workflow
 
-1. Write a test that reproduces the bug
+1. Write a test that reproduces the bug. The test must exercise the
+   existing buggy code path and fail because the bug produces wrong
+   results — not because new fix code is missing. A compilation error
+   is never a valid reproduction. When the bug is reported as a series
+   of steps (e.g. "do X, then Y, then Z fails"), write an integration
+   test (see below) that follows those steps. If the bug involves
+   multiple components (daemon, DHCP, CLI, reconciler), also use an
+   integration test. Reserve unit tests for new feature development,
+   where you need to verify that a single function behaves as expected.
 2. Run the test and verify it fails **for the right reason** (the bug)
 3. Write the fix
 4. Run the test again and verify it passes
