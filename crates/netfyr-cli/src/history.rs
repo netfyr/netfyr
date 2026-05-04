@@ -1119,9 +1119,9 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                         match fc.field_name.as_str() {
                             "addresses" => {
                                 let a: Vec<&str> =
-                                    added.iter().filter_map(|v| v.as_str()).collect();
+                                    added.iter().filter_map(|v| v.as_str().or_else(|| v.get("address")?.as_str())).collect();
                                 let r: Vec<&str> =
-                                    removed.iter().filter_map(|v| v.as_str()).collect();
+                                    removed.iter().filter_map(|v| v.as_str().or_else(|| v.get("address")?.as_str())).collect();
                                 parts.extend(format_address_changes(a, r));
                             }
                             "routes" => {
