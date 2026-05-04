@@ -642,6 +642,7 @@ pub async fn query_ethernet(
         let driver = read_sysfs_driver(&link.name);
         let pci_path = read_sysfs_pci_path(&link.name);
         let discovered = build_discovered_selector(
+            "ethernet",
             &link.name,
             link.mac,
             driver.as_deref(),

@@ -35,6 +35,7 @@ pub async fn establish_connection() -> Result<Handle, BackendError> {
 ///
 /// Used to apply `user_selector.matches(&discovered)` for filtering.
 pub fn build_discovered_selector(
+    entity_type: &str,
     name: &str,
     mac: Option<[u8; 6]>,
     driver: Option<&str>,
@@ -42,6 +43,7 @@ pub fn build_discovered_selector(
 ) -> Selector {
     Selector {
         name: Some(name.to_owned()),
+        entity_type: Some(entity_type.to_owned()),
         mac: mac.map(MacAddr),
         driver: driver.map(str::to_owned),
         pci_path: pci_path.map(str::to_owned),
@@ -99,8 +101,9 @@ mod tests {
     /// Scenario: name-only selector is built correctly.
     #[test]
     fn test_build_discovered_selector_sets_name() {
-        let sel = build_discovered_selector("eth0", None, None, None);
+        let sel = build_discovered_selector("ethernet", "eth0", None, None, None);
         assert_eq!(sel.name.as_deref(), Some("eth0"));
+        assert_eq!(sel.entity_type.as_deref(), Some("ethernet"));
         assert!(sel.mac.is_none(), "mac must be None when not provided");
         assert!(sel.driver.is_none(), "driver must be None when not provided");
         assert!(sel.pci_path.is_none(), "pci_path must be None when not provided");
@@ -110,7 +113,7 @@ mod tests {
     #[test]
     fn test_build_discovered_selector_sets_mac() {
         let mac = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x01u8];
-        let sel = build_discovered_selector("eth0", Some(mac), None, None);
+        let sel = build_discovered_selector("ethernet", "eth0", Some(mac), None, None);
         assert_eq!(
             sel.mac.as_ref().map(|m| m.0),
             Some(mac),
@@ -121,14 +124,14 @@ mod tests {
     /// Scenario: driver is stored when provided.
     #[test]
     fn test_build_discovered_selector_sets_driver() {
-        let sel = build_discovered_selector("eth0", None, Some("ixgbe"), None);
+        let sel = build_discovered_selector("ethernet", "eth0", None, Some("ixgbe"), None);
         assert_eq!(sel.driver.as_deref(), Some("ixgbe"));
     }
 
     /// Scenario: pci_path is stored when provided.
     #[test]
     fn test_build_discovered_selector_sets_pci_path() {
-        let sel = build_discovered_selector("eth0", None, None, Some("0000:03:00.0"));
+        let sel = build_discovered_selector("ethernet", "eth0", None, None, Some("0000:03:00.0"));
         assert_eq!(sel.pci_path.as_deref(), Some("0000:03:00.0"));
     }
 
@@ -137,12 +140,14 @@ mod tests {
     fn test_build_discovered_selector_with_all_fields() {
         let mac = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0xFFu8];
         let sel = build_discovered_selector(
+            "ethernet",
             "eth0",
             Some(mac),
             Some("ixgbe"),
             Some("0000:03:00.0"),
         );
         assert_eq!(sel.name.as_deref(), Some("eth0"));
+        assert_eq!(sel.entity_type.as_deref(), Some("ethernet"));
         assert_eq!(sel.mac.as_ref().map(|m| m.0), Some(mac));
         assert_eq!(sel.driver.as_deref(), Some("ixgbe"));
         assert_eq!(sel.pci_path.as_deref(), Some("0000:03:00.0"));
@@ -155,7 +160,7 @@ mod tests {
     #[test]
     fn test_build_discovered_selector_name_match() {
         let user_sel = Selector::with_name("eth0");
-        let discovered = build_discovered_selector("eth0", None, None, None);
+        let discovered = build_discovered_selector("ethernet", "eth0", None, None, None);
         assert!(
             user_sel.matches(&discovered),
             "name selector must match discovered selector with same name"
@@ -167,7 +172,7 @@ mod tests {
     #[test]
     fn test_build_discovered_selector_name_mismatch_does_not_match() {
         let user_sel = Selector::with_name("eth1");
-        let discovered = build_discovered_selector("eth0", None, None, None);
+        let discovered = build_discovered_selector("ethernet", "eth0", None, None, None);
         assert!(
             !user_sel.matches(&discovered),
             "name selector 'eth1' must not match discovered selector for 'eth0'"
@@ -179,7 +184,7 @@ mod tests {
     #[test]
     fn test_build_discovered_selector_mac_match() {
         let mac = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x01u8];
-        let discovered = build_discovered_selector("eth0", Some(mac), None, None);
+        let discovered = build_discovered_selector("ethernet", "eth0", Some(mac), None, None);
         let user_sel = Selector {
             mac: Some(MacAddr(mac)),
             ..Default::default()
@@ -195,7 +200,7 @@ mod tests {
     fn test_build_discovered_selector_mac_mismatch_does_not_match() {
         let mac0 = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x01u8];
         let mac1 = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x02u8];
-        let discovered = build_discovered_selector("eth0", Some(mac0), None, None);
+        let discovered = build_discovered_selector("ethernet", "eth0", Some(mac0), None, None);
         let user_sel = Selector {
             mac: Some(MacAddr(mac1)),
             ..Default::default()
@@ -210,7 +215,7 @@ mod tests {
     /// with that driver.
     #[test]
     fn test_build_discovered_selector_driver_match() {
-        let discovered = build_discovered_selector("eth0", None, Some("ixgbe"), None);
+        let discovered = build_discovered_selector("ethernet", "eth0", None, Some("ixgbe"), None);
         let user_sel = Selector {
             driver: Some("ixgbe".to_string()),
             ..Default::default()
@@ -225,7 +230,7 @@ mod tests {
     /// driver (e.g., selecting "ixgbe" when the interface uses "e1000").
     #[test]
     fn test_build_discovered_selector_driver_mismatch_does_not_match() {
-        let discovered = build_discovered_selector("eth0", None, Some("e1000"), None);
+        let discovered = build_discovered_selector("ethernet", "eth0", None, Some("e1000"), None);
         let user_sel = Selector {
             driver: Some("ixgbe".to_string()),
             ..Default::default()
@@ -241,7 +246,7 @@ mod tests {
     #[test]
     fn test_build_discovered_selector_and_logic_both_match() {
         let mac = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x01u8];
-        let discovered = build_discovered_selector("eth0", Some(mac), None, None);
+        let discovered = build_discovered_selector("ethernet", "eth0", Some(mac), None, None);
         let user_sel = Selector {
             name: Some("eth0".to_string()),
             mac: Some(MacAddr(mac)),
@@ -259,7 +264,7 @@ mod tests {
     fn test_build_discovered_selector_and_logic_mac_mismatch_fails() {
         let mac0 = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x01u8];
         let mac1 = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x02u8];
-        let discovered = build_discovered_selector("eth0", Some(mac0), None, None);
+        let discovered = build_discovered_selector("ethernet", "eth0", Some(mac0), None, None);
         let user_sel = Selector {
             name: Some("eth0".to_string()),
             mac: Some(MacAddr(mac1)), // wrong MAC
@@ -275,7 +280,7 @@ mod tests {
     /// driver AND name both match.
     #[test]
     fn test_build_discovered_selector_and_logic_driver_and_name() {
-        let discovered = build_discovered_selector("eth0", None, Some("ixgbe"), None);
+        let discovered = build_discovered_selector("ethernet", "eth0", None, Some("ixgbe"), None);
         let user_sel = Selector {
             name: Some("eth0".to_string()),
             driver: Some("ixgbe".to_string()),
@@ -290,7 +295,7 @@ mod tests {
     /// Scenario: PCI path selector matches the discovered pci_path.
     #[test]
     fn test_build_discovered_selector_pci_path_match() {
-        let discovered = build_discovered_selector("eth0", None, None, Some("0000:03:00.0"));
+        let discovered = build_discovered_selector("ethernet", "eth0", None, None, Some("0000:03:00.0"));
         let user_sel = Selector {
             pci_path: Some("0000:03:00.0".to_string()),
             ..Default::default()
@@ -298,10 +303,40 @@ mod tests {
         assert!(user_sel.matches(&discovered), "pci_path selector must match");
     }
 
+    /// Scenario: A user selector with entity_type="ethernet" matches a discovered
+    /// selector built for the "ethernet" entity type.
+    #[test]
+    fn test_build_discovered_selector_entity_type_match() {
+        let discovered = build_discovered_selector("ethernet", "eth0", None, None, None);
+        let user_sel = Selector {
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            user_sel.matches(&discovered),
+            "entity_type selector must match discovered selector with same entity type"
+        );
+    }
+
+    /// Scenario: A user selector with entity_type="wifi" does not match a
+    /// discovered selector built for "ethernet".
+    #[test]
+    fn test_build_discovered_selector_entity_type_mismatch_does_not_match() {
+        let discovered = build_discovered_selector("ethernet", "eth0", None, None, None);
+        let user_sel = Selector {
+            entity_type: Some("wifi".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !user_sel.matches(&discovered),
+            "entity_type selector 'wifi' must not match discovered selector for 'ethernet'"
+        );
+    }
+
     /// Scenario: PCI path selector does not match a different pci_path.
     #[test]
     fn test_build_discovered_selector_pci_path_mismatch_does_not_match() {
-        let discovered = build_discovered_selector("eth0", None, None, Some("0000:04:00.0"));
+        let discovered = build_discovered_selector("ethernet", "eth0", None, None, Some("0000:04:00.0"));
         let user_sel = Selector {
             pci_path: Some("0000:03:00.0".to_string()),
             ..Default::default()
