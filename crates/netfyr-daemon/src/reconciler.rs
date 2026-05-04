@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use netfyr_backend::{ApplyReport, BackendRegistry, NetlinkBackend};
+use netfyr_backend::{ApplyReport, BackendError, BackendRegistry, NetlinkBackend};
 use netfyr_journal::{
     summarize_policies, ApplyOutcome, Journal, JournalEntry, SequenceId, SerializableDiff,
     SerializableDiffOp, SerializableFieldChange, SerializableState, SerializableStateSet, Trigger,
@@ -521,8 +521,19 @@ impl Reconciler {
                 .await?;
             Ok(state_set)
         } else {
-            let state_set = self.backend_registry.query_all().await?;
-            Ok(state_set)
+            let mut merged = StateSet::new();
+            for et in self.backend_registry.supported_entities() {
+                match self.backend_registry.query(&et, selector).await {
+                    Ok(state_set) => {
+                        for state in state_set.iter() {
+                            merged.insert(state.clone());
+                        }
+                    }
+                    Err(BackendError::NotFound { .. }) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(merged)
         }
     }
 
