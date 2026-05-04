@@ -10,6 +10,7 @@
 //! - Error:    `{"error": "io.netfyr.ErrorName", "parameters": {"reason": "..."}}\0`
 
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -33,6 +34,22 @@ use crate::reconciler::Reconciler;
 
 /// Maximum message size accepted from clients (16 MiB).
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Returns `true` if the given method+parameters combination requires root
+/// (uid 0). Write methods that mutate system state require root; read-only
+/// methods are allowed for any uid.
+fn requires_root(method: &str, params: &serde_json::Value) -> bool {
+    match method {
+        "io.netfyr.SubmitPolicies" => true,
+        "io.netfyr.Revert" => {
+            !params
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
 
 // ── Wire-protocol helpers ─────────────────────────────────────────────────────
 
@@ -742,6 +759,40 @@ async fn handle_connection(
             .cloned()
             .unwrap_or(serde_json::Value::Object(Default::default()));
 
+        if requires_root(&method, &params) {
+            match stream.peer_cred() {
+                Ok(cred) => {
+                    if cred.uid() != 0 {
+                        warn!(
+                            method = %method,
+                            uid = cred.uid(),
+                            "Permission denied: write method requires root"
+                        );
+                        let _ = write_error(
+                            stream,
+                            "PermissionDenied",
+                            &format!(
+                                "method '{}' requires root (uid 0), but client has uid {}",
+                                method, cred.uid()
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get peer credentials: {}", e);
+                    let _ = write_error(
+                        stream,
+                        "PermissionDenied",
+                        "could not verify client credentials",
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
+
         let result = match method.as_str() {
             "io.netfyr.SubmitPolicies" => {
                 handle_submit_policies(
@@ -815,6 +866,9 @@ pub async fn serve_varlink(
 
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("Failed to bind Varlink socket {}: {}", socket_path, e))?;
+
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
+        .map_err(|e| anyhow::anyhow!("Failed to set socket permissions on {}: {}", socket_path, e))?;
 
     info!("Varlink server listening on {}", socket_path);
 
@@ -1988,5 +2042,47 @@ mod tests {
         // Drop client to allow server task to finish
         drop(client);
         let _ = server_task.await;
+    }
+
+    // ── requires_root ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_requires_root_submit_policies() {
+        assert!(requires_root("io.netfyr.SubmitPolicies", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn test_requires_root_revert_dry_run_false() {
+        assert!(requires_root(
+            "io.netfyr.Revert",
+            &serde_json::json!({"target_seq": 1, "dry_run": false})
+        ));
+    }
+
+    #[test]
+    fn test_requires_root_revert_dry_run_absent() {
+        assert!(requires_root(
+            "io.netfyr.Revert",
+            &serde_json::json!({"target_seq": 1})
+        ));
+    }
+
+    #[test]
+    fn test_requires_root_revert_dry_run_true_does_not_require_root() {
+        assert!(!requires_root(
+            "io.netfyr.Revert",
+            &serde_json::json!({"target_seq": 1, "dry_run": true})
+        ));
+    }
+
+    #[test]
+    fn test_requires_root_read_methods() {
+        let empty = serde_json::json!({});
+        assert!(!requires_root("io.netfyr.Query", &empty));
+        assert!(!requires_root("io.netfyr.DryRun", &empty));
+        assert!(!requires_root("io.netfyr.GetStatus", &empty));
+        assert!(!requires_root("io.netfyr.GetHistory", &empty));
+        assert!(!requires_root("io.netfyr.GetJournalEntry", &empty));
+        assert!(!requires_root("io.netfyr.GetShowInfo", &empty));
     }
 }

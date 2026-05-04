@@ -138,7 +138,7 @@ mod tests {
         );
     }
 
-    /// Interface file defines the three required error types.
+    /// Interface file defines the required error types.
     #[test]
     fn test_varlink_interface_file_defines_required_errors() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -149,5 +149,6 @@ mod tests {
         assert!(content.contains("error InvalidPolicy"), "Interface must define InvalidPolicy error");
         assert!(content.contains("error BackendError"), "Interface must define BackendError error");
         assert!(content.contains("error InternalError"), "Interface must define InternalError error");
+        assert!(content.contains("error PermissionDenied"), "Interface must define PermissionDenied error");
     }
 }

@@ -239,10 +239,15 @@ async fn run_apply_daemon(
         return Ok(ExitCode::from(if is_empty { 0u8 } else { 1u8 }));
     }
 
-    let report = client
-        .submit_policies(policies)
-        .await
-        .context("failed to submit policies to daemon")?;
+    let report = match client.submit_policies(policies).await {
+        Ok(r) => r,
+        Err(VarlinkError::PermissionDenied(msg)) => {
+            eprintln!("Error: {}", msg);
+            eprintln!("Hint: run as root to apply policies (e.g. sudo netfyr apply ...)");
+            return Ok(ExitCode::from(1u8));
+        }
+        Err(e) => return Err(anyhow::Error::from(e).context("failed to submit policies to daemon")),
+    };
 
     display_varlink_apply_report(&report, policy_count);
     Ok(daemon_exit_code(&report))

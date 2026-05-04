@@ -110,6 +110,17 @@ Maximum journal file size in bytes before rotation (default: 52428800).
 .TP
 .B NETFYR_JOURNAL_RETENTION_DAYS
 Days to retain rotated journal archives (default: 90).
+.SH "ACCESS CONTROL"
+The daemon socket is created with mode 0666 so that any local user can
+connect.
+.B Read\-only operations
+(show, query, history, diagnose, and dry\-run revert) are available to
+all users.
+.B Write operations
+(apply and non\-dry\-run revert) require the connecting process to run as
+root (uid\ 0); non\-root clients receive a
+.I PermissionDenied
+error.
 .SH FILES
 .TP
 .I /run/netfyr/netfyr.sock

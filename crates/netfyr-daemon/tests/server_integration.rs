@@ -67,20 +67,37 @@ struct DaemonProcess {
 
 impl DaemonProcess {
     /// Start the daemon and wait up to `timeout` for the socket to appear.
+    ///
+    /// When the test process is not root, wraps the daemon in
+    /// `unshare --user --map-root-user` so that peer credential checks
+    /// see the connecting test client as uid 0.
     async fn start_with_timeout(timeout: Duration) -> Self {
         let socket_dir = tempfile::tempdir().unwrap();
         let policy_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("netfyr-test.sock");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_netfyr-daemon"))
-            .env("NETFYR_SOCKET_PATH", socket_path.as_os_str())
-            .env("NETFYR_POLICY_DIR", policy_dir.path())
-            // Suppress tracing output to keep test output clean.
-            .env("RUST_LOG", "off")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn netfyr-daemon binary");
+        let euid = unsafe { libc::geteuid() };
+        let child = if euid != 0 {
+            Command::new("unshare")
+                .args(["--user", "--map-root-user", "--"])
+                .arg(env!("CARGO_BIN_EXE_netfyr-daemon"))
+                .env("NETFYR_SOCKET_PATH", socket_path.as_os_str())
+                .env("NETFYR_POLICY_DIR", policy_dir.path())
+                .env("RUST_LOG", "off")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to spawn netfyr-daemon via unshare")
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_netfyr-daemon"))
+                .env("NETFYR_SOCKET_PATH", socket_path.as_os_str())
+                .env("NETFYR_POLICY_DIR", policy_dir.path())
+                .env("RUST_LOG", "off")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to spawn netfyr-daemon binary")
+        };
 
         // Poll for the socket file to appear.
         let deadline = Instant::now() + timeout;

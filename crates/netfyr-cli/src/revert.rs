@@ -67,6 +67,11 @@ async fn run_revert_daemon(mut client: VarlinkClient, args: RevertArgs) -> Resul
             eprintln!("Error: {}", msg);
             return Ok(ExitCode::from(1u8));
         }
+        Err(VarlinkError::PermissionDenied(msg)) => {
+            eprintln!("Error: {}", msg);
+            eprintln!("Hint: run as root to revert state (e.g. sudo netfyr revert ...)");
+            return Ok(ExitCode::from(1u8));
+        }
         Err(e) => {
             return Err(anyhow::Error::from(e).context("revert via daemon failed"));
         }

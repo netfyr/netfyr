@@ -58,6 +58,11 @@ pub enum VarlinkError {
     /// does not exist.
     #[error("entry not found: {0}")]
     EntryNotFound(String),
+
+    /// The server returned `io.netfyr.PermissionDenied` — the client's UID is not
+    /// authorized for the requested write operation.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 // ── VarlinkClient ─────────────────────────────────────────────────────────────
@@ -272,6 +277,7 @@ impl VarlinkClient {
                 "io.netfyr.BackendError" => VarlinkError::Backend(reason),
                 "io.netfyr.InternalError" => VarlinkError::Internal(reason),
                 "io.netfyr.EntryNotFound" => VarlinkError::EntryNotFound(reason),
+                "io.netfyr.PermissionDenied" => VarlinkError::PermissionDenied(reason),
                 other => VarlinkError::Protocol(format!("unknown error '{other}': {reason}")),
             });
         }
@@ -729,6 +735,34 @@ mod tests {
             assert!(
                 msg.contains("panic"),
                 "reason must mention 'panic', got: {msg}"
+            );
+        }
+        server.await.unwrap();
+    }
+
+    /// Scenario: PermissionDenied response returns VarlinkError::PermissionDenied.
+    #[tokio::test]
+    async fn test_permission_denied_response_returns_permission_denied_variant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_error_server(
+            path.clone(),
+            "io.netfyr.PermissionDenied",
+            "method 'io.netfyr.SubmitPolicies' requires root (uid 0), but client has uid 1000",
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.submit_policies(vec![]).await;
+
+        assert!(
+            matches!(result, Err(VarlinkError::PermissionDenied(_))),
+            "expected PermissionDenied error, got {result:?}"
+        );
+        if let Err(VarlinkError::PermissionDenied(msg)) = result {
+            assert!(
+                msg.contains("requires root"),
+                "reason must mention 'requires root', got: {msg}"
             );
         }
         server.await.unwrap();
