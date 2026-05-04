@@ -608,6 +608,75 @@ fn test_history_show_route_diff_zero_metric_omitted() {
     );
 }
 
+// ── Feature: Route destination shown in CHANGES column ───────────────────────
+
+/// AC: The list-view CHANGES column shows routes with "rt" prefix and
+/// destination, e.g. "+rt 10.0.0.0/8", distinguishing them from addresses.
+#[test]
+fn test_history_list_changes_column_shows_route_destination() {
+    let entry = make_entry_with_diff("veth1", vec![SerializableFieldChange {
+        field_name: "routes".to_string(),
+        change_kind: "set".to_string(),
+        current: Some(serde_json::json!([])),
+        desired: Some(serde_json::json!([
+            {"destination": "10.0.0.0/8"}
+        ])),
+        outcome: None,
+    }]);
+    let dir = setup_journal(vec![entry]);
+    let output = run_history(dir.path(), &[]);
+    assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("+rt 10.0.0.0/8"),
+        "CHANGES column must show '+rt 10.0.0.0/8'; got:\n{text}"
+    );
+}
+
+/// AC: Route with a gateway shows "via GATEWAY" after the destination.
+#[test]
+fn test_history_list_changes_column_shows_route_with_gateway() {
+    let entry = make_entry_with_diff("veth1", vec![SerializableFieldChange {
+        field_name: "routes".to_string(),
+        change_kind: "set".to_string(),
+        current: Some(serde_json::json!([])),
+        desired: Some(serde_json::json!([
+            {"destination": "10.0.0.0/8", "gateway": "192.168.1.1"}
+        ])),
+        outcome: None,
+    }]);
+    let dir = setup_journal(vec![entry]);
+    let output = run_history(dir.path(), &[]);
+    assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("+rt 10.0.0.0/8 via 192.168.1.1"),
+        "CHANGES column must show '+rt 10.0.0.0/8 via 192.168.1.1'; got:\n{text}"
+    );
+}
+
+/// AC: Removed routes show "rt" prefix and gateway when present.
+#[test]
+fn test_history_list_changes_column_shows_removed_route_destination() {
+    let entry = make_entry_with_diff("veth1", vec![SerializableFieldChange {
+        field_name: "routes".to_string(),
+        change_kind: "set".to_string(),
+        current: Some(serde_json::json!([
+            {"destination": "192.168.1.0/24", "gateway": "192.168.1.1"}
+        ])),
+        desired: Some(serde_json::json!([])),
+        outcome: None,
+    }]);
+    let dir = setup_journal(vec![entry]);
+    let output = run_history(dir.path(), &[]);
+    assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
+    let text = combined(&output);
+    assert!(
+        text.contains("-rt 192.168.1.0/24 via 192.168.1.1"),
+        "CHANGES column must show '-rt 192.168.1.0/24 via 192.168.1.1' for removed route; got:\n{text}"
+    );
+}
+
 // ── Feature: failure indicator in CHANGES column ─────────────────────────────
 
 /// AC: CHANGES column shows "FAIL" prefix when failures occurred in list view.

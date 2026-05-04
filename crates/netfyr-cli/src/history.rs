@@ -591,6 +591,17 @@ fn format_address_changes(added: Vec<&str>, removed: Vec<&str>) -> Vec<String> {
     parts
 }
 
+fn format_route_dest_via(r: &serde_json::Value) -> String {
+    let dest = r.as_object()
+        .and_then(|o| o.get("destination"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    match r.as_object().and_then(|o| o.get("gateway")).and_then(|v| v.as_str()) {
+        Some(gw) => format!("{} via {}", dest, gw),
+        None => dest.to_string(),
+    }
+}
+
 fn format_route_changes(
     added_routes: Vec<&serde_json::Value>,
     removed_routes: Vec<&serde_json::Value>,
@@ -638,11 +649,20 @@ fn format_route_changes(
     }
     let n_add = added_nondflt.len();
     let n_rem = removed_nondflt.len();
-    if n_add > 0 {
-        parts.push(format!("+{} {}", n_add, if n_add == 1 { "route" } else { "routes" }));
-    }
-    if n_rem > 0 {
-        parts.push(format!("-{} {}", n_rem, if n_rem == 1 { "route" } else { "routes" }));
+    if n_add + n_rem >= 9 {
+        if n_add > 0 {
+            parts.push(format!("+{} routes", n_add));
+        }
+        if n_rem > 0 {
+            parts.push(format!("-{} routes", n_rem));
+        }
+    } else {
+        for r in &added_nondflt {
+            parts.push(format!("+rt {}", format_route_dest_via(r)));
+        }
+        for r in &removed_nondflt {
+            parts.push(format!("-rt {}", format_route_dest_via(r)));
+        }
     }
     parts
 }
@@ -3345,9 +3365,9 @@ mod tests {
         );
     }
 
-    /// AC: Non-default routes show counts only, not individual destinations.
+    /// AC: Non-default routes show individual destinations.
     #[test]
-    fn test_changes_summary_non_default_routes_show_count_only() {
+    fn test_changes_summary_non_default_routes_show_destinations() {
         let ops = vec![SerializableDiffOp {
             kind: "modify".to_string(),
             entity_type: "ethernet".to_string(),
@@ -3365,10 +3385,15 @@ mod tests {
             }],
         }];
         let result = changes_summary(&ops);
-        assert_eq!(result, "+3 routes", "3 non-default routes should show '+3 routes', got: {}", result);
+        for expected in &["+rt 10.0.0.0/8 via 192.168.1.1", "+rt 172.16.0.0/12 via 192.168.1.1", "+rt 192.168.2.0/24 via 192.168.1.1"] {
+            assert!(
+                result.contains(expected),
+                "non-default route {} should appear; got: {}", expected, result
+            );
+        }
     }
 
-    /// AC: Default route and non-default routes: default shown by value, others counted.
+    /// AC: Default route and non-default routes: all shown by destination.
     #[test]
     fn test_changes_summary_default_route_and_non_default_routes_mixed() {
         let ops = vec![SerializableDiffOp {
@@ -3395,12 +3420,13 @@ mod tests {
             "default route should be shown by value, got: {}",
             result
         );
-        // 1 default + 4 non-default = 5 total; default shown separately, 4 counted as "+4 routes"
-        assert!(
-            result.contains("+4 routes"),
-            "4 non-default routes should show '+4 routes', got: {}",
-            result
-        );
+        for expected in &["+rt 10.0.0.0/8 via 192.168.1.1", "+rt 172.16.0.0/12 via 192.168.1.1", "+rt 192.168.2.0/24 via 192.168.1.1", "+rt 203.0.113.0/24 via 192.168.1.1"] {
+            assert!(
+                result.contains(expected),
+                "non-default route {} should appear; got: {}",
+                expected, result
+            );
+        }
     }
 
     /// AC: Default route removal is shown by value "-dflt via ...".
