@@ -232,27 +232,65 @@ impl Selector {
 
 /// The set of possible field values in a network entity's configuration.
 ///
-/// Uses `#[serde(untagged)]` to produce natural JSON/YAML (strings as strings,
-/// numbers as numbers, etc.) rather than tagged envelopes. Variant declaration
-/// order matters for untagged deserialization — serde tries each in order:
-/// Bool first (syntactically distinct in JSON), then numerics, then IP types
-/// (before String so IP-format strings don't match String first), then
-/// List/Map (structurally distinct), then String as the fallback.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Serialization uses `#[serde(untagged)]` for natural JSON/YAML output.
+/// Deserialization uses a custom impl that routes string values through
+/// IP-aware parsing: only strings containing `/` are tried as `IpNetwork`,
+/// bare IPs become `IpAddr`, and everything else stays `String`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Value {
     Bool(bool),
     U64(u64),
     I64(i64),
-    // IpNetwork before IpAddr: the ipnetwork deserializer requires a `/prefix`,
-    // so it will fail on bare IPs and fall through to IpAddr.
     IpNetwork(Ipv4Network),
     IpAddr(Ipv4Addr),
     List(Vec<Value>),
     Map(IndexMap<String, Value>),
-    // String is last — it matches any JSON string, so it must come after all
-    // other string-like types (IpNetwork, IpAddr).
     String(String),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawValue {
+    Bool(bool),
+    U64(u64),
+    I64(i64),
+    String(String),
+    List(Vec<RawValue>),
+    Map(IndexMap<String, RawValue>),
+}
+
+impl From<RawValue> for Value {
+    fn from(raw: RawValue) -> Self {
+        match raw {
+            RawValue::Bool(b) => Value::Bool(b),
+            RawValue::U64(n) => Value::U64(n),
+            RawValue::I64(n) => Value::I64(n),
+            RawValue::String(s) => {
+                if s.contains('/') {
+                    if let Ok(net) = s.parse::<Ipv4Network>() {
+                        return Value::IpNetwork(net);
+                    }
+                }
+                if let Ok(ip) = s.parse::<Ipv4Addr>() {
+                    return Value::IpAddr(ip);
+                }
+                Value::String(s)
+            }
+            RawValue::List(items) => {
+                Value::List(items.into_iter().map(Value::from).collect())
+            }
+            RawValue::Map(map) => {
+                Value::Map(map.into_iter().map(|(k, v)| (k, Value::from(v))).collect())
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        RawValue::deserialize(deserializer).map(Value::from)
+    }
 }
 
 impl fmt::Display for Value {

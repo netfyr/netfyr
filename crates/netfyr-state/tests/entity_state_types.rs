@@ -136,12 +136,6 @@ fn test_state_serde_round_trip() {
     fields.insert(
         "gateway_network".to_string(),
         FieldValue {
-            // NOTE: Value::IpAddr does NOT round-trip through JSON with the current
-            // implementation. Because the enum uses #[serde(untagged)] with IpNetwork
-            // before IpAddr, a bare IP like "10.0.1.1" is deserialized as
-            // IpNetwork(10.0.1.1/32) rather than IpAddr(10.0.1.1).
-            // See test_value_ip_addr_serde_bug below.
-            // Using IpNetwork here instead to keep this round-trip test passing.
             value: Value::IpNetwork(net),
             provenance: Provenance::ExternalTool {
                 tool: "iproute2".to_string(),
@@ -335,20 +329,14 @@ fn test_selector_default_has_no_name() {
 }
 
 // ---------------------------------------------------------------------------
-// Bug documentation: Value::IpAddr does not round-trip through JSON
+// Value::IpAddr JSON round-trip
 // ---------------------------------------------------------------------------
 
-/// BUG: Value::IpAddr(x.x.x.x) does not survive a JSON round-trip.
-///
-/// Because `Value` uses `#[serde(untagged)]` and the `IpNetwork` variant is
-/// declared before `IpAddr`, a bare IP string like `"10.0.1.1"` is
-/// deserialized as `IpNetwork(10.0.1.1/32)` instead of `IpAddr(10.0.1.1)`.
-/// The fix is to reorder the variants so that `IpAddr` comes before
-/// `IpNetwork` in the enum, OR use a custom deserializer that checks for a
-/// `/` in the string before attempting IpNetwork. The verify phase should
-/// address this.
+/// Value::IpAddr(x.x.x.x) must survive a JSON round-trip as IpAddr, not
+/// IpNetwork(x.x.x.x/32). The custom Deserialize impl checks for `/`
+/// before trying IpNetwork.
 #[test]
-fn test_value_ip_addr_serde_bug() {
+fn test_value_ip_addr_json_round_trip() {
     use std::net::Ipv4Addr;
     let ip = Ipv4Addr::new(10, 0, 1, 1);
     let original = Value::IpAddr(ip);
@@ -356,13 +344,5 @@ fn test_value_ip_addr_serde_bug() {
     let json = serde_json::to_string(&original).expect("serialize");
     let deserialized: Value = serde_json::from_str(&json).expect("deserialize");
 
-    // BUG: this assertion currently FAILS — IpAddr round-trips as IpNetwork/32
-    // assert_eq!(original, deserialized, "IpAddr must survive a JSON round-trip");
-
-    // Instead, document the actual (buggy) behaviour:
-    let expected_bug = Value::IpNetwork("10.0.1.1/32".parse::<ipnetwork::Ipv4Network>().unwrap());
-    assert_eq!(
-        deserialized, expected_bug,
-        "BUG: IpAddr(10.0.1.1) deserializes as IpNetwork(10.0.1.1/32) due to variant ordering"
-    );
+    assert_eq!(original, deserialized, "IpAddr must survive a JSON round-trip");
 }

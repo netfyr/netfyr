@@ -25,6 +25,8 @@ futures = "0.3"
 tracing = "0.1"
 # indexmap: ordered map for State fields; re-exported from netfyr-state but needed directly here.
 indexmap = "2"
+# ipnetwork: parse CIDR strings into typed Ipv4Network values matching netfyr-state::Value variants.
+ipnetwork = "0.20"
 # dhcproto: DHCPv4 message encoding/decoding. The RFC 2131 option format is complex
 # (~50 option types, variable-length encoding). Implementing from scratch would be
 # ~500+ lines of error-prone code.

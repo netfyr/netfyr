@@ -986,6 +986,7 @@ dependencies = [
  "dhcproto",
  "futures",
  "indexmap",
+ "ipnetwork",
  "libc",
  "netfyr-state",
  "netfyr-test-utils",

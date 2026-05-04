@@ -1,7 +1,7 @@
 //! Ethernet interface query via rtnetlink.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use futures::TryStreamExt;
 use indexmap::IndexMap;
@@ -151,9 +151,17 @@ fn build_route_value(
     protocol: Option<&str>,
 ) -> Value {
     let mut map = IndexMap::new();
-    map.insert("destination".to_string(), Value::String(destination.to_owned()));
+    let dest_val = destination
+        .parse::<ipnetwork::Ipv4Network>()
+        .map(Value::IpNetwork)
+        .unwrap_or_else(|_| Value::String(destination.to_owned()));
+    map.insert("destination".to_string(), dest_val);
     if let Some(gw) = gateway {
-        map.insert("gateway".to_string(), Value::String(gw.to_owned()));
+        let gw_val = gw
+            .parse::<Ipv4Addr>()
+            .map(Value::IpAddr)
+            .unwrap_or_else(|_| Value::String(gw.to_owned()));
+        map.insert("gateway".to_string(), gw_val);
     }
     map.insert("metric".to_string(), Value::U64(metric as u64));
     if let Some(proto) = protocol {
@@ -421,7 +429,7 @@ mod tests {
         assert!(map.contains_key("metric"),      "map must have 'metric' key");
         assert!(!map.contains_key("gateway"),    "map must NOT have 'gateway' key when not provided");
         assert!(!map.contains_key("protocol"),   "map must NOT have 'protocol' key when not provided");
-        assert_eq!(map["destination"].as_str(), Some("10.0.0.0/24"));
+        assert_eq!(map["destination"].to_string(), "10.0.0.0/24");
         assert_eq!(map["metric"].as_u64(), Some(100));
     }
 
@@ -434,8 +442,8 @@ mod tests {
         assert!(map.contains_key("gateway"),     "map must have 'gateway' key when provided");
         assert!(map.contains_key("metric"),      "map must have 'metric' key");
         assert!(map.contains_key("protocol"),    "map must have 'protocol' key when provided");
-        assert_eq!(map["destination"].as_str(), Some("0.0.0.0/0"));
-        assert_eq!(map["gateway"].as_str(), Some("192.168.1.1"));
+        assert_eq!(map["destination"].to_string(), "0.0.0.0/0");
+        assert_eq!(map["gateway"].to_string(), "192.168.1.1");
         assert_eq!(map["metric"].as_u64(), Some(0));
         assert_eq!(map["protocol"].as_str(), Some("static"));
     }
@@ -715,7 +723,11 @@ pub async fn query_ethernet(
             .map(|addrs| {
                 addrs
                     .iter()
-                    .map(|s| Value::String(s.clone()))
+                    .map(|s| {
+                        s.parse::<ipnetwork::Ipv4Network>()
+                            .map(Value::IpNetwork)
+                            .unwrap_or_else(|_| Value::String(s.clone()))
+                    })
                     .collect()
             })
             .unwrap_or_default();
