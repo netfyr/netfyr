@@ -582,33 +582,11 @@ fn format_address_changes(added: Vec<&str>, removed: Vec<&str>) -> Vec<String> {
         return parts;
     }
 
-    if total <= 2 {
-        for addr in &added_sorted {
-            parts.push(format!("+{}", addr));
-        }
-        for addr in &removed_sorted {
-            parts.push(format!("-{}", addr));
-        }
-        return parts;
+    for addr in &added_sorted {
+        parts.push(format!("+{}", addr));
     }
-
-    // 3-8: show first 2 additions by value, count rest; first 1 removal, count rest
-    if !added_sorted.is_empty() {
-        let show = 2.min(added_sorted.len());
-        for addr in &added_sorted[..show] {
-            parts.push(format!("+{}", addr));
-        }
-        let rem = added_sorted.len() - show;
-        if rem > 0 {
-            parts.push(format!("(+{} addrs)", rem));
-        }
-    }
-    if !removed_sorted.is_empty() {
-        parts.push(format!("-{}", removed_sorted[0]));
-        let rem = removed_sorted.len() - 1;
-        if rem > 0 {
-            parts.push(format!("(-{} addrs)", rem));
-        }
+    for addr in &removed_sorted {
+        parts.push(format!("-{}", addr));
     }
     parts
 }
@@ -1103,6 +1081,28 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                             .and_then(|v| v.as_array())
                             .unwrap_or(&empty_arr);
 
+                        if fc.field_name == "addresses" {
+                            fn extract_addr(v: &serde_json::Value) -> Option<&str> {
+                                v.as_str().or_else(|| v.get("address")?.as_str())
+                            }
+                            let current_addrs: Vec<&str> =
+                                current_items.iter().filter_map(|v| extract_addr(v)).collect();
+                            let desired_addrs: Vec<&str> =
+                                desired_items.iter().filter_map(|v| extract_addr(v)).collect();
+                            let a: Vec<&str> = desired_addrs.iter()
+                                .filter(|d| !current_addrs.contains(d))
+                                .copied()
+                                .collect();
+                            let r: Vec<&str> = current_addrs.iter()
+                                .filter(|c| !desired_addrs.contains(c))
+                                .copied()
+                                .collect();
+                            if !a.is_empty() || !r.is_empty() {
+                                parts.extend(format_address_changes(a, r));
+                            }
+                            continue;
+                        }
+
                         let added: Vec<&serde_json::Value> = desired_items
                             .iter()
                             .filter(|d| !current_items.contains(d))
@@ -1117,13 +1117,6 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                         }
 
                         match fc.field_name.as_str() {
-                            "addresses" => {
-                                let a: Vec<&str> =
-                                    added.iter().filter_map(|v| v.as_str().or_else(|| v.get("address")?.as_str())).collect();
-                                let r: Vec<&str> =
-                                    removed.iter().filter_map(|v| v.as_str().or_else(|| v.get("address")?.as_str())).collect();
-                                parts.extend(format_address_changes(a, r));
-                            }
                             "routes" => {
                                 parts.extend(format_route_changes(added, removed));
                             }
@@ -3221,9 +3214,9 @@ mod tests {
         );
     }
 
-    /// AC: 5 address additions and 3 removals caps at first 2 shown by value.
+    /// AC: 5 address additions and 3 removals shows all 8 addresses individually.
     #[test]
-    fn test_changes_summary_5_addr_additions_3_removals_caps_at_2_shown() {
+    fn test_changes_summary_5_addr_additions_3_removals_shows_all() {
         let added: Vec<serde_json::Value> = (1..=5)
             .map(|i| serde_json::json!(format!("10.0.0.{}/24", i + 10)))
             .collect();
@@ -3243,22 +3236,20 @@ mod tests {
             }],
         }];
         let result = changes_summary(&ops);
-        // 5 added + 3 removed = 8 total: 3–8 range → show first 2 added by value, count rest
+        // 5 added + 3 removed = 8 total → all shown individually, no abbreviation
         assert!(
-            result.contains("(+3 addrs)"),
-            "should show '(+3 addrs)' for remaining 3 additions after showing 2, got: {}",
+            !result.contains("addrs)"),
+            "8 total address changes should show all individually without abbreviation, got: {}",
             result
         );
-        assert!(
-            result.contains("-192.168.1.1/24"),
-            "should show first removed address by value, got: {}",
-            result
-        );
-        assert!(
-            result.contains("(-2 addrs)"),
-            "should show '(-2 addrs)' for remaining 2 removals, got: {}",
-            result
-        );
+        for i in 1..=5 {
+            let addr = format!("+10.0.0.{}/24", i + 10);
+            assert!(result.contains(&addr), "should show {}, got: {}", addr, result);
+        }
+        for i in 1..=3 {
+            let addr = format!("-192.168.{}.1/24", i);
+            assert!(result.contains(&addr), "should show {}, got: {}", addr, result);
+        }
     }
 
     /// AC: 10 address additions and 10 removals shows only counts "+10 addrs, -10 addrs".
@@ -5013,5 +5004,54 @@ mod tests {
             row_300.trim_end().len(),
             "terminal widths beyond 200 should produce the same output"
         );
+    }
+
+    #[test]
+    fn test_changes_summary_address_string_vs_object_not_double_counted() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "veth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!(["172.25.0.101/24"])),
+                desired: Some(serde_json::json!([
+                    {"address": "172.25.0.101/24", "preferred_lft": 3600, "valid_lft": 7200}
+                ])),
+                outcome: None,
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert_eq!(
+            result, "(no changes)",
+            "same address in string vs object form should not appear as both added and removed, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_changes_summary_3_addresses_no_abbreviation() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!(["10.0.0.1/24", "10.0.0.2/24"])),
+                desired: Some(serde_json::json!(["10.0.0.3/24"])),
+                outcome: None,
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert!(
+            !result.contains("addrs)"),
+            "3 total address changes should show all addresses without abbreviation, got: {}",
+            result
+        );
+        assert!(result.contains("+10.0.0.3/24"), "should show added address, got: {}", result);
+        assert!(result.contains("-10.0.0.1/24"), "should show first removed address, got: {}", result);
+        assert!(result.contains("-10.0.0.2/24"), "should show second removed address, got: {}", result);
     }
 }
