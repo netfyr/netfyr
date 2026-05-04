@@ -315,6 +315,7 @@ impl Reconciler {
 
         let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state, &self.schema_registry);
         let state_diff = inject_dhcp_addresses(&trigger, policy_store, &effective_state, state_diff);
+        let state_diff = restrict_to_dhcp_trigger(&trigger, policy_store, state_diff);
 
         if state_diff.is_empty() {
             tracing::debug!("Reconciliation: no changes needed");
@@ -837,6 +838,29 @@ fn filter_state_for_interface(state: &StateSet, iface_name: &str) -> StateSet {
         }
     }
     filtered
+}
+
+/// For DHCP events, restrict the apply diff to only the triggering interface.
+///
+/// Without this, a reconciliation triggered by interface A would also apply
+/// pending changes for interfaces B and C (whose factories already have
+/// leases). When B's own event fires later, its address is already applied
+/// and the journal records an empty diff — losing the change from history.
+fn restrict_to_dhcp_trigger(
+    trigger: &Trigger,
+    policy_store: &PolicyStore,
+    diff: netfyr_state::StateDiff,
+) -> netfyr_state::StateDiff {
+    let iface = match dhcp_trigger_interface(trigger, policy_store) {
+        Some(name) => name,
+        None => return diff,
+    };
+    let filtered_ops: Vec<_> = diff
+        .into_ops()
+        .into_iter()
+        .filter(|op| op.selector().name.as_deref() == Some(iface))
+        .collect();
+    netfyr_state::StateDiff::new(filtered_ops)
 }
 
 /// Return a copy of `set` with all `STABLE_FIELDS` removed from every state.
