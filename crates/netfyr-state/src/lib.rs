@@ -546,6 +546,32 @@ pub struct State {
     pub priority: u32,
 }
 
+// ── Route normalization ──────────────────────────────────────────────────────
+
+const DEFAULT_ROUTE_METRIC: u64 = 100;
+
+/// Fills in `metric: 100` on any route map in `routes` fields that doesn't
+/// already specify a metric. This makes desired state comparable to kernel
+/// state via `PartialEq`, since the kernel always assigns the default metric.
+pub fn normalize_route_defaults(state_set: &mut set::StateSet) {
+    for state in state_set.iter_mut() {
+        if let Some(fv) = state.fields.get_mut("routes") {
+            if let Value::List(ref mut routes) = fv.value {
+                for route in routes.iter_mut() {
+                    if let Value::Map(ref mut map) = route {
+                        if !map.contains_key("metric") {
+                            map.insert(
+                                "metric".to_string(),
+                                Value::U64(DEFAULT_ROUTE_METRIC),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

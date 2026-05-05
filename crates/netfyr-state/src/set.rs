@@ -79,6 +79,11 @@ impl StateSet {
         self.inner.values()
     }
 
+    /// Iterates mutably over all states in insertion order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut State> {
+        self.inner.values_mut()
+    }
+
     /// Returns the number of states in this set.
     pub fn len(&self) -> usize {
         self.inner.len()

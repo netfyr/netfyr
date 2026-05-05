@@ -24,7 +24,7 @@ use netfyr_policy::{
 };
 use netfyr_reconcile::{
     generate_diff, merge, ConflictReport, DiffReport, EntityKey, PolicyId, PolicyInput,
-    StateDiff as ReconcileDiff,
+    ReconciliationResult, StateDiff as ReconcileDiff,
 };
 // Import the state-level diff function via its full module path to avoid the
 // name ambiguity between the `diff` module and the re-exported `diff` function.
@@ -134,7 +134,12 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
         .await
         .context("failed to query current system state via netlink")?;
 
-    let effective_state = &reconciliation.effective_state;
+    let ReconciliationResult {
+        mut effective_state,
+        conflicts,
+        ..
+    } = reconciliation;
+    netfyr_state::normalize_route_defaults(&mut effective_state);
 
     // 7. Compute diffs:
     //    - reconcile diff: rich per-field diff for display (old→new values)
@@ -143,7 +148,7 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     // generate_diff(desired, actual, managed_entities, schema) — desired first, then actual
     // compute_state_diff(from, to) — from=actual, to=desired
     let reconcile_diff: ReconcileDiff =
-        generate_diff(effective_state, &actual_state, &managed_entities, &schema);
+        generate_diff(&effective_state, &actual_state, &managed_entities, &schema);
 
     // Restrict actual_state to only managed entities before computing state_diff.
     // This matches the daemon's reconciler behavior: only entities covered by an
@@ -155,15 +160,15 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
             managed_actual.insert(state.clone());
         }
     }
-    let state_diff: StateDiffState = compute_state_diff(&managed_actual, effective_state, &schema);
+    let state_diff: StateDiffState = compute_state_diff(&managed_actual, &effective_state, &schema);
 
     // 8. Dry-run: display planned changes and exit without applying.
     if args.dry_run {
         let is_empty = !reconcile_diff.has_meaningful_changes();
-        if !reconciliation.conflicts.is_empty() {
-            print_conflicts(&reconciliation.conflicts);
+        if !conflicts.is_empty() {
+            print_conflicts(&conflicts);
         }
-        let diff_report = DiffReport::new(reconcile_diff, effective_state, &actual_state);
+        let diff_report = DiffReport::new(reconcile_diff, &effective_state, &actual_state);
         display_dry_run_report(&diff_report, is_empty);
         let code: u8 = if is_empty { 0 } else { 1 };
         return Ok(ExitCode::from(code));
@@ -171,12 +176,12 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
 
     // 9. No changes — exit early.
     if !reconcile_diff.has_meaningful_changes() {
-        if reconciliation.conflicts.is_empty() {
+        if conflicts.is_empty() {
             println!("No changes needed. System is already in desired state.");
             return Ok(ExitCode::SUCCESS);
         } else {
             // Conflicting fields prevented all desired changes; nothing applicable left.
-            print_conflicts(&reconciliation.conflicts);
+            print_conflicts(&conflicts);
             return Ok(ExitCode::from(1u8));
         }
     }
@@ -205,7 +210,7 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
                     trigger: Trigger::PolicyApply { source },
                     active_policies: summarize_policies(&policies_vec),
                     diff: serializable_diff,
-                    state_after: SerializableStateSet::from(effective_state),
+                    state_after: SerializableStateSet::from(&effective_state),
                     outcome: ApplyOutcome::Applied {
                         succeeded: apply_report.succeeded.len() as u32,
                         failed: apply_report.failed.len() as u32,
@@ -223,10 +228,10 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     }
 
     // 11. Display results.
-    display_apply_report(&apply_report, &reconciliation.conflicts);
+    display_apply_report(&apply_report, &conflicts);
 
     // 12. Return exit code.
-    Ok(determine_exit_code(&apply_report, &reconciliation.conflicts))
+    Ok(determine_exit_code(&apply_report, &conflicts))
 }
 
 // ── Daemon mode ───────────────────────────────────────────────────────────────

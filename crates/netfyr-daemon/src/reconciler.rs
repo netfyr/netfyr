@@ -287,7 +287,8 @@ impl Reconciler {
         let entity_count = managed_entities.len();
         tracing::debug!(policy_count, entity_count, "starting reconciliation");
         let merged = merge(inputs);
-        let effective_state = merged.effective_state;
+        let mut effective_state = merged.effective_state;
+        netfyr_state::normalize_route_defaults(&mut effective_state);
         let conflicts = merged.conflicts;
 
         let actual_state = self.backend_registry.query_all().await?;
@@ -417,7 +418,8 @@ impl Reconciler {
             .flat_map(|input| input.state_set.entities())
             .collect();
         let merged = merge(inputs);
-        let effective_state = merged.effective_state;
+        let mut effective_state = merged.effective_state;
+        netfyr_state::normalize_route_defaults(&mut effective_state);
         let conflicts = merged.conflicts;
 
         let actual_state = self.backend_registry.query_all().await?;
