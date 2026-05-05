@@ -1326,14 +1326,18 @@ fn format_list_element(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Object(map) => {
             if let Some(serde_json::Value::String(dest)) = map.get("destination") {
+                let mut s = dest.clone();
+                if let Some(serde_json::Value::String(gw)) = map.get("gateway") {
+                    s.push_str(" via ");
+                    s.push_str(gw);
+                }
                 let metric = map.get("metric")
                     .and_then(|m| m.as_u64())
                     .unwrap_or(0);
-                if metric == 0 {
-                    dest.clone()
-                } else {
-                    format!("{} metric {}", dest, metric)
+                if metric != 0 {
+                    s.push_str(&format!(" metric {}", metric));
                 }
+                s
             } else {
                 json_compact(v)
             }
