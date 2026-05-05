@@ -1065,26 +1065,40 @@ fn entities_summary_fitted(ops: &[SerializableDiffOp], state_entities: &[Seriali
     pad_or_truncate(&full, max_width)
 }
 
+fn field_display_priority(name: &str) -> u8 {
+    match name {
+        "enabled" => 1,
+        "carrier" => 2,
+        "addresses" => 3,
+        "routes" => 4,
+        "nameservers" => 5,
+        "search" | "search_domains" => 6,
+        "mtu" => 7,
+        _ => 8,
+    }
+}
+
 pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
     if ops.is_empty() {
         return "(none)".to_string();
     }
 
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(u8, String)> = Vec::new();
 
     for op in ops {
         match op.kind.as_str() {
             "add" => {
-                parts.push(format!("+{}", entity_display_name(op)));
+                parts.push((0, format!("+{}", entity_display_name(op))));
             }
             "remove" => {
-                parts.push(format!("-{}", entity_display_name(op)));
+                parts.push((0, format!("-{}", entity_display_name(op))));
             }
             _ => {
                 for fc in &op.field_changes {
                     if fc.change_kind == "unchanged" {
                         continue;
                     }
+                    let prio = field_display_priority(&fc.field_name);
                     let is_list = fc.current.as_ref().is_some_and(|v| v.is_array())
                         || fc.desired.as_ref().is_some_and(|v| v.is_array());
 
@@ -1118,7 +1132,9 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                                 .copied()
                                 .collect();
                             if !a.is_empty() || !r.is_empty() {
-                                parts.extend(format_address_changes(a, r));
+                                for s in format_address_changes(a, r) {
+                                    parts.push((prio, s));
+                                }
                             }
                             continue;
                         }
@@ -1138,14 +1154,18 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
 
                         match fc.field_name.as_str() {
                             "routes" => {
-                                parts.extend(format_route_changes(added, removed));
+                                for s in format_route_changes(added, removed) {
+                                    parts.push((prio, s));
+                                }
                             }
                             "nameservers" => {
                                 let a: Vec<&str> =
                                     added.iter().filter_map(|v| v.as_str()).collect();
                                 let r: Vec<&str> =
                                     removed.iter().filter_map(|v| v.as_str()).collect();
-                                parts.extend(format_dns_changes(a, r));
+                                for s in format_dns_changes(a, r) {
+                                    parts.push((prio, s));
+                                }
                             }
                             "search" | "search_domains" => {
                                 let cur = fc
@@ -1159,19 +1179,19 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                                     .map(json_display_value)
                                     .unwrap_or_default();
                                 if cur.is_empty() {
-                                    parts.push(format!("+search: {}", des));
+                                    parts.push((prio, format!("+search: {}", des)));
                                 } else if des.is_empty() {
-                                    parts.push("-search".to_string());
+                                    parts.push((prio, "-search".to_string()));
                                 } else {
-                                    parts.push(format!("search {}→{}", cur, des));
+                                    parts.push((prio, format!("search {}→{}", cur, des)));
                                 }
                             }
                             other => {
                                 if !added.is_empty() {
-                                    parts.push(format!("+{} {}", added.len(), other));
+                                    parts.push((prio, format!("+{} {}", added.len(), other)));
                                 }
                                 if !removed.is_empty() {
-                                    parts.push(format!("-{} {}", removed.len(), other));
+                                    parts.push((prio, format!("-{} {}", removed.len(), other)));
                                 }
                             }
                         }
@@ -1181,16 +1201,16 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                                 let old = json_display_value(fc.current.as_ref().unwrap());
                                 let new =
                                     json_display_value(fc.desired.as_ref().unwrap_or(&serde_json::Value::Null));
-                                parts.push(format!("{} {}→{}", fc.field_name, old, new));
+                                parts.push((prio, format!("{} {}→{}", fc.field_name, old, new)));
                             }
                             "set" => {
                                 let val = json_display_value(
                                     fc.desired.as_ref().unwrap_or(&serde_json::Value::Null),
                                 );
-                                parts.push(format!("+{}: {}", fc.field_name, val));
+                                parts.push((prio, format!("+{}: {}", fc.field_name, val)));
                             }
                             "unset" => {
-                                parts.push(format!("-{}", fc.field_name));
+                                parts.push((prio, format!("-{}", fc.field_name)));
                             }
                             _ => {}
                         }
@@ -1204,7 +1224,8 @@ pub fn changes_summary(ops: &[SerializableDiffOp]) -> String {
         return "(no changes)".to_string();
     }
 
-    parts.join(", ")
+    parts.sort_by_key(|(p, _)| *p);
+    parts.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(", ")
 }
 
 fn get_terminal_width() -> usize {
@@ -2259,6 +2280,62 @@ mod tests {
         }];
         let result = changes_summary(&ops);
         assert!(result.contains("-addr"), "unset field should show '-addr', got: {}", result);
+    }
+
+    /// AC: When multiple field types change, the CHANGES column orders them
+    /// canonically: carrier/enabled first, then addresses, routes, mtu —
+    /// regardless of field_changes iteration order.
+    #[test]
+    fn test_changes_summary_orders_fields_canonically() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "enp1s0".to_string(),
+            field_changes: vec![
+                SerializableFieldChange {
+                    field_name: "mtu".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!(1500u64)),
+                    desired: Some(serde_json::json!(1480u64)),
+                    outcome: None,
+                },
+                SerializableFieldChange {
+                    field_name: "addresses".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!([])),
+                    desired: Some(serde_json::json!(["10.0.0.50/24"])),
+                    outcome: None,
+                },
+                SerializableFieldChange {
+                    field_name: "carrier".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!(false)),
+                    desired: Some(serde_json::json!(true)),
+                    outcome: None,
+                },
+                SerializableFieldChange {
+                    field_name: "routes".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!([])),
+                    desired: Some(serde_json::json!([
+                        {"destination": "0.0.0.0/0", "gateway": "10.0.0.254"}
+                    ])),
+                    outcome: None,
+                },
+            ],
+        }];
+        let result = changes_summary(&ops);
+        let parts: Vec<&str> = result.split(", ").collect();
+
+        let carrier_pos = parts.iter().position(|p| p.contains("carrier")).expect("carrier missing");
+        let addr_pos = parts.iter().position(|p| p.contains("10.0.0.50")).expect("address missing");
+        let route_pos = parts.iter().position(|p| p.contains("dflt")).expect("route missing");
+        let mtu_pos = parts.iter().position(|p| p.contains("mtu")).expect("mtu missing");
+
+        assert!(
+            carrier_pos < addr_pos && addr_pos < route_pos && route_pos < mtu_pos,
+            "changes must be ordered: carrier, addresses, routes, mtu — got: {result}"
+        );
     }
 
     // ── outcome_summary ───────────────────────────────────────────────────────
