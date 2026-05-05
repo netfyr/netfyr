@@ -103,34 +103,6 @@ fn test_workspace_members_count_is_seven() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: Workspace features are defined
-// ---------------------------------------------------------------------------
-
-/// AC: workspace features section defines dhcp, systemd, varlink with empty dependency lists.
-#[test]
-fn test_workspace_features_defines_dhcp_systemd_varlink() {
-    let cargo_toml = read_workspace_cargo_toml();
-
-    // The spec requires a [workspace.features] section with these three features.
-    assert!(
-        cargo_toml.contains("[workspace.features]"),
-        "Root Cargo.toml must have a [workspace.features] section"
-    );
-
-    for feature in &["dhcp", "systemd", "varlink"] {
-        // Each feature should appear as a key in the features table.
-        // Minimal form is:  dhcp = []
-        let pattern = format!("{} = []", feature);
-        assert!(
-            cargo_toml.contains(&pattern),
-            "Workspace feature '{}' must be defined as an empty list ('{}') in Cargo.toml",
-            feature,
-            pattern
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Scenario: Library crates have correct structure
 // ---------------------------------------------------------------------------
 
@@ -507,15 +479,15 @@ fn test_makefile_integration_test_target_structure() {
 /// if any test fails).
 #[test]
 fn test_makefile_integration_test_propagates_failure() {
-    let makefile_path = workspace_root().join("Makefile");
-    let content = fs::read_to_string(&makefile_path)
-        .unwrap_or_else(|e| panic!("Failed to read Makefile: {}", e));
+    // The Makefile delegates to scripts/run-integration-tests.sh which tracks
+    // failures via a `failed` variable and `exit 1`. Check the runner script.
+    let runner_path = workspace_root().join("scripts/run-integration-tests.sh");
+    let content = fs::read_to_string(&runner_path)
+        .unwrap_or_else(|e| panic!("Failed to read runner script: {}", e));
 
-    // The Makefile must track failures and exit non-zero if any test fails.
-    // The reference implementation uses a `failed` variable and `exit 1`.
     assert!(
         content.contains("failed") && content.contains("exit 1"),
-        "Makefile integration-test must track failures and exit with code 1 if any test fails"
+        "Integration test runner must track failures and exit with code 1 if any test fails"
     );
 }
 

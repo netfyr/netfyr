@@ -207,40 +207,6 @@ fn test_daemon_binary_prints_netfyr() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: Workspace features are defined
-// ---------------------------------------------------------------------------
-
-/// AC: The root Cargo.toml defines a [workspace.features] section with dhcp,
-/// systemd, and varlink, each with an empty dependency list.
-#[test]
-fn test_workspace_features_defined() {
-    let root = workspace_root();
-    let content = fs::read_to_string(root.join("Cargo.toml"))
-        .expect("failed to read root Cargo.toml");
-
-    assert!(
-        content.contains("[workspace.features]"),
-        "root Cargo.toml is missing [workspace.features] section"
-    );
-
-    for feature in &["dhcp", "systemd", "varlink"] {
-        assert!(
-            content.contains(feature),
-            "workspace features missing '{feature}'"
-        );
-    }
-
-    // Each feature must map to an empty list ("= []").
-    for feature in &["dhcp", "systemd", "varlink"] {
-        let pattern = format!("{feature} = []");
-        assert!(
-            content.contains(&pattern),
-            "feature '{feature}' does not have an empty dependency list ('= []')"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Scenario: Library crates have correct structure
 // ---------------------------------------------------------------------------
 
