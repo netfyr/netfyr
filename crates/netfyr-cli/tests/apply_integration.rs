@@ -131,6 +131,7 @@ selector:
     let output = std::process::Command::new(netfyr_bin())
         .args(["apply", path.to_str().unwrap()])
         .env("NO_COLOR", "1")
+        .env("NETFYR_SOCKET_PATH", "/nonexistent")
         .output()
         .expect("failed to run netfyr");
 
@@ -164,6 +165,7 @@ selector:
     let output = std::process::Command::new(netfyr_bin())
         .args(["apply", path.to_str().unwrap()])
         .env("NO_COLOR", "1")
+        .env("NETFYR_SOCKET_PATH", "/nonexistent")
         .output()
         .expect("failed to run netfyr");
 
@@ -191,6 +193,7 @@ selector:
     let output = std::process::Command::new(netfyr_bin())
         .args(["apply", path.to_str().unwrap()])
         .env("NO_COLOR", "1")
+        .env("NETFYR_SOCKET_PATH", "/nonexistent")
         .output()
         .expect("failed to run netfyr");
 
@@ -227,6 +230,7 @@ selector:
     let output = std::process::Command::new(netfyr_bin())
         .args(["apply", dir.path().to_str().unwrap()])
         .env("NO_COLOR", "1")
+        .env("NETFYR_SOCKET_PATH", "/nonexistent")
         .output()
         .expect("failed to run netfyr");
 

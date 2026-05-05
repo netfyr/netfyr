@@ -106,6 +106,7 @@ fn test_query_invalid_type_value_shows_error_with_valid_types_exit_2() {
     let output = std::process::Command::new(netfyr_bin())
         .args(["query", "--selector", "type=foobar_unknown_type_xyz"])
         .env("NO_COLOR", "1")
+        .env("NETFYR_SOCKET_PATH", "/nonexistent")
         .output()
         .expect("failed to run netfyr");
 
