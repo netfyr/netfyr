@@ -416,11 +416,11 @@ async fn test_apply_remove_route_from_interface() {
     );
 }
 
-/// Scenario: Modify operation skips read-only fields
+/// Scenario: Modify operation silently ignores read-only fields
 ///
 /// Given a diff that includes changes to "carrier" and "speed" on an existing
-/// interface, apply should put those in the skipped list with reason
-/// "read-only field" and not report them as failures.
+/// interface, apply should silently ignore them — no skipped entries, no
+/// failures. Read-only fields must not produce any output.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_apply_skips_readonly_fields_carrier_and_speed() {
     require_netns!(_guard);
@@ -437,21 +437,21 @@ async fn test_apply_skips_readonly_fields_carrier_and_speed() {
     let handle = establish_connection().await.unwrap();
     let report = apply_ethernet(&handle, &diff).await.unwrap();
 
-    // Skipped list must contain entries for the read-only fields.
-    let skip_reasons: Vec<&str> = report.skipped.iter().map(|s| s.reason.as_str()).collect();
+    // Read-only fields must be silently ignored — no skipped entries.
     assert!(
-        skip_reasons.contains(&"read-only field"),
-        "Expected 'read-only field' reason in skipped list, got: {skip_reasons:?}"
+        report.skipped.is_empty(),
+        "Read-only fields must not produce skipped entries, got: {:?}",
+        report.skipped
     );
 
-    // No failures — skipping is not failure.
+    // No failures — ignoring is not failure.
     assert!(
         report.failed.is_empty(),
         "Read-only field changes must not produce failures: {:?}",
         report.failed
     );
 
-    // Verify is_success() returns true even with skipped entries.
+    // Verify is_success() returns true.
     assert!(
         report.is_success(),
         "is_success() must be true when only read-only fields were in the diff"

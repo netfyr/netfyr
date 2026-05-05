@@ -28,9 +28,6 @@ use super::ethernet::query_ethernet;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Fields reported by the query layer that cannot be set via netlink.
-const READONLY_FIELDS: &[&str] = &["carrier", "speed", "mac", "driver", "name"];
-
 /// Default route metric applied when the desired state does not specify one.
 const DEFAULT_ROUTE_METRIC: u32 = 100;
 
@@ -464,18 +461,6 @@ async fn apply_modify_fields(
     let mut fields_changed: Vec<String> = vec![];
     let mut failures: Vec<FailedOperation> = vec![];
     let mut skipped: Vec<SkippedOperation> = vec![];
-
-    // Emit a skip entry for every read-only field that appears in the diff.
-    for field_name in changed_fields.keys().chain(removed_fields.iter()) {
-        if READONLY_FIELDS.contains(&field_name.as_str()) {
-            skipped.push(SkippedOperation {
-                operation: DiffOpKind::Modify,
-                entity_type: "ethernet".to_string(),
-                selector: Selector::with_name(name),
-                reason: "read-only field".to_string(),
-            });
-        }
-    }
 
     // ── Phase 1: Link-level ───────────────────────────────────────────────────
 
@@ -1657,20 +1642,6 @@ mod tests {
             changes.is_empty(),
             "Remove op on empty current state must produce no field changes"
         );
-    }
-
-    // ── READONLY_FIELDS ───────────────────────────────────────────────────────
-
-    /// Scenario: Modify operation skips read-only fields — READONLY_FIELDS must
-    /// contain every field named in the spec ("carrier", "speed", "mac", "driver").
-    #[test]
-    fn test_readonly_fields_contains_spec_required_fields() {
-        for field in &["carrier", "speed", "mac", "driver"] {
-            assert!(
-                READONLY_FIELDS.contains(field),
-                "READONLY_FIELDS must contain '{field}' per spec"
-            );
-        }
     }
 
     // ── value_to_str ──────────────────────────────────────────────────────────
