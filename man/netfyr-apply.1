@@ -4,7 +4,7 @@
 .SH NAME
 netfyr\-apply \- Apply network policies to the system
 .SH SYNOPSIS
-\fBnetfyr\-apply\fR [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATHS\fR> 
+\fBnetfyr\-apply\fR [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIPATHS\fR] 
 .SH DESCRIPTION
 Apply network policies to the system
 .PP
@@ -21,8 +21,8 @@ Show what would change without applying
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fIPATHS\fR>
-Paths to YAML files or directories containing policies
+[\fIPATHS\fR]
+Paths to YAML files or directories containing policies. Defaults to /etc/netfyr/policies/ if none given
 .SH "EXIT STATUS"
 .TP
 .B 0

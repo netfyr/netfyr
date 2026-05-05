@@ -193,7 +193,7 @@ mod tests {
     // ── Clap CLI parsing / structural tests ───────────────────────────────────
 
     use clap::Parser;
-    use super::Cli;
+    use super::{Cli, Commands};
 
     /// AC "No subcommand shows usage help and exit code 2":
     /// Running `netfyr` with no arguments must fail with a clap error so that
@@ -209,17 +209,28 @@ mod tests {
         );
     }
 
-    /// AC "No path arguments shows error and exit code 2":
-    /// Running `netfyr apply` with no paths must fail because `paths` has
-    /// `required = true` on the `ApplyArgs` field.
+    /// AC "No path arguments defaults to /etc/netfyr/policies/":
+    /// Running `netfyr apply` with no paths must parse successfully,
+    /// producing an empty paths vector (the default is applied in run_apply).
     #[test]
-    fn test_cli_apply_no_paths_produces_clap_error() {
+    fn test_cli_apply_no_paths_parses_with_empty_vec() {
         let result = Cli::try_parse_from(["netfyr", "apply"]);
         assert!(
-            result.is_err(),
-            "invoking `netfyr apply` without any path arguments must fail; \
-             ApplyArgs.paths has required=true so clap returns an error (exit 2)"
+            result.is_ok(),
+            "invoking `netfyr apply` without paths must succeed at parse time; \
+             got: {:?}",
+            result.err()
         );
+        let cli = result.unwrap();
+        match cli.command {
+            Commands::Apply(args) => {
+                assert!(
+                    args.paths.is_empty(),
+                    "paths must be empty when no arguments are given"
+                );
+            }
+            _ => panic!("expected Apply command"),
+        }
     }
 
     /// AC "--color is a global flag": it must be accepted before the subcommand.

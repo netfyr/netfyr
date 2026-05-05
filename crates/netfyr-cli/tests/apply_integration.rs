@@ -40,32 +40,30 @@ fn combined(output: &std::process::Output) -> String {
 
 // ── Feature: Error cases (no system access required) ─────────────────────────
 
-/// AC: No path arguments shows a clap usage error, exit code 2.
+/// AC: No path arguments defaults to /etc/netfyr/policies/ (not a clap error).
+/// With a nonexistent default dir, the binary exits with code 2 (path not found).
 #[test]
-fn test_apply_no_args_shows_clap_usage_error_exit_code_2() {
+fn test_apply_no_args_uses_default_path() {
     let output = std::process::Command::new(netfyr_bin())
         .arg("apply")
         .env("NO_COLOR", "1")
+        .env("NETFYR_SOCKET_PATH", "/nonexistent")
+        .env("NETFYR_APPLY_DEFAULT_DIR", "/nonexistent/default/policies")
         .output()
         .expect("failed to run netfyr");
 
-    // clap exits with code 2 for usage errors
     assert_eq!(
         output.status.code(),
         Some(2),
-        "expected exit code 2 for missing required argument; stdout={} stderr={}",
+        "expected exit code 2 when default path does not exist; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 
-    // clap prints error/usage info to stderr
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let out = combined(&output);
     assert!(
-        stderr.contains("required")
-            || stderr.contains("Usage")
-            || stderr.contains("USAGE")
-            || stderr.contains("paths"),
-        "clap usage message must mention required argument; stderr={stderr}"
+        out.contains("not found") || out.contains("No such file"),
+        "error must indicate path not found; output={out}"
     );
 }
 

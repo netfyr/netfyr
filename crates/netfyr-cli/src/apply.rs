@@ -42,12 +42,18 @@ fn daemon_socket_path() -> String {
         .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
 }
 
+fn default_policy_dir() -> PathBuf {
+    std::env::var("NETFYR_APPLY_DEFAULT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/etc/netfyr/policies"))
+}
+
 // ── CLI argument struct ───────────────────────────────────────────────────────
 
 #[derive(Args)]
 pub struct ApplyArgs {
-    /// Paths to YAML files or directories containing policies
-    #[arg(required = true)]
+    /// Paths to YAML files or directories containing policies.
+    /// Defaults to /etc/netfyr/policies/ if none given.
     pub paths: Vec<PathBuf>,
 
     /// Show what would change without applying
@@ -62,8 +68,13 @@ pub struct ApplyArgs {
 /// Loads policies from `args.paths`, detects daemon vs. daemon-free mode,
 /// and either applies changes locally or delegates to the daemon via Varlink.
 pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
-    // 1. Load all policies from the provided paths.
-    let policy_set = load_policies(&args.paths)?;
+    // 1. Load all policies from the provided paths (or default directory).
+    let paths = if args.paths.is_empty() {
+        vec![default_policy_dir()]
+    } else {
+        args.paths
+    };
+    let policy_set = load_policies(&paths)?;
 
     // 1a. Validate all policy states before applying.
     let schema = SchemaRegistry::default();
@@ -178,8 +189,7 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
 
     // 10a. Write journal entry (non-fatal on failure).
     {
-        let source = args
-            .paths
+        let source = paths
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
