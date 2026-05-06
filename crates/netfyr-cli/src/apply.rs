@@ -34,13 +34,7 @@ use netfyr_varlink::{
     VarlinkApplyReport, VarlinkClient, VarlinkError, VarlinkPolicy, VarlinkStateDiff,
 };
 
-/// Unix socket path for the netfyr daemon's Varlink API.
-/// Override with `NETFYR_SOCKET_PATH` environment variable (used in tests and
-/// non-systemd deployments that place the socket at a custom path).
-fn daemon_socket_path() -> String {
-    std::env::var("NETFYR_SOCKET_PATH")
-        .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
-}
+use crate::daemon_socket_path;
 
 fn default_policy_dir() -> PathBuf {
     std::env::var("NETFYR_APPLY_DEFAULT_DIR")
