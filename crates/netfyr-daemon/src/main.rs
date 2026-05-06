@@ -1,15 +1,35 @@
 //! netfyr-daemon — declarative network configuration daemon.
 //!
-//! Startup sequence:
+//! # Startup sequence
+//!
 //! 1. Initialize structured logging.
 //! 2. Ensure the socket directory exists.
-//! 3. Load persisted policies from disk (`PolicyStore`).
-//! 4. Sync DHCP factories for existing policies (`FactoryManager`).
+//! 3. Load persisted policies from disk ([`PolicyStore`]).
+//! 4. Sync DHCP factories for existing policies ([`FactoryManager`]).
 //! 5. Run initial reconciliation and apply.
 //! 6. Notify systemd that the daemon is ready (`sd_notify READY=1`).
 //! 7. Run the Varlink server event loop.
 //! 8. On shutdown: release DHCP leases and exit (leave applied network config
 //!    in place — the system should keep working).
+//!
+//! # Design decisions
+//!
+//! - **Resilient startup.** Each step logs errors but does not abort. If the
+//!   policy store is unreadable, the daemon starts with an empty set. If
+//!   initial reconciliation fails, the daemon still serves the Varlink API.
+//!   A network daemon that refuses to start makes the system harder to
+//!   recover, not easier.
+//!
+//! - **Config survives shutdown.** Applied network configuration is left in
+//!   place when the daemon exits. Tearing down routes and addresses on stop
+//!   would drop network connectivity — the system should keep working
+//!   regardless of daemon lifecycle.
+//!
+//! - **Passive external change recording.** When the netlink monitor detects
+//!   changes made by other tools (e.g. `ip link set`), the daemon journals
+//!   them but does not re-apply desired state. Re-applying would create a
+//!   state-fighting loop with other network management tools. The user can
+//!   inspect drift via `netfyr history` and decide whether to revert.
 
 pub mod policy_store;
 mod factory_manager;

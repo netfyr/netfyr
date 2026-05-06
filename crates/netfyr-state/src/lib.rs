@@ -1,4 +1,32 @@
 //! netfyr-state crate — foundational data model for network entity configuration.
+//!
+//! This crate defines the types that every other netfyr crate depends on.
+//!
+//! # Design decisions
+//!
+//! - **`IndexMap` for fields and selector entries.** Fields are stored in
+//!   [`IndexMap`] rather than `HashMap` so that
+//!   serialisation order is deterministic and diffs are stable across runs.
+//!   `Selector::key()` sorts its entries alphabetically to produce a canonical
+//!   string key regardless of insertion order.
+//!
+//! - **IP-aware YAML parsing.** [`Value`] uses a custom deserializer that
+//!   tries to parse unquoted strings as IP addresses or CIDR networks before
+//!   falling back to plain `String`. This lets users write `192.168.1.0/24`
+//!   in YAML without explicit type annotations, while the internal model
+//!   carries a typed `Value::IpNetwork`.
+//!
+//! - **Provenance tracking.** Each [`FieldValue`] pairs its [`Value`] with a
+//!   [`Provenance`] variant (`UserConfigured`, `KernelDefault`, `ExternalTool`,
+//!   `Derived`). This tells the reconciliation engine and diff display where a
+//!   value came from — essential for conflict reporting and history.
+//!
+//! - **Selector AND-logic.** A [`Selector`] matches only entities that satisfy
+//!   *all* specified criteria (name, type, driver, PCI path, MAC, labels).
+//!   AND-logic provides stable hardware identification across reboots: a
+//!   selector that requires both `driver=ixgbe` and `pci_path=0000:03:00.0`
+//!   won't accidentally match a different NIC if the kernel renumbers
+//!   interfaces.
 
 pub mod diff;
 pub mod loader;

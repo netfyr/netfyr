@@ -4,6 +4,23 @@
 //!
 //! 1. **Daemon-free**: Connect to daemon fails → static policies only, apply directly.
 //! 2. **Daemon**: Connect succeeds → submit policies via Varlink, daemon reconciles.
+//!
+//! # Standalone-mode flow
+//!
+//! 1. Load policies from paths (or default `/etc/netfyr/policies/`).
+//! 2. Validate all policy states against the schema registry.
+//! 3. Try to connect to the daemon socket — if it succeeds, delegate
+//!    everything to the daemon-mode handler and return.
+//! 4. Reject non-static policies (DHCPv4 requires the daemon).
+//! 5. Convert policies to `PolicyInput`s and compute `managed_entities`
+//!    before `merge()` consumes the inputs.
+//! 6. Reconcile via `merge` to get effective state and conflicts.
+//! 7. Query live kernel state via netlink.
+//! 8. Normalise route defaults (the kernel always assigns metric 100,
+//!    so the diff must account for implicit defaults).
+//! 9. Compute two diffs: a rich reconcile diff for display and a
+//!    lightweight state diff for the apply operation.
+//! 10. Apply, journal (non-fatal on failure), display, return exit code.
 
 use std::collections::HashSet;
 use std::path::PathBuf;

@@ -1,6 +1,25 @@
 //! netfyr-backend: trait-based abstraction layer between the reconciliation engine
 //! and kernel I/O. Provides `NetworkBackend`, report types, `BackendError`, and
 //! `BackendRegistry`.
+//!
+//! # Design decisions
+//!
+//! - **Backend registry.** [`BackendRegistry`] maps entity types (e.g.
+//!   `"ethernet"`) to [`NetworkBackend`] implementations. Today there is only
+//!   one backend (`NetlinkBackend`), but the registry pattern allows adding
+//!   backends for other entity types (bonds, VLANs, bridges) without changing
+//!   the reconciliation or CLI layers.
+//!
+//! - **Async trait via `async-trait`.** [`NetworkBackend`] uses `#[async_trait]`
+//!   because the trait needs to be object-safe for `dyn` dispatch in
+//!   `BackendRegistry`. The performance cost is negligible compared to the
+//!   netlink I/O it wraps.
+//!
+//! - **DHCP factory in backend, not policy.** The [`Dhcpv4Factory`]
+//!   lives here rather than in `netfyr-policy` because it performs runtime
+//!   network I/O (spawning a DHCP client, receiving packets) — fundamentally
+//!   a backend concern. The policy crate defines what a DHCPv4 policy *is*;
+//!   the backend crate implements how it *runs*.
 
 pub mod dhcp;
 pub mod netlink;

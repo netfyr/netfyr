@@ -188,6 +188,8 @@ The project is a Rust workspace with nine crates arranged in layers:
 
 Dependency flow: `netfyr-state` is the foundation. `netfyr-policy` and `netfyr-reconcile` depend on it. `netfyr-backend` depends on `netfyr-state`. `netfyr-journal` depends on `netfyr-state`. `netfyr-varlink` depends on all library crates. `netfyr-cli` and `netfyr-daemon` are the top-level binaries that wire everything together.
 
+See [docs/architecture.md](docs/architecture.md) for crate dependency diagrams and data model overview, and [docs/workflows.md](docs/workflows.md) for operation sequence diagrams.
+
 ## License
 
 See the [LICENSE](LICENSE) file for details.

@@ -1,4 +1,23 @@
 //! netfyr-reconcile crate — per-field priority merge for network policy reconciliation.
+//!
+//! # Design decisions
+//!
+//! - **Per-field, not per-entity.** Reconciliation resolves each field
+//!   independently so that two teams can manage different fields on the same
+//!   interface (e.g. one team sets MTU while another manages addresses)
+//!   without requiring a single combined policy.
+//!
+//! - **Conflicts omit, not tiebreak.** When two policies at the same priority
+//!   set the same field to different values, the field is omitted from the
+//!   effective state and reported as a [`Conflict`]. This avoids silent wrong
+//!   behaviour — the user must resolve the ambiguity by adjusting priorities
+//!   or removing the duplicate.
+//!
+//! - **Order-insensitive list comparison.** List fields (e.g. addresses) are
+//!   compared as multisets for conflict detection. `["10.0.0.1/24",
+//!   "10.0.0.2/24"]` and `["10.0.0.2/24", "10.0.0.1/24"]` are considered
+//!   equal, preventing spurious conflicts when two policies configure the
+//!   same set of addresses in different order.
 
 pub mod diff;
 pub mod report;

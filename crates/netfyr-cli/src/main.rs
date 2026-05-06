@@ -1,3 +1,13 @@
+//! Binary entry point for the `netfyr` CLI.
+//!
+//! Parses command-line arguments via [`clap`], resolves the color output mode,
+//! and dispatches to the appropriate subcommand handler. Each subcommand is
+//! implemented in a separate module within the `netfyr-cli` library crate.
+//!
+//! All subcommand handlers are async (running on a Tokio runtime) and return
+//! a [`std::process::ExitCode`]: 0 for success (no changes or clean apply),
+//! 1 for partial failure or conflicts, 2 for fatal errors.
+
 use netfyr_cli::{resolve_color_mode, run_apply, run_completions, run_diagnose, run_history, run_query, run_revert, run_show, Cli, Commands};
 
 use clap::Parser;
