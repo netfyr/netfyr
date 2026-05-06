@@ -1096,7 +1096,7 @@ mod tests {
         assert!(
             diff.is_empty(),
             "driver is a read-only hardware property and must not generate a Modify \
-             operation; diff had {} operation(s) — see BUG comment above",
+             operation; diff had {} operation(s)",
             diff.len()
         );
     }

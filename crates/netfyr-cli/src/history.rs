@@ -2575,13 +2575,6 @@ mod tests {
     }
 
     // ── changes_summary: list field notation ──────────────────────────────────
-    //
-    // BUG: The three tests below were written with incorrect expected values.
-    // The SPEC-352 spec says addresses should show actual values inline (e.g.
-    // "+192.168.1.100/24"), not "addresses(+N)" notation. The implementation
-    // correctly follows the spec and uses format_address_changes which shows
-    // actual values for 1-2 total changes. These tests will fail — the verify
-    // phase should update the assertions to match the correct spec behavior.
 
     /// AC: 2 address additions (total 2, ≤2 threshold) show actual values "+addr1, +addr2".
     #[test]
