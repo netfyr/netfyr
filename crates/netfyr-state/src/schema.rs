@@ -167,6 +167,11 @@ impl EntitySchema {
     pub fn field_info(&self, field: &str) -> Option<&FieldSchemaInfo> {
         self.fields.get(field)
     }
+
+    /// Returns all field names declared in this schema.
+    pub fn field_names(&self) -> Vec<&str> {
+        self.fields.keys().map(String::as_str).collect()
+    }
 }
 
 // ── SchemaRegistry ────────────────────────────────────────────────────────────
@@ -1500,6 +1505,78 @@ mod tests {
             unknown_err.field, "mtt",
             "UnknownField error should reference 'mtt', got: {:?}",
             unknown_err.field
+        );
+    }
+
+    // ── Feature: Schema field inventory pinning ──────────────────────────────
+
+    #[test]
+    fn test_ethernet_schema_has_exactly_the_expected_fields() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let mut fields: Vec<&str> = schema.field_names();
+        fields.sort();
+
+        let expected = vec![
+            "addresses",
+            "carrier",
+            "dns_servers",
+            "driver",
+            "enabled",
+            "mac",
+            "mtu",
+            "name",
+            "routes",
+            "speed",
+        ];
+
+        assert_eq!(
+            fields, expected,
+            "ethernet schema fields diverged from pinned set.\n\
+             If you added or removed a field in the schema, update this \
+             test AND the corresponding backend query/apply code."
+        );
+    }
+
+    #[test]
+    fn test_ethernet_writable_fields_match_expected_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let mut writable: Vec<&str> = schema
+            .field_names()
+            .into_iter()
+            .filter(|f| schema.field_info(f).map_or(false, |i| i.writable))
+            .collect();
+        writable.sort();
+
+        let expected = vec!["addresses", "enabled", "mtu", "routes"];
+
+        assert_eq!(
+            writable, expected,
+            "ethernet writable fields diverged from pinned set.\n\
+             If you changed a field's writable attribute, update this test \
+             AND the apply code in netfyr-backend."
+        );
+    }
+
+    #[test]
+    fn test_ethernet_readonly_fields_match_expected_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let mut readonly: Vec<&str> = schema
+            .field_names()
+            .into_iter()
+            .filter(|f| schema.field_info(f).map_or(false, |i| !i.writable))
+            .collect();
+        readonly.sort();
+
+        let expected = vec!["carrier", "dns_servers", "driver", "mac", "name", "speed"];
+
+        assert_eq!(
+            readonly, expected,
+            "ethernet read-only fields diverged from pinned set.\n\
+             If you changed a field's writable attribute, update this test \
+             AND the query code in netfyr-backend."
         );
     }
 }

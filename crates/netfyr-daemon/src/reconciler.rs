@@ -1872,4 +1872,35 @@ mod tests {
             "empty target state must produce an empty reconcile diff"
         );
     }
+
+    // ── Feature: STABLE_FIELDS must be valid schema fields ───────────────────
+
+    #[test]
+    fn test_stable_fields_exist_in_ethernet_schema() {
+        let registry = SchemaRegistry::new();
+        for field in STABLE_FIELDS {
+            assert!(
+                registry.field_info("ethernet", field).is_some(),
+                "STABLE_FIELDS entry '{}' is not in the ethernet schema. \
+                 Update STABLE_FIELDS or the schema.",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn test_stable_fields_are_all_readonly() {
+        let registry = SchemaRegistry::new();
+        for field in STABLE_FIELDS {
+            let info = registry
+                .field_info("ethernet", field)
+                .unwrap_or_else(|| panic!("STABLE_FIELDS entry '{}' not in schema", field));
+            assert!(
+                !info.writable,
+                "STABLE_FIELDS entry '{}' is writable in the schema, but stable fields \
+                 must be read-only (they are excluded from external-change diffs)",
+                field
+            );
+        }
+    }
 }

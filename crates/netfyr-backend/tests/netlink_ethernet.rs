@@ -1244,3 +1244,34 @@ async fn test_enabled_false_carrier_false_after_admin_down() {
     assert!(!enabled, "enabled must be false after set_link_down");
     assert!(!carrier, "carrier must be false when interface is admin-down");
 }
+
+// ── Schema-backend field divergence check ────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_fields_are_subset_of_schema_fields() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-sf-a", "veth-sf-b").await.unwrap();
+    add_address("veth-sf-a", "10.99.0.1/24").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-sf-a");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+    let state = result.get("ethernet", "veth-sf-a").unwrap();
+
+    let schema = netfyr_state::SchemaRegistry::new();
+    let entity_schema = schema.get_schema("ethernet").unwrap();
+    let schema_fields: std::collections::HashSet<&str> =
+        entity_schema.field_names().into_iter().collect();
+
+    for field_name in state.fields.keys() {
+        assert!(
+            schema_fields.contains(field_name.as_str()),
+            "backend query produced field '{}' which is not in the ethernet schema.\n\
+             Schema fields: {:?}\n\
+             Add the field to the schema, or remove it from the query code.",
+            field_name,
+            schema_fields
+        );
+    }
+}
