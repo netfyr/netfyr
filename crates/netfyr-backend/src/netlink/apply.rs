@@ -1279,7 +1279,7 @@ mod tests {
 
     // ── Helper constructors ───────────────────────────────────────────────────
 
-    fn kd(v: Value) -> FieldValue {
+    fn kernel_default(v: Value) -> FieldValue {
         FieldValue {
             value: v,
             provenance: Provenance::KernelDefault,
@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn test_build_planned_changes_modify_existing_field_produces_modify_kind() {
         let mut changed_fields = IndexMap::new();
-        changed_fields.insert("mtu".to_string(), kd(Value::U64(9000)));
+        changed_fields.insert("mtu".to_string(), kernel_default(Value::U64(9000)));
 
         let op = DiffOp::Modify {
             entity_type: "ethernet".to_string(),
@@ -1484,7 +1484,7 @@ mod tests {
         let mut current = empty_state("eth0");
         current
             .fields
-            .insert("mtu".to_string(), kd(Value::U64(1500)));
+            .insert("mtu".to_string(), kernel_default(Value::U64(1500)));
 
         let changes = build_planned_changes(&op, &current);
 
@@ -1514,7 +1514,7 @@ mod tests {
         let mut changed_fields = IndexMap::new();
         changed_fields.insert(
             "addresses".to_string(),
-            kd(Value::List(vec![Value::String("10.0.1.1/24".to_string())])),
+            kernel_default(Value::List(vec![Value::String("10.0.1.1/24".to_string())])),
         );
 
         let op = DiffOp::Modify {
@@ -1553,7 +1553,7 @@ mod tests {
         let mut current = empty_state("eth0");
         current.fields.insert(
             "addresses".to_string(),
-            kd(Value::List(vec![Value::String("10.0.1.1/24".to_string())])),
+            kernel_default(Value::List(vec![Value::String("10.0.1.1/24".to_string())])),
         );
 
         let changes = build_planned_changes(&op, &current);
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn test_build_planned_changes_add_op_produces_set_kind_no_current() {
         let mut fields = IndexMap::new();
-        fields.insert("mtu".to_string(), kd(Value::U64(1500)));
+        fields.insert("mtu".to_string(), kernel_default(Value::U64(1500)));
 
         let op = DiffOp::Add {
             entity_type: "ethernet".to_string(),
@@ -1605,10 +1605,10 @@ mod tests {
         let mut current = empty_state("eth0");
         current
             .fields
-            .insert("mtu".to_string(), kd(Value::U64(1500)));
+            .insert("mtu".to_string(), kernel_default(Value::U64(1500)));
         current.fields.insert(
             "enabled".to_string(),
-            kd(Value::Bool(true)),
+            kernel_default(Value::Bool(true)),
         );
 
         let changes = build_planned_changes(&op, &current);

@@ -37,7 +37,7 @@ macro_rules! require_netns {
 
 // ── Builder helpers ───────────────────────────────────────────────────────────
 
-fn kd(value: Value) -> FieldValue {
+fn kernel_default(value: Value) -> FieldValue {
     FieldValue {
         value,
         provenance: Provenance::KernelDefault,
@@ -66,7 +66,7 @@ fn remove_op(name: &str) -> DiffOp {
 
 fn one_field(key: &str, value: Value) -> IndexMap<String, FieldValue> {
     let mut m = IndexMap::new();
-    m.insert(key.to_string(), kd(value));
+    m.insert(key.to_string(), kernel_default(value));
     m
 }
 
@@ -429,8 +429,8 @@ async fn test_apply_skips_readonly_fields_carrier_and_speed() {
 
     // Build a diff that changes "carrier" and "speed" — both read-only.
     let mut changed_fields = IndexMap::new();
-    changed_fields.insert("carrier".to_string(), kd(Value::Bool(true)));
-    changed_fields.insert("speed".to_string(), kd(Value::U64(1000)));
+    changed_fields.insert("carrier".to_string(), kernel_default(Value::Bool(true)));
+    changed_fields.insert("speed".to_string(), kernel_default(Value::U64(1000)));
 
     let diff = make_diff(vec![modify_op("veth-ro0", changed_fields, vec![])]);
 
@@ -731,15 +731,15 @@ async fn test_apply_field_order_link_mtu_addresses_routes() {
     );
 
     let mut changed_fields = IndexMap::new();
-    changed_fields.insert("mtu".to_string(), kd(Value::U64(1400)));
-    changed_fields.insert("enabled".to_string(), kd(Value::Bool(true)));
+    changed_fields.insert("mtu".to_string(), kernel_default(Value::U64(1400)));
+    changed_fields.insert("enabled".to_string(), kernel_default(Value::Bool(true)));
     changed_fields.insert(
         "addresses".to_string(),
-        kd(Value::List(vec![Value::String("10.99.6.1/24".to_string())])),
+        kernel_default(Value::List(vec![Value::String("10.99.6.1/24".to_string())])),
     );
     changed_fields.insert(
         "routes".to_string(),
-        kd(Value::List(vec![Value::Map(route_map)])),
+        kernel_default(Value::List(vec![Value::Map(route_map)])),
     );
 
     let diff = make_diff(vec![modify_op("veth-ord0", changed_fields, vec![])]);
@@ -971,10 +971,10 @@ async fn test_apply_then_query_shows_updated_state() {
     set_link_up("veth-frt0").await.unwrap();
 
     let mut changed_fields = IndexMap::new();
-    changed_fields.insert("mtu".to_string(), kd(Value::U64(1400)));
+    changed_fields.insert("mtu".to_string(), kernel_default(Value::U64(1400)));
     changed_fields.insert(
         "addresses".to_string(),
-        kd(Value::List(vec![Value::String("10.99.8.1/24".to_string())])),
+        kernel_default(Value::List(vec![Value::String("10.99.8.1/24".to_string())])),
     );
 
     let diff = make_diff(vec![modify_op("veth-frt0", changed_fields, vec![])]);
@@ -1108,8 +1108,8 @@ async fn test_apply_remove_nonexistent_route_counts_as_success() {
     // Phase 3 (routes): find_route_message returns None for the connected
     // route (already gone) → counted as success, NOT failure.
     let mut changed_fields = IndexMap::new();
-    changed_fields.insert("addresses".to_string(), kd(Value::List(vec![])));
-    changed_fields.insert("routes".to_string(), kd(Value::List(vec![])));
+    changed_fields.insert("addresses".to_string(), kernel_default(Value::List(vec![])));
+    changed_fields.insert("routes".to_string(), kernel_default(Value::List(vec![])));
 
     let diff = make_diff(vec![modify_op("veth-rmrx0", changed_fields, vec![])]);
 
@@ -1804,11 +1804,11 @@ async fn test_apply_prefix_route_updates_on_static_address_change() {
     let mut changed_fields = IndexMap::new();
     changed_fields.insert(
         "addresses".to_string(),
-        kd(Value::List(vec![Value::String("10.99.71.1/24".to_string())])),
+        kernel_default(Value::List(vec![Value::String("10.99.71.1/24".to_string())])),
     );
     changed_fields.insert(
         "routes".to_string(),
-        kd(Value::List(vec![Value::Map(route_map)])),
+        kernel_default(Value::List(vec![Value::Map(route_map)])),
     );
 
     let diff = make_diff(vec![modify_op("veth-kru0", changed_fields, vec![])]);

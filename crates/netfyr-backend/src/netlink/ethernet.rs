@@ -171,7 +171,7 @@ fn build_route_value(
 }
 
 /// Convenience wrapper that tags a `Value` with `KernelDefault` provenance.
-fn kd(value: Value) -> FieldValue {
+fn kernel_default(value: Value) -> FieldValue {
     FieldValue {
         value,
         provenance: Provenance::KernelDefault,
@@ -498,42 +498,42 @@ mod tests {
         );
     }
 
-    // ── kd() provenance helper ────────────────────────────────────────────────────
+    // ── kernel_default() provenance helper ────────────────────────────────────────────────────
 
     /// Scenario: All queried fields have KernelDefault provenance.
-    /// kd() must tag a String value with Provenance::KernelDefault.
+    /// kernel_default() must tag a String value with Provenance::KernelDefault.
     #[test]
     fn test_kd_string_value_has_kernel_default_provenance() {
-        let fv = kd(Value::String("eth0".to_owned()));
+        let fv = kernel_default(Value::String("eth0".to_owned()));
         assert_eq!(
             fv.provenance,
             Provenance::KernelDefault,
-            "kd() must set provenance to KernelDefault"
+            "kernel_default() must set provenance to KernelDefault"
         );
         assert_eq!(fv.value, Value::String("eth0".to_owned()));
     }
 
-    /// kd() applied to a U64 (e.g., mtu) produces KernelDefault provenance.
+    /// kernel_default() applied to a U64 (e.g., mtu) produces KernelDefault provenance.
     #[test]
     fn test_kd_u64_value_has_kernel_default_provenance() {
-        let fv = kd(Value::U64(1500));
+        let fv = kernel_default(Value::U64(1500));
         assert_eq!(fv.provenance, Provenance::KernelDefault);
         assert_eq!(fv.value, Value::U64(1500));
     }
 
-    /// kd() applied to a Bool (e.g., carrier) produces KernelDefault provenance.
+    /// kernel_default() applied to a Bool (e.g., carrier) produces KernelDefault provenance.
     #[test]
     fn test_kd_bool_value_has_kernel_default_provenance() {
-        let fv = kd(Value::Bool(false));
+        let fv = kernel_default(Value::Bool(false));
         assert_eq!(fv.provenance, Provenance::KernelDefault);
         assert_eq!(fv.value, Value::Bool(false));
     }
 
-    /// kd() applied to a List (e.g., addresses, routes) produces KernelDefault provenance.
+    /// kernel_default() applied to a List (e.g., addresses, routes) produces KernelDefault provenance.
     #[test]
     fn test_kd_list_value_has_kernel_default_provenance() {
         let list = Value::List(vec![Value::String("10.0.1.50/24".to_owned())]);
-        let fv = kd(list.clone());
+        let fv = kernel_default(list.clone());
         assert_eq!(fv.provenance, Provenance::KernelDefault);
         assert_eq!(fv.value, list);
     }
@@ -686,35 +686,35 @@ pub async fn query_ethernet(
 
         let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
 
-        fields.insert("name".to_string(), kd(Value::String(link.name.clone())));
+        fields.insert("name".to_string(), kernel_default(Value::String(link.name.clone())));
 
         if let Some(mtu) = link.mtu {
-            fields.insert("mtu".to_string(), kd(Value::U64(mtu as u64)));
+            fields.insert("mtu".to_string(), kernel_default(Value::U64(mtu as u64)));
         }
 
         if let Some(mac_bytes) = link.mac {
             fields.insert(
                 "mac".to_string(),
-                kd(Value::String(format_mac(&mac_bytes))),
+                kernel_default(Value::String(format_mac(&mac_bytes))),
             );
         }
 
         fields.insert(
             "carrier".to_string(),
-            kd(Value::Bool(link.carrier.unwrap_or(0) != 0)),
+            kernel_default(Value::Bool(link.carrier.unwrap_or(0) != 0)),
         );
 
         fields.insert(
             "enabled".to_string(),
-            kd(Value::Bool(link.enabled)),
+            kernel_default(Value::Bool(link.enabled)),
         );
 
         if let Some(spd) = speed {
-            fields.insert("speed".to_string(), kd(Value::U64(spd)));
+            fields.insert("speed".to_string(), kernel_default(Value::U64(spd)));
         }
 
         if let Some(drv) = driver {
-            fields.insert("driver".to_string(), kd(Value::String(drv)));
+            fields.insert("driver".to_string(), kernel_default(Value::String(drv)));
         }
 
         // Addresses
@@ -731,7 +731,7 @@ pub async fn query_ethernet(
                     .collect()
             })
             .unwrap_or_default();
-        fields.insert("addresses".to_string(), kd(Value::List(addr_list)));
+        fields.insert("addresses".to_string(), kernel_default(Value::List(addr_list)));
 
         // Routes — exclude kernel-managed routes (proto kernel) so they
         // never appear in state snapshots or diffs, and strip the protocol
@@ -759,7 +759,7 @@ pub async fn query_ethernet(
                 }
             })
             .collect();
-        fields.insert("routes".to_string(), kd(Value::List(route_list)));
+        fields.insert("routes".to_string(), kernel_default(Value::List(route_list)));
 
         let state = State {
             entity_type: "ethernet".to_string(),
