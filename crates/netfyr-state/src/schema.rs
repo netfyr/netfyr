@@ -13,6 +13,8 @@ use std::fmt;
 // Embedded JSON Schema files — paths are relative to this source file.
 // The compiler will error here if the file does not exist.
 const ETHERNET_SCHEMA: &str = include_str!("schemas/ethernet.json");
+const IP_SCHEMA: &str = include_str!("schemas/ip.json");
+const LINK_SCHEMA: &str = include_str!("schemas/link.json");
 
 // ── FieldType ─────────────────────────────────────────────────────────────────
 
@@ -186,15 +188,10 @@ impl SchemaRegistry {
     /// Schema. Since schemas are compile-time constants this indicates a
     /// build-time bug, not a runtime condition.
     pub fn new() -> Self {
+        let fragments = load_fragments();
         let mut schemas = HashMap::new();
-        {
-            let (name, schema_str) = ("ethernet", ETHERNET_SCHEMA);
-            let raw: serde_json::Value = serde_json::from_str(schema_str)
-                .unwrap_or_else(|e| panic!("embedded {name} schema is malformed JSON: {e}"));
-            let validator = jsonschema::validator_for(&raw)
-                .unwrap_or_else(|e| panic!("embedded {name} schema is invalid JSON Schema: {e}"));
-            let fields = parse_field_metadata(&raw);
-            schemas.insert(name.to_string(), EntitySchema { validator, fields, raw });
+        for (name, src) in [("ethernet", ETHERNET_SCHEMA)] {
+            schemas.insert(name.to_string(), load_entity_schema(name, src, &fragments));
         }
         SchemaRegistry { schemas }
     }
@@ -348,6 +345,68 @@ impl Default for SchemaRegistry {
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+fn load_fragments() -> HashMap<String, serde_json::Value> {
+    let mut fragments = HashMap::new();
+    for (name, src) in [("ip", IP_SCHEMA), ("link", LINK_SCHEMA)] {
+        let val: serde_json::Value = serde_json::from_str(src)
+            .unwrap_or_else(|e| panic!("embedded {name} fragment is malformed JSON: {e}"));
+        fragments.insert(name.to_string(), val);
+    }
+    fragments
+}
+
+fn resolve_schema(
+    raw: &serde_json::Value,
+    fragments: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut resolved = raw.clone();
+    let inherit = match raw.get("x-netfyr-inherit").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => return resolved,
+    };
+
+    let props = resolved
+        .as_object_mut().unwrap()
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()))
+        .as_object_mut().unwrap();
+
+    for name_val in &inherit {
+        let name = name_val.as_str()
+            .unwrap_or_else(|| panic!("x-netfyr-inherit entries must be strings"));
+        let fragment = fragments.get(name)
+            .unwrap_or_else(|| panic!("unknown fragment: {name}"));
+        let frag_props = fragment.get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| panic!("fragment {name} has no properties"));
+        for (k, v) in frag_props {
+            if props.contains_key(k) {
+                panic!(
+                    "fragment \"{name}\" property \"{k}\" collides with an existing property"
+                );
+            }
+            props.insert(k.clone(), v.clone());
+        }
+    }
+
+    resolved.as_object_mut().unwrap().remove("x-netfyr-inherit");
+    resolved
+}
+
+fn load_entity_schema(
+    name: &str,
+    schema_str: &str,
+    fragments: &HashMap<String, serde_json::Value>,
+) -> EntitySchema {
+    let raw: serde_json::Value = serde_json::from_str(schema_str)
+        .unwrap_or_else(|e| panic!("embedded {name} schema is malformed JSON: {e}"));
+    let resolved = resolve_schema(&raw, fragments);
+    let validator = jsonschema::validator_for(&resolved)
+        .unwrap_or_else(|e| panic!("embedded {name} schema is invalid JSON Schema: {e}"));
+    let fields = parse_field_metadata(&resolved);
+    EntitySchema { validator, fields, raw: resolved }
+}
 
 /// Converts `State.fields` to a JSON object suitable for schema validation.
 ///

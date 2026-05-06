@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "link",
+  "description": "Link-level properties shared across interface types",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Interface name (kernel-assigned, not settable via policy)",
+      "x-netfyr-writable": false
+    },
+    "mac": {
+      "type": "string",
+      "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
+      "description": "Hardware MAC address",
+      "x-netfyr-writable": false
+    },
+    "carrier": {
+      "type": "boolean",
+      "description": "Whether the link has carrier",
+      "x-netfyr-writable": false
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "Whether the interface is administratively enabled",
+      "x-netfyr-writable": true
+    },
+    "mtu": {
+      "type": "integer",
+      "minimum": 68,
+      "maximum": 65535,
+      "description": "Maximum transmission unit",
+      "x-netfyr-writable": true,
+      "x-netfyr-keep-when-absent": true
+    }
+  }
+}

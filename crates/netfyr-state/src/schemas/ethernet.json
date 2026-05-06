@@ -4,94 +4,17 @@
   "description": "Ethernet interface entity",
   "type": "object",
   "additionalProperties": false,
+  "x-netfyr-inherit": ["ip", "link"],
   "properties": {
-    "mtu": {
-      "type": "integer",
-      "minimum": 68,
-      "maximum": 65535,
-      "description": "Maximum transmission unit",
-      "x-netfyr-writable": true,
-      "x-netfyr-keep-when-absent": true
-    },
-    "addresses": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"
-      },
-      "description": "IP addresses assigned to the interface",
-      "x-netfyr-writable": true,
-      "x-netfyr-comparison-keys": ["address"]
-    },
-    "mac": {
-      "type": "string",
-      "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
-      "description": "Hardware MAC address",
-      "x-netfyr-writable": false
-    },
-    "carrier": {
-      "type": "boolean",
-      "description": "Whether the link has carrier",
-      "x-netfyr-writable": false
-    },
     "speed": {
       "type": "integer",
       "minimum": 0,
       "description": "Link speed in Mbps",
       "x-netfyr-writable": false
     },
-    "routes": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["destination"],
-        "properties": {
-          "destination": {
-            "type": "string",
-            "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$",
-            "description": "Route destination in CIDR format"
-          },
-          "gateway": {
-            "type": "string",
-            "pattern": "^[0-9a-fA-F:.]+$",
-            "description": "Gateway IP address"
-          },
-          "metric": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Route metric (lower is preferred)"
-          },
-          "protocol": {
-            "type": "string",
-            "description": "Route protocol (kernel, static, dhcp, etc.)"
-          }
-        }
-      },
-      "description": "Routes via this interface",
-      "x-netfyr-writable": true
-    },
-    "name": {
-      "type": "string",
-      "description": "Interface name (kernel-assigned, not settable via policy)",
-      "x-netfyr-writable": false
-    },
     "driver": {
       "type": "string",
       "description": "Kernel driver name",
-      "x-netfyr-writable": false
-    },
-    "enabled": {
-      "type": "boolean",
-      "description": "Whether the interface is administratively enabled",
-      "x-netfyr-writable": true
-    },
-    "dns_servers": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "description": "DNS server addresses",
       "x-netfyr-writable": false
     }
   }
