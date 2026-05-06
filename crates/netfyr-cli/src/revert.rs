@@ -182,7 +182,7 @@ async fn run_revert_standalone(args: RevertArgs) -> Result<ExitCode> {
         },
     };
     if let Err(e) = journal.append(revert_entry) {
-        tracing::warn!("Failed to write revert journal entry: {}", e);
+        tracing::warn!(%e, "failed to write revert journal entry");
     }
 
     display_apply_report(&apply_report, &ConflictReport::new());

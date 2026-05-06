@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     //    non-systemd environments and tests).
     if let Some(dir) = Path::new(&socket_path).parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!("Failed to create socket directory {}: {}", dir.display(), e);
+            tracing::warn!(%e, path = %dir.display(), "failed to create socket directory");
         }
     }
 
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
             store
         }
         Err(e) => {
-            tracing::error!("Failed to load policy store from {}: {}", policy_dir, e);
+            tracing::error!(%e, dir = %policy_dir, "failed to load policy store");
             PolicyStore::ephemeral(vec![])
         }
     };
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
             );
         }
         Err(e) => {
-            tracing::error!("Factory sync error during startup: {}", e);
+            tracing::error!(%e, "factory sync error during startup");
         }
         _ => {}
     }
@@ -109,14 +109,14 @@ async fn main() -> Result<()> {
         .reconcile_and_apply(&policy_store, &factory_manager, Trigger::DaemonStartup)
         .await
     {
-        tracing::error!("Initial reconciliation failed: {}", e);
+        tracing::error!(%e, "initial reconciliation failed");
     }
 
     // 6. Record startup time and notify systemd.
     let start_time = Instant::now();
     match sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
         Ok(()) => tracing::debug!("sd_notify READY=1 sent"),
-        Err(e) => tracing::debug!("sd_notify: {}", e),
+        Err(e) => tracing::debug!(%e, "sd_notify"),
     }
 
     // 7. Run the Varlink server event loop. Returns on SIGTERM or SIGINT.
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     )
     .await
     {
-        tracing::error!("Varlink server error: {}", e);
+        tracing::error!(%e, "varlink server error");
     }
 
     Ok(())

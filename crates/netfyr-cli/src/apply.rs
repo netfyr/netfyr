@@ -212,11 +212,11 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
                     },
                 };
                 if let Err(e) = journal.append(entry) {
-                    tracing::warn!("Failed to write journal entry: {}", e);
+                    tracing::warn!(%e, "failed to write journal entry");
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to open journal: {}", e);
+                tracing::warn!(%e, "failed to open journal");
             }
         }
     }

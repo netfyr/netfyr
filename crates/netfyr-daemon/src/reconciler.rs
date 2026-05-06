@@ -67,7 +67,7 @@ impl Reconciler {
         let mut registry = BackendRegistry::new();
         let netlink = Arc::new(NetlinkBackend::new());
         if let Err(e) = registry.register(netlink) {
-            tracing::error!("Failed to register NetlinkBackend: {}", e);
+            tracing::error!(%e, "failed to register NetlinkBackend");
         }
 
         let journal = match Journal::open_default() {
@@ -76,7 +76,7 @@ impl Reconciler {
                 Some(j)
             }
             Err(e) => {
-                tracing::warn!("Failed to open journal (journal writes disabled): {}", e);
+                tracing::warn!(%e, "failed to open journal, journal writes disabled");
                 None
             }
         };
@@ -167,7 +167,7 @@ impl Reconciler {
         let mut guard = match self.journal.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!("Journal mutex poisoned: {}", e);
+                tracing::warn!(%e, "journal mutex poisoned");
                 return Ok(());
             }
         };
@@ -553,7 +553,7 @@ impl Reconciler {
         let mut guard = match self.journal.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!("Journal mutex poisoned: {}", e);
+                tracing::warn!(%e, "journal mutex poisoned");
                 return;
             }
         };
@@ -572,7 +572,7 @@ impl Reconciler {
                 outcome,
             };
             if let Err(e) = journal.append(entry) {
-                tracing::warn!("Failed to write journal entry: {}", e);
+                tracing::warn!(%e, "failed to write journal entry");
             }
         }
     }
@@ -589,7 +589,7 @@ impl Reconciler {
         let mut guard = match self.journal.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!("Journal mutex poisoned: {}", e);
+                tracing::warn!(%e, "journal mutex poisoned");
                 return;
             }
         };
@@ -608,7 +608,7 @@ impl Reconciler {
                 outcome,
             };
             if let Err(e) = journal.append(entry) {
-                tracing::warn!("Failed to write revert journal entry: {}", e);
+                tracing::warn!(%e, "failed to write revert journal entry");
             }
         }
     }

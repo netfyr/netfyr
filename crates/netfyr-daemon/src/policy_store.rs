@@ -165,11 +165,7 @@ impl PolicyStore {
             let contents = match fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(
-                        "Skipping policy file {}: failed to read: {}",
-                        fname_display,
-                        e
-                    );
+                    tracing::warn!(%e, file = %fname_display, "skipping policy file, failed to read");
                     continue;
                 }
             };
@@ -177,11 +173,7 @@ impl PolicyStore {
             match parse_policy_yaml(&contents) {
                 Ok(parsed) => policies.extend(parsed),
                 Err(e) => {
-                    tracing::warn!(
-                        "Skipping malformed policy file {}: {}",
-                        fname_display,
-                        e
-                    );
+                    tracing::warn!(%e, file = %fname_display, "skipping malformed policy file");
                 }
             }
         }
@@ -231,10 +223,9 @@ impl PolicyStore {
         for (sanitized, policy) in sanitized_names.iter().zip(new_policies.iter()) {
             if !seen_names.insert(sanitized.as_str()) {
                 tracing::warn!(
-                    "Policy '{}' sanitizes to '{}' which conflicts with another policy; \
-                     last write wins",
-                    policy.name,
-                    sanitized
+                    policy = %policy.name,
+                    sanitized,
+                    "policy name conflicts with another policy after sanitization; last write wins",
                 );
             }
         }
@@ -273,11 +264,7 @@ impl PolicyStore {
                     match fs::remove_file(entry.path()) {
                         Ok(()) => removed += 1,
                         Err(e) => {
-                            tracing::warn!(
-                                "failed to remove stale policy file {}: {}",
-                                entry.path().display(),
-                                e
-                            );
+                            tracing::warn!(%e, path = %entry.path().display(), "failed to remove stale policy file");
                         }
                     }
                 }
@@ -291,11 +278,7 @@ impl PolicyStore {
                 let fname_str = fname.to_string_lossy();
                 if fname_str.ends_with(".yaml.tmp") {
                     if let Err(e) = fs::remove_file(entry.path()) {
-                        tracing::warn!(
-                            "failed to remove leftover tmp file {}: {}",
-                            entry.path().display(),
-                            e
-                        );
+                        tracing::warn!(%e, path = %entry.path().display(), "failed to remove leftover tmp file");
                     }
                 }
             }

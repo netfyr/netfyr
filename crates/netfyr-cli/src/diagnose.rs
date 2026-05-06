@@ -188,7 +188,7 @@ async fn run_diagnose_local(args: &DiagnoseArgs) -> Result<ExitCode> {
     let state_set = match registry.query_all().await {
         Ok(ss) => ss,
         Err(e) => {
-            tracing::warn!("failed to query current system state: {}", e);
+            tracing::warn!(%e, "failed to query current system state");
             netfyr_state::StateSet::new()
         }
     };
