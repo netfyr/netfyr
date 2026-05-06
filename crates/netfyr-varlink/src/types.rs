@@ -1447,6 +1447,130 @@ mod tests {
         }
     }
 
+    // ── Comprehensive roundtrip tests ────────────────────────────────────────
+    //
+    // These tests populate every field and use every Value variant to catch
+    // silent field loss when core types gain new fields or new Value variants.
+
+    /// Selector → VarlinkSelector → JSON → VarlinkSelector → Selector preserves
+    /// all wire-visible fields (labels are intentionally excluded from wire format).
+    #[test]
+    fn test_selector_full_roundtrip_through_json_preserves_all_wire_fields() {
+        let original = Selector {
+            name: Some("eth0".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            driver: Some("ixgbe".to_string()),
+            pci_path: Some("0000:03:00.0".to_string()),
+            mac: Some("aa:bb:cc:dd:ee:ff".parse().unwrap()),
+            labels: [("env".to_string(), "prod".to_string())].into(),
+        };
+
+        let wire = VarlinkSelector::from(&original);
+        let json = serde_json::to_value(&wire).unwrap();
+        let wire2: VarlinkSelector = serde_json::from_value(json).unwrap();
+        let restored = Selector::from(wire2);
+
+        assert_eq!(restored.name, original.name);
+        assert_eq!(restored.entity_type, original.entity_type);
+        assert_eq!(restored.driver, original.driver);
+        assert_eq!(restored.pci_path, original.pci_path);
+        assert_eq!(restored.mac, original.mac);
+        assert!(restored.labels.is_empty(), "labels are not part of wire format");
+    }
+
+    /// State → VarlinkStateDef → JSON → VarlinkStateDef → State roundtrip
+    /// with every Value variant (U64, I64, Bool, String, IpNetwork, IpAddr, List, Map).
+    #[test]
+    fn test_state_full_roundtrip_through_json_all_value_types() {
+        let mut field_map = IndexMap::new();
+        let pairs: Vec<(&str, Value)> = vec![
+            ("mtu", Value::U64(9000)),
+            ("priority", Value::I64(-1)),
+            ("enabled", Value::Bool(true)),
+            ("description", Value::String("primary uplink".to_string())),
+            (
+                "gateway",
+                Value::IpAddr("10.0.0.1".parse().unwrap()),
+            ),
+            (
+                "network",
+                Value::IpNetwork("10.0.0.0/24".parse().unwrap()),
+            ),
+            (
+                "addresses",
+                Value::List(vec![
+                    Value::IpNetwork("10.0.0.2/24".parse().unwrap()),
+                    Value::IpNetwork("10.0.0.3/24".parse().unwrap()),
+                ]),
+            ),
+            (
+                "options",
+                Value::Map(IndexMap::from([
+                    ("arp".to_string(), Value::Bool(true)),
+                    ("cost".to_string(), Value::U64(100)),
+                ])),
+            ),
+        ];
+        for (k, v) in &pairs {
+            field_map.insert(k.to_string(), fv(v.clone()));
+        }
+
+        let original = State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields: field_map,
+            metadata: StateMetadata::new(),
+            policy_ref: Some("test-policy".to_string()),
+            priority: 200,
+        };
+
+        let wire = VarlinkStateDef::from(&original);
+        let json = serde_json::to_value(&wire).unwrap();
+        let wire2: VarlinkStateDef = serde_json::from_value(json).unwrap();
+        let restored = State::try_from(wire2).expect("roundtrip must succeed");
+
+        assert_eq!(restored.entity_type, original.entity_type);
+        assert_eq!(restored.selector.name, original.selector.name);
+        for (name, value) in &pairs {
+            assert_eq!(
+                &restored.fields[*name].value, value,
+                "field '{name}' must survive roundtrip"
+            );
+        }
+    }
+
+    /// Policy with `states` (plural) roundtrips through JSON without losing entries.
+    #[test]
+    fn test_policy_with_states_plural_roundtrip_through_json() {
+        let original = Policy {
+            name: "multi-state".to_string(),
+            factory_type: FactoryType::Static,
+            priority: 150,
+            state: None,
+            states: Some(vec![
+                make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]),
+                make_state("ethernet", "eth1", vec![("mtu", Value::U64(9000))]),
+            ]),
+            selector: None,
+        };
+
+        let wire = VarlinkPolicy::from(&original);
+        let json = serde_json::to_value(&wire).unwrap();
+        let wire2: VarlinkPolicy = serde_json::from_value(json).unwrap();
+        let restored = Policy::try_from(wire2).expect("roundtrip must succeed");
+
+        assert_eq!(restored.name, "multi-state");
+        assert_eq!(restored.priority, 150);
+        let states = restored.states.expect("states must be Some");
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[1].selector.name, Some("eth1".to_string()));
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(1500));
+        assert_eq!(states[1].fields["mtu"].value, Value::U64(9000));
+    }
+
+    // ── Varlink interface file tests ─────────────────────────────────────────
+
     /// Interface definition file defines key composite types (Policy, Selector,
     /// ApplyReport, StateDiff, ShowInfo).
     #[test]
