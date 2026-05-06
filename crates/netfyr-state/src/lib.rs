@@ -21,9 +21,14 @@ pub use yaml::{
 /// A string identifying a category of network entity (e.g., `"ethernet"`, `"bond"`, `"vlan"`).
 ///
 /// Type alias for `String` — zero-cost and fully compatible with all existing code
-/// that uses `String` for entity types. Can be upgraded to a newtype in a future story
-/// if stronger type safety is needed across crate boundaries.
+/// that uses `String` for entity types.
 pub type EntityType = String;
+
+/// Known entity type constants. Use these instead of raw string literals
+/// to avoid typos and centralize the set of supported types.
+pub mod entity_types {
+    pub const ETHERNET: &str = "ethernet";
+}
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;

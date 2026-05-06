@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use futures::TryStreamExt;
 use indexmap::IndexMap;
-use netfyr_state::{FieldValue, Provenance, Selector, State, StateMetadata, StateSet, Value};
+use netfyr_state::{entity_types::ETHERNET, FieldValue, Provenance, Selector, State, StateMetadata, StateSet, Value};
 use netlink_packet_route::link::{
     InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkLayerType, LinkMessage,
 };
@@ -189,7 +189,7 @@ async fn dump_addresses(
 
     let mut stream = handle.address().get().execute();
     while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
-        entity_type: "ethernet".to_string(),
+        entity_type: ETHERNET.to_string(),
         source: Box::new(e),
     })? {
         // Only include IPv4 addresses; skip IPv6 and any other address family.
@@ -230,7 +230,7 @@ async fn dump_routes(
 
     let mut stream = handle.route().get(route_msg).execute();
     while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
-        entity_type: "ethernet".to_string(),
+        entity_type: ETHERNET.to_string(),
         source: Box::new(e),
     })? {
         if let Some(route_val) = parse_route_message(&msg, known_indices) {

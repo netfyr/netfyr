@@ -8,7 +8,7 @@ pub mod ethernet;
 pub mod query;
 
 use async_trait::async_trait;
-use netfyr_state::{EntityType, Selector, StateDiff, StateSet};
+use netfyr_state::{entity_types::ETHERNET, EntityType, Selector, StateDiff, StateSet};
 
 use crate::{ApplyReport, BackendError, DryRunReport, NetworkBackend};
 
@@ -28,7 +28,7 @@ impl NetlinkBackend {
     /// Create a new `NetlinkBackend` with the default supported entity types.
     pub fn new() -> Self {
         Self {
-            supported_entities: vec!["ethernet".to_string()],
+            supported_entities: vec![ETHERNET.to_string()],
         }
     }
 }
@@ -51,7 +51,7 @@ impl NetworkBackend for NetlinkBackend {
         selector: Option<&Selector>,
     ) -> Result<StateSet, BackendError> {
         match entity_type.as_str() {
-            "ethernet" => {
+            ETHERNET => {
                 let handle = establish_connection().await?;
                 ethernet::query_ethernet(&handle, selector).await
             }

@@ -16,7 +16,7 @@ use futures::TryStreamExt;
 use rtnetlink::new_connection;
 
 use indexmap::IndexMap;
-use netfyr_state::{FieldValue, Provenance, Selector, State, StateMetadata, Value};
+use netfyr_state::{entity_types::ETHERNET, FieldValue, Provenance, Selector, State, StateMetadata, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -282,7 +282,7 @@ pub fn lease_to_state(
     }
 
     State {
-        entity_type: "ethernet".to_string(),
+        entity_type: ETHERNET.to_string(),
         selector: Selector::with_name(interface),
         fields,
         metadata: StateMetadata::new(),
@@ -312,7 +312,7 @@ pub(super) fn pending_state(interface: &str, policy_name: &str, priority: u32) -
         },
     );
     State {
-        entity_type: "ethernet".to_string(),
+        entity_type: ETHERNET.to_string(),
         selector: Selector::with_name(interface),
         fields,
         metadata: StateMetadata::new(),

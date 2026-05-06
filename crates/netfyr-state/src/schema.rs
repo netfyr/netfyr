@@ -5,7 +5,7 @@
 //! distinguishes between full validation (structural correctness) and writable
 //! validation (additionally rejects read-only fields that users cannot set).
 
-use crate::{FieldValue, State, Value};
+use crate::{entity_types::ETHERNET, FieldValue, State, Value};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -190,7 +190,7 @@ impl SchemaRegistry {
     pub fn new() -> Self {
         let fragments = load_fragments();
         let mut schemas = HashMap::new();
-        for (name, src) in [("ethernet", ETHERNET_SCHEMA)] {
+        for (name, src) in [(ETHERNET, ETHERNET_SCHEMA)] {
             schemas.insert(name.to_string(), load_entity_schema(name, src, &fragments));
         }
         SchemaRegistry { schemas }
@@ -559,7 +559,7 @@ fn parse_constraints(field_schema: &serde_json::Value) -> Option<FieldConstraint
 /// JSON Schema alone can express (e.g., duplicate detection with named values).
 fn run_custom_checks(state: &State) -> Vec<ValidationError> {
     match state.entity_type.as_str() {
-        "ethernet" => check_ethernet_addresses(state),
+        ETHERNET => check_ethernet_addresses(state),
         _ => Vec::new(),
     }
 }

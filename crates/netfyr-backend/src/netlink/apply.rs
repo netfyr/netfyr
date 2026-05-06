@@ -8,7 +8,7 @@ use std::net::IpAddr;
 
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
-use netfyr_state::{DiffOp, FieldValue, Selector, State, StateDiff, Value};
+use netfyr_state::{entity_types::ETHERNET, DiffOp, FieldValue, Selector, State, StateDiff, Value};
 use netlink_packet_route::address::{AddressAttribute, AddressMessage, CacheInfo};
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
 use netlink_packet_route::RouteNetlinkMessage;
@@ -43,7 +43,7 @@ pub async fn apply_ethernet(
     let mut report = ApplyReport::new();
 
     for op in diff.ops() {
-        if op.entity_type() != "ethernet" {
+        if op.entity_type() != ETHERNET {
             continue;
         }
         let (applied, failed, skipped) = apply_one_op(handle, op).await;
@@ -66,7 +66,7 @@ pub async fn dry_run_ethernet(
     let mut report = DryRunReport::new();
 
     for op in diff.ops() {
-        if op.entity_type() != "ethernet" {
+        if op.entity_type() != ETHERNET {
             continue;
         }
 
@@ -474,7 +474,7 @@ async fn apply_modify_fields(
             if desired == current {
                 skipped.push(SkippedOperation {
                     operation: DiffOpKind::Modify,
-                    entity_type: "ethernet".to_string(),
+                    entity_type: ETHERNET.to_string(),
                     selector: Selector::with_name(name),
                     reason: format!("mtu already at desired value ({desired})"),
                 });
@@ -535,7 +535,7 @@ async fn apply_modify_fields(
             None => {
                 skipped.push(SkippedOperation {
                     operation: DiffOpKind::Modify,
-                    entity_type: "ethernet".to_string(),
+                    entity_type: ETHERNET.to_string(),
                     selector: Selector::with_name(name),
                     reason: "enabled field must be a boolean".to_string(),
                 });
@@ -610,7 +610,7 @@ async fn apply_modify_fields(
                                             Err(ref e) if is_not_found_error(e) => {
                                                 skipped.push(SkippedOperation {
                                                     operation: DiffOpKind::Modify,
-                                                    entity_type: "ethernet".to_string(),
+                                                    entity_type: ETHERNET.to_string(),
                                                     selector: Selector::with_name(name),
                                                     reason: format!(
                                                         "address {cidr} not present"
@@ -630,7 +630,7 @@ async fn apply_modify_fields(
                                     None => {
                                         skipped.push(SkippedOperation {
                                             operation: DiffOpKind::Modify,
-                                            entity_type: "ethernet".to_string(),
+                                            entity_type: ETHERNET.to_string(),
                                             selector: Selector::with_name(name),
                                             reason: format!("address {cidr} not present"),
                                         });
@@ -665,7 +665,7 @@ async fn apply_modify_fields(
                         Err(ref e) if is_eexist(e) => {
                             skipped.push(SkippedOperation {
                                 operation: DiffOpKind::Modify,
-                                entity_type: "ethernet".to_string(),
+                                entity_type: ETHERNET.to_string(),
                                 selector: Selector::with_name(name),
                                 reason: format!("address {cidr} already present"),
                             });
@@ -751,7 +751,7 @@ async fn apply_modify_fields(
                             Err(ref e) if is_eexist_backend(e) => {
                                 skipped.push(SkippedOperation {
                                     operation: DiffOpKind::Modify,
-                                    entity_type: "ethernet".to_string(),
+                                    entity_type: ETHERNET.to_string(),
                                     selector: Selector::with_name(name),
                                     reason: format!(
                                         "route {dst_ip}/{dst_prefix} already present"
@@ -835,14 +835,14 @@ async fn resolve_link_index(handle: &Handle, name: &str) -> Result<u32, BackendE
         .try_next()
         .await
         .map_err(|e| BackendError::QueryFailed {
-            entity_type: "ethernet".to_string(),
+            entity_type: ETHERNET.to_string(),
             source: Box::new(e),
         })?
     {
         return Ok(msg.header.index);
     }
     Err(BackendError::NotFound {
-        entity_type: "ethernet".to_string(),
+        entity_type: ETHERNET.to_string(),
         selector: Box::new(Selector::with_name(name)),
     })
 }
@@ -854,7 +854,7 @@ async fn get_current_state(handle: &Handle, name: &str) -> Result<State, Backend
     // Collect the first state before `state_set` is dropped.
     let first = state_set.iter().next().cloned();
     first.ok_or_else(|| BackendError::NotFound {
-        entity_type: "ethernet".to_string(),
+        entity_type: ETHERNET.to_string(),
         selector: Box::new(sel),
     })
 }
@@ -870,7 +870,7 @@ async fn query_address_messages(
         .try_next()
         .await
         .map_err(|e| BackendError::QueryFailed {
-            entity_type: "ethernet".to_string(),
+            entity_type: ETHERNET.to_string(),
             source: Box::new(e),
         })?
     {
@@ -900,7 +900,7 @@ async fn query_route_messages(
             .try_next()
             .await
             .map_err(|e| BackendError::QueryFailed {
-                entity_type: "ethernet".to_string(),
+                entity_type: ETHERNET.to_string(),
                 source: Box::new(e),
             })?
         {
@@ -1085,7 +1085,7 @@ fn map_netlink_error(err: rtnetlink::Error, operation: &str) -> BackendError {
         Some(19) => {
             // ENODEV
             BackendError::NotFound {
-                entity_type: "ethernet".to_string(),
+                entity_type: ETHERNET.to_string(),
                 selector: Box::new(Selector::new()),
             }
         }
