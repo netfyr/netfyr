@@ -150,10 +150,6 @@ pub enum FactoryError {
     /// Wraps a `StateSet` union conflict (same entity, same field, same priority, different values).
     #[error(transparent)]
     ConflictError(#[from] ConflictError),
-
-    /// Catch-all for unexpected errors.
-    #[error("{message}")]
-    Other { message: String },
 }
 
 // ── StaticFactory ─────────────────────────────────────────────────────────────
