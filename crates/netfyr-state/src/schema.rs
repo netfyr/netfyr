@@ -571,7 +571,6 @@ fn run_custom_checks(state: &State) -> Vec<ValidationError> {
 
 /// Custom validation for the `addresses` field of an ethernet entity:
 /// - Rejects duplicate CIDR strings with a `ConstraintViolation` error.
-/// - Rejects IPv6 addresses (containing `:`) with an `InvalidFormat` error.
 ///
 /// Only runs when `addresses` is present and is a `Value::List`; if it has the
 /// wrong type, JSON Schema already emitted a type error — no cascading errors.
@@ -586,32 +585,20 @@ fn check_ethernet_addresses(state: &State) -> Vec<ValidationError> {
     let mut reported_dup: HashSet<String> = HashSet::new();
 
     for item in addresses {
-        // Addresses arrive as Value::IpNetwork (parsed from YAML strings like
-        // "10.99.0.1/24") or Value::String (raw strings). Non-address types
-        // are caught by JSON Schema before this function runs.
         let addr = match item {
             Value::IpNetwork(_) | Value::String(_) => item.to_string(),
+            Value::Map(m) => match m.get("address") {
+                Some(v) => v.to_string(),
+                None => continue,
+            },
             _ => continue,
         };
 
-        // Duplicate detection: one error per unique duplicated address.
         if !seen.insert(addr.clone()) && reported_dup.insert(addr.clone()) {
             errors.push(ValidationError {
                 field: "addresses".into(),
                 message: format!("duplicate address \"{addr}\""),
                 kind: ValidationErrorKind::ConstraintViolation,
-            });
-        }
-
-        // IPv6 detection: the prefix part (before '/') contains ':'.
-        let prefix = addr.split_once('/').map_or(addr.as_str(), |(p, _)| p);
-        if prefix.contains(':') {
-            errors.push(ValidationError {
-                field: "addresses".into(),
-                message: format!(
-                    "IPv6 address \"{addr}\" is not supported; use IPv4 CIDR format"
-                ),
-                kind: ValidationErrorKind::InvalidFormat,
             });
         }
     }
@@ -1378,9 +1365,9 @@ mod tests {
         );
     }
 
-    /// Scenario: IPv6 addresses are rejected
+    /// Scenario: IPv6 addresses are accepted
     #[test]
-    fn test_ipv6_address_is_rejected() {
+    fn test_ipv6_address_is_accepted() {
         let registry = SchemaRegistry::new();
         let state = make_state(
             "ethernet",
@@ -1390,56 +1377,65 @@ mod tests {
             )],
         );
         assert!(
-            registry.validate(&state).is_err(),
-            "IPv6 address in 'addresses' should be rejected"
+            registry.validate(&state).is_ok(),
+            "IPv6 address in 'addresses' should be accepted"
         );
     }
 
-    /// Scenario: IPv6 addresses — error kind is InvalidFormat for field "addresses"
+    /// Scenario: Map-format addresses with lifetimes are accepted by schema
     #[test]
-    fn test_ipv6_address_error_kind_is_invalid_format() {
+    fn test_address_map_with_lifetime_is_accepted() {
         let registry = SchemaRegistry::new();
+        let mut addr_map = IndexMap::new();
+        addr_map.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        addr_map.insert("valid_lft".to_string(), Value::U64(3600));
+        addr_map.insert("preferred_lft".to_string(), Value::U64(1800));
         let state = make_state(
             "ethernet",
-            vec![(
-                "addresses",
-                Value::List(vec![Value::String("fe80::1/64".to_string())]),
-            )],
+            vec![("addresses", Value::List(vec![Value::Map(addr_map)]))],
         );
-        let errs = registry.validate(&state).unwrap_err();
-        let has_invalid_format = errs
-            .errors()
-            .iter()
-            .any(|e| e.field == "addresses" && e.kind == ValidationErrorKind::InvalidFormat);
         assert!(
-            has_invalid_format,
-            "expected InvalidFormat for 'addresses' with IPv6 input, got: {:?}",
-            errs.errors()
+            registry.validate(&state).is_ok(),
+            "map-format address with lifetimes should be accepted"
         );
     }
 
-    /// Scenario: IPv6 addresses — message mentions IPv6 is not supported
+    /// Scenario: Duplicate addresses in map format are detected
     #[test]
-    fn test_ipv6_address_message_mentions_not_supported() {
+    fn test_duplicate_map_format_addresses_rejected() {
         let registry = SchemaRegistry::new();
+        let mut m1 = IndexMap::new();
+        m1.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m1.insert("valid_lft".to_string(), Value::U64(3600));
+        let mut m2 = IndexMap::new();
+        m2.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m2.insert("valid_lft".to_string(), Value::U64(7200));
         let state = make_state(
             "ethernet",
-            vec![(
-                "addresses",
-                Value::List(vec![Value::String("fe80::1/64".to_string())]),
-            )],
+            vec![("addresses", Value::List(vec![Value::Map(m1), Value::Map(m2)]))],
         );
-        let errs = registry.validate(&state).unwrap_err();
-        let ipv6_err = errs
-            .errors()
-            .iter()
-            .find(|e| e.field == "addresses" && e.kind == ValidationErrorKind::InvalidFormat)
-            .expect("should have an InvalidFormat error for 'addresses'");
-        let msg_lower = ipv6_err.message.to_lowercase();
+        let result = registry.validate(&state);
+        assert!(result.is_err(), "duplicate map-format addresses should be rejected");
+    }
+
+    /// Scenario: Route with mtu, table, tos is accepted by schema
+    #[test]
+    fn test_route_with_mtu_table_tos_accepted() {
+        let registry = SchemaRegistry::new();
+        let mut route = IndexMap::new();
+        route.insert("destination".to_string(), Value::String("10.0.0.0/8".to_string()));
+        route.insert("gateway".to_string(), Value::String("10.0.1.1".to_string()));
+        route.insert("metric".to_string(), Value::U64(100));
+        route.insert("mtu".to_string(), Value::U64(1400));
+        route.insert("table".to_string(), Value::U64(100));
+        route.insert("tos".to_string(), Value::U64(16));
+        let state = make_state(
+            "ethernet",
+            vec![("routes", Value::List(vec![Value::Map(route)]))],
+        );
         assert!(
-            msg_lower.contains("ipv6"),
-            "message should mention 'IPv6', got: {}",
-            ipv6_err.message
+            registry.validate(&state).is_ok(),
+            "route with mtu/table/tos should be accepted"
         );
     }
 

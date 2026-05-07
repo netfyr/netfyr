@@ -190,14 +190,20 @@ fn format_value_element(v: &Value) -> String {
     match v {
         Value::Map(map) => {
             if let Some(Value::IpNetwork(dest)) = map.get("destination") {
-                let metric = match map.get("metric") {
-                    Some(Value::U64(n)) => *n,
-                    _ => 0,
-                };
-                if metric == 0 {
-                    return format!("{}", dest);
+                let mut parts = vec![format!("{dest}")];
+                if let Some(Value::U64(n)) = map.get("metric") {
+                    if *n != 0 { parts.push(format!("metric {n}")); }
                 }
-                return format!("{} metric {}", dest, metric);
+                if let Some(Value::U64(m)) = map.get("mtu") {
+                    parts.push(format!("mtu {m}"));
+                }
+                if let Some(Value::U64(t)) = map.get("table") {
+                    parts.push(format!("table {t}"));
+                }
+                if let Some(Value::U64(t)) = map.get("tos") {
+                    if *t != 0 { parts.push(format!("tos {t}")); }
+                }
+                return parts.join(" ");
             }
             format!("{}", v)
         }

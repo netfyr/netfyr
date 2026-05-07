@@ -8,9 +8,9 @@
 
 use crate::{FieldValue, MacAddr, MacAddrParseError, Provenance, Selector, State, StateMetadata, Value};
 use indexmap::IndexMap;
-use ipnetwork::Ipv4Network;
+use ipnetwork::IpNetwork;
 use serde::de::Deserialize;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -108,11 +108,11 @@ pub fn deserialize_value(v: &serde_yaml::Value) -> Result<Value, YamlError> {
             // host-route networks, which would prevent bare IPs from being parsed
             // as Value::IpAddr as the spec requires.
             if s.contains('/') {
-                if let Ok(net) = Ipv4Network::from_str(s) {
+                if let Ok(net) = IpNetwork::from_str(s) {
                     return Ok(Value::IpNetwork(net));
                 }
             }
-            if let Ok(ip) = Ipv4Addr::from_str(s) {
+            if let Ok(ip) = IpAddr::from_str(s) {
                 Ok(Value::IpAddr(ip))
             } else {
                 Ok(Value::String(s.clone()))
@@ -390,8 +390,8 @@ mod tests {
     use super::*;
     use crate::{FieldValue, Provenance, Selector, State, StateMetadata, Value};
     use indexmap::IndexMap;
-    use ipnetwork::Ipv4Network;
-    use std::net::Ipv4Addr;
+    use ipnetwork::IpNetwork;
+    use std::net::IpAddr;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -469,7 +469,7 @@ mod tests {
     fn test_deserialize_value_ip_addr_string_becomes_ip_addr() {
         let result =
             deserialize_value(&serde_yaml::Value::String("10.0.1.1".to_string())).unwrap();
-        let expected_ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        let expected_ip: IpAddr = "10.0.1.1".parse().unwrap();
         assert_eq!(result, Value::IpAddr(expected_ip));
     }
 
@@ -478,7 +478,7 @@ mod tests {
     fn test_deserialize_value_cidr_string_becomes_ip_network() {
         let result =
             deserialize_value(&serde_yaml::Value::String("10.0.1.0/24".to_string())).unwrap();
-        let expected_net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
+        let expected_net: IpNetwork = "10.0.1.0/24".parse().unwrap();
         assert_eq!(result, Value::IpNetwork(expected_net));
     }
 
@@ -506,7 +506,7 @@ mod tests {
         let result = deserialize_value(&seq).unwrap();
         let list = result.as_list().expect("should be a list");
         assert_eq!(list.len(), 1);
-        let expected_net: Ipv4Network = "10.0.1.50/24".parse().unwrap();
+        let expected_net: IpNetwork = "10.0.1.50/24".parse().unwrap();
         assert_eq!(list[0], Value::IpNetwork(expected_net));
     }
 
@@ -565,7 +565,7 @@ mod tests {
         let addrs = &states[0].fields["addresses"].value;
         let list = addrs.as_list().expect("addresses should be a list");
         assert_eq!(list.len(), 1);
-        let expected_net: Ipv4Network = "10.0.1.50/24".parse().unwrap();
+        let expected_net: IpNetwork = "10.0.1.50/24".parse().unwrap();
         assert_eq!(list[0], Value::IpNetwork(expected_net));
     }
 
@@ -900,8 +900,8 @@ mod tests {
     /// a YAML round-trip.
     #[test]
     fn test_round_trip_yaml_various_field_types() {
-        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
-        let ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let ip: IpAddr = "10.0.1.1".parse().unwrap();
 
         let mut inner_map = IndexMap::new();
         inner_map.insert("proto".to_string(), Value::String("tcp".to_string()));
@@ -958,14 +958,14 @@ mod tests {
         let routes = states[0].fields["routes"].value.as_list().unwrap();
         let route_map = routes[0].as_map().unwrap();
 
-        let expected_net: Ipv4Network = "0.0.0.0/0".parse().unwrap();
+        let expected_net: IpNetwork = "0.0.0.0/0".parse().unwrap();
         assert_eq!(
             route_map.get("destination"),
             Some(&Value::IpNetwork(expected_net)),
             "destination should be Value::IpNetwork"
         );
 
-        let expected_gw: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        let expected_gw: IpAddr = "10.0.1.1".parse().unwrap();
         assert_eq!(
             route_map.get("gateway"),
             Some(&Value::IpAddr(expected_gw)),
@@ -989,9 +989,9 @@ mod tests {
 
         assert_eq!(list.len(), 3, "all three addresses should be present");
 
-        let n1: Ipv4Network = "10.0.1.50/24".parse().unwrap();
-        let n2: Ipv4Network = "10.0.2.50/24".parse().unwrap();
-        let n3: Ipv4Network = "10.0.3.50/24".parse().unwrap();
+        let n1: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        let n2: IpNetwork = "10.0.2.50/24".parse().unwrap();
+        let n3: IpNetwork = "10.0.3.50/24".parse().unwrap();
 
         assert_eq!(list[0], Value::IpNetwork(n1), "first address should be 10.0.1.50/24");
         assert_eq!(list[1], Value::IpNetwork(n2), "second address should be 10.0.2.50/24");
@@ -1022,7 +1022,7 @@ mod tests {
     /// Scenario: A `Value::IpAddr` field survives a YAML round-trip correctly.
     #[test]
     fn test_round_trip_yaml_ip_addr_round_trips_correctly() {
-        let ip: Ipv4Addr = "10.0.1.1".parse().unwrap();
+        let ip: IpAddr = "10.0.1.1".parse().unwrap();
 
         let mut fields = IndexMap::new();
         fields.insert("gateway".to_string(), make_fv(Value::IpAddr(ip)));
@@ -1040,5 +1040,44 @@ mod tests {
         let restored = &parse_yaml(&yaml).unwrap()[0];
 
         assert_eq!(restored.fields["gateway"].value, Value::IpAddr(ip));
+    }
+
+    #[test]
+    fn test_deserialize_ipv6_network() {
+        let yaml_str = "fd00::/64";
+        let val = deserialize_value(&serde_yaml::from_str::<serde_yaml::Value>(yaml_str).unwrap()).unwrap();
+        let expected: IpNetwork = "fd00::/64".parse().unwrap();
+        assert_eq!(val, Value::IpNetwork(expected));
+    }
+
+    #[test]
+    fn test_deserialize_ipv6_addr() {
+        let yaml_str = "\"::1\"";
+        let val = deserialize_value(&serde_yaml::from_str::<serde_yaml::Value>(yaml_str).unwrap()).unwrap();
+        let expected: IpAddr = "::1".parse().unwrap();
+        assert_eq!(val, Value::IpAddr(expected));
+    }
+
+    #[test]
+    fn test_ipv6_yaml_round_trip() {
+        let net: IpNetwork = "fd00::/64".parse().unwrap();
+        let mut fields = IndexMap::new();
+        fields.insert("addresses".to_string(), make_fv(Value::List(vec![
+            Value::IpNetwork(net),
+        ])));
+
+        let state = State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields,
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 100,
+        };
+
+        let yaml = state_to_yaml(&state).unwrap();
+        let restored = &parse_yaml(&yaml).unwrap()[0];
+        let addrs = restored.fields["addresses"].value.as_list().unwrap();
+        assert_eq!(addrs[0], Value::IpNetwork(net));
     }
 }

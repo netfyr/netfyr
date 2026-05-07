@@ -60,11 +60,11 @@ pub mod entity_types {
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
-use ipnetwork::Ipv4Network;
+use ipnetwork::IpNetwork;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -275,8 +275,8 @@ pub enum Value {
     Bool(bool),
     U64(u64),
     I64(i64),
-    IpNetwork(Ipv4Network),
-    IpAddr(Ipv4Addr),
+    IpNetwork(IpNetwork),
+    IpAddr(IpAddr),
     List(Vec<Value>),
     Map(IndexMap<String, Value>),
     String(String),
@@ -301,11 +301,11 @@ impl From<RawValue> for Value {
             RawValue::I64(n) => Value::I64(n),
             RawValue::String(s) => {
                 if s.contains('/') {
-                    if let Ok(net) = s.parse::<Ipv4Network>() {
+                    if let Ok(net) = s.parse::<IpNetwork>() {
                         return Value::IpNetwork(net);
                     }
                 }
-                if let Ok(ip) = s.parse::<Ipv4Addr>() {
+                if let Ok(ip) = s.parse::<IpAddr>() {
                     return Value::IpAddr(ip);
                 }
                 Value::String(s)
@@ -389,14 +389,14 @@ impl From<bool> for Value {
     }
 }
 
-impl From<Ipv4Addr> for Value {
-    fn from(ip: Ipv4Addr) -> Self {
+impl From<IpAddr> for Value {
+    fn from(ip: IpAddr) -> Self {
         Value::IpAddr(ip)
     }
 }
 
-impl From<Ipv4Network> for Value {
-    fn from(net: Ipv4Network) -> Self {
+impl From<IpNetwork> for Value {
+    fn from(net: IpNetwork) -> Self {
         Value::IpNetwork(net)
     }
 }
@@ -430,14 +430,14 @@ impl Value {
         }
     }
 
-    pub fn as_ip_addr(&self) -> Option<&Ipv4Addr> {
+    pub fn as_ip_addr(&self) -> Option<&IpAddr> {
         match self {
             Value::IpAddr(ip) => Some(ip),
             _ => None,
         }
     }
 
-    pub fn as_ip_network(&self) -> Option<&Ipv4Network> {
+    pub fn as_ip_network(&self) -> Option<&IpNetwork> {
         match self {
             Value::IpNetwork(net) => Some(net),
             _ => None,
@@ -612,7 +612,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use indexmap::IndexMap;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     // ── MacAddr tests ─────────────────────────────────────────────────────────
 
@@ -1058,8 +1058,8 @@ mod tests {
 
     #[test]
     fn test_value_all_variants_constructable() {
-        let ip = Ipv4Addr::new(10, 0, 1, 1);
-        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
+        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
         let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
 
@@ -1078,8 +1078,8 @@ mod tests {
 
     #[test]
     fn test_value_all_variants_clone_debug_partialeq() {
-        let ip = Ipv4Addr::new(10, 0, 1, 1);
-        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
+        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
         let mut map = IndexMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
 
@@ -1139,13 +1139,13 @@ mod tests {
 
     #[test]
     fn test_value_from_ip_addr() {
-        let ip = Ipv4Addr::new(192, 168, 1, 1);
+        let ip: IpAddr = Ipv4Addr::new(192, 168, 1, 1).into();
         assert_eq!(Value::from(ip), Value::IpAddr(ip));
     }
 
     #[test]
     fn test_value_from_ip_network() {
-        let net: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+        let net: IpNetwork = "192.168.1.0/24".parse().unwrap();
         assert_eq!(Value::from(net), Value::IpNetwork(net));
     }
 
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn test_value_ip_addr_accessor_returns_some() {
-        let ip = Ipv4Addr::new(10, 0, 1, 1);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
         assert_eq!(Value::IpAddr(ip).as_ip_addr(), Some(&ip));
     }
 
@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn test_value_ip_network_accessor_returns_some() {
-        let net: Ipv4Network = "10.0.0.0/8".parse().unwrap();
+        let net: IpNetwork = "10.0.0.0/8".parse().unwrap();
         assert_eq!(Value::IpNetwork(net).as_ip_network(), Some(&net));
     }
 
@@ -1261,13 +1261,13 @@ mod tests {
 
     #[test]
     fn test_value_display_ip_addr() {
-        let ip = Ipv4Addr::new(10, 0, 1, 1);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
         assert_eq!(format!("{}", Value::IpAddr(ip)), "10.0.1.1");
     }
 
     #[test]
     fn test_value_display_ip_network() {
-        let net: Ipv4Network = "10.0.1.0/24".parse().unwrap();
+        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
         assert_eq!(format!("{}", Value::IpNetwork(net)), "10.0.1.0/24");
     }
 

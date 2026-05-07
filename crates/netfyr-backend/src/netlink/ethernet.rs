@@ -1,7 +1,7 @@
 //! Ethernet interface query via rtnetlink.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use futures::TryStreamExt;
 use indexmap::IndexMap;
@@ -149,16 +149,19 @@ fn build_route_value(
     gateway: Option<&str>,
     metric: u32,
     protocol: Option<&str>,
+    mtu: Option<u32>,
+    table: Option<u32>,
+    tos: u8,
 ) -> Value {
     let mut map = IndexMap::new();
     let dest_val = destination
-        .parse::<ipnetwork::Ipv4Network>()
+        .parse::<ipnetwork::IpNetwork>()
         .map(Value::IpNetwork)
         .unwrap_or_else(|_| Value::String(destination.to_owned()));
     map.insert("destination".to_string(), dest_val);
     if let Some(gw) = gateway {
         let gw_val = gw
-            .parse::<Ipv4Addr>()
+            .parse::<IpAddr>()
             .map(Value::IpAddr)
             .unwrap_or_else(|_| Value::String(gw.to_owned()));
         map.insert("gateway".to_string(), gw_val);
@@ -166,6 +169,17 @@ fn build_route_value(
     map.insert("metric".to_string(), Value::U64(metric as u64));
     if let Some(proto) = protocol {
         map.insert("protocol".to_string(), Value::String(proto.to_owned()));
+    }
+    if let Some(m) = mtu {
+        map.insert("mtu".to_string(), Value::U64(m as u64));
+    }
+    if let Some(t) = table {
+        if t != 254 {
+            map.insert("table".to_string(), Value::U64(t as u64));
+        }
+    }
+    if tos != 0 {
+        map.insert("tos".to_string(), Value::U64(tos as u64));
     }
     Value::Map(map)
 }
@@ -192,8 +206,10 @@ async fn dump_addresses(
         entity_type: ETHERNET.to_string(),
         source: Box::new(e),
     })? {
-        // Only include IPv4 addresses; skip IPv6 and any other address family.
-        if msg.header.family != netlink_packet_route::AddressFamily::Inet {
+        let family = msg.header.family;
+        if family != netlink_packet_route::AddressFamily::Inet
+            && family != netlink_packet_route::AddressFamily::Inet6
+        {
             continue;
         }
 
@@ -213,30 +229,35 @@ async fn dump_addresses(
 
 // ── Route dump ────────────────────────────────────────────────────────────────
 
-/// Dump IPv4 routes and return a map from output interface index to
+/// Dump IPv4 and IPv6 routes and return a map from output interface index to
 /// route `Value::Map` objects.
 ///
 /// Only unicast routes (RTN_UNICAST) are included. Routes with no output
 /// interface (`RTA_OIF`) — e.g., local/blackhole routes — are skipped.
-/// IPv6 routes are not queried per spec.
 async fn dump_routes(
     handle: &Handle,
     known_indices: &std::collections::HashSet<u32>,
 ) -> Result<HashMap<u32, Vec<Value>>, BackendError> {
     let mut map: HashMap<u32, Vec<Value>> = HashMap::new();
 
-    let mut route_msg = RouteMessage::default();
-    route_msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
+    let families = [
+        netlink_packet_route::AddressFamily::Inet,
+        netlink_packet_route::AddressFamily::Inet6,
+    ];
+    for family in families {
+        let mut route_msg = RouteMessage::default();
+        route_msg.header.address_family = family;
 
-    let mut stream = handle.route().get(route_msg).execute();
-    while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
-        entity_type: ETHERNET.to_string(),
-        source: Box::new(e),
-    })? {
-        if let Some(route_val) = parse_route_message(&msg, known_indices) {
-            let oif = extract_oif(&msg);
-            if let Some(idx) = oif {
-                map.entry(idx).or_default().push(route_val);
+        let mut stream = handle.route().get(route_msg).execute();
+        while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
+            entity_type: ETHERNET.to_string(),
+            source: Box::new(e),
+        })? {
+            if let Some(route_val) = parse_route_message(&msg, known_indices) {
+                let oif = extract_oif(&msg);
+                if let Some(idx) = oif {
+                    map.entry(idx).or_default().push(route_val);
+                }
             }
         }
     }
@@ -268,6 +289,8 @@ fn parse_route_message(
     let mut destination_ip: Option<IpAddr> = None;
     let mut gateway_ip: Option<IpAddr> = None;
     let mut metric: u32 = 0;
+    let mut mtu: Option<u32> = None;
+    let mut table: Option<u32> = None;
 
     for attr in &msg.attributes {
         match attr {
@@ -280,19 +303,33 @@ fn parse_route_message(
             RouteAttribute::Priority(p) => {
                 metric = *p;
             }
+            RouteAttribute::Metrics(metrics) => {
+                for m in metrics {
+                    if let netlink_packet_route::route::RouteMetric::Mtu(v) = m {
+                        mtu = Some(*v);
+                    }
+                }
+            }
+            RouteAttribute::Table(t) => {
+                table = Some(*t);
+            }
             _ => {}
         }
     }
+
+    let tos = msg.header.tos;
 
     // Build destination CIDR. If no explicit destination, it's a default route.
     let destination = if let Some(ip) = destination_ip {
         format!("{ip}/{dst_prefix_len}")
     } else {
-        // Default route: 0.0.0.0/0 (IPv4 only; IPv6 routes are not queried).
         let af = msg.header.address_family;
         match af {
             netlink_packet_route::AddressFamily::Inet => {
                 format!("0.0.0.0/{dst_prefix_len}")
+            }
+            netlink_packet_route::AddressFamily::Inet6 => {
+                format!("::/{dst_prefix_len}")
             }
             _ => return None,
         }
@@ -305,6 +342,9 @@ fn parse_route_message(
         gateway_str.as_deref(),
         metric,
         Some(protocol),
+        mtu,
+        table,
+        tos,
     ))
 }
 
@@ -423,12 +463,15 @@ mod tests {
     /// build_route_value without gateway produces a map with destination and metric.
     #[test]
     fn test_build_route_value_without_gateway() {
-        let val = build_route_value("10.0.0.0/24", None, 100, None);
+        let val = build_route_value("10.0.0.0/24", None, 100, None, None, None, 0);
         let map = val.as_map().expect("build_route_value must return Value::Map");
         assert!(map.contains_key("destination"), "map must have 'destination' key");
         assert!(map.contains_key("metric"),      "map must have 'metric' key");
         assert!(!map.contains_key("gateway"),    "map must NOT have 'gateway' key when not provided");
         assert!(!map.contains_key("protocol"),   "map must NOT have 'protocol' key when not provided");
+        assert!(!map.contains_key("mtu"),        "map must NOT have 'mtu' key when not provided");
+        assert!(!map.contains_key("table"),      "map must NOT have 'table' key when default");
+        assert!(!map.contains_key("tos"),        "map must NOT have 'tos' key when zero");
         assert_eq!(map["destination"].to_string(), "10.0.0.0/24");
         assert_eq!(map["metric"].as_u64(), Some(100));
     }
@@ -436,7 +479,7 @@ mod tests {
     /// build_route_value with gateway produces a map with destination, gateway, and metric.
     #[test]
     fn test_build_route_value_with_gateway() {
-        let val = build_route_value("0.0.0.0/0", Some("192.168.1.1"), 0, Some("static"));
+        let val = build_route_value("0.0.0.0/0", Some("192.168.1.1"), 0, Some("static"), None, None, 0);
         let map = val.as_map().expect("build_route_value must return Value::Map");
         assert!(map.contains_key("destination"), "map must have 'destination' key");
         assert!(map.contains_key("gateway"),     "map must have 'gateway' key when provided");
@@ -451,7 +494,7 @@ mod tests {
     /// build_route_value gateway field is only present when Some(_) is passed.
     #[test]
     fn test_build_route_value_gateway_field_absent_when_none() {
-        let val = build_route_value("::/0", None, 512, None);
+        let val = build_route_value("::/0", None, 512, None, None, None, 0);
         let map = val.as_map().unwrap();
         assert!(!map.contains_key("gateway"), "gateway must be absent when None");
         assert_eq!(map["metric"].as_u64(), Some(512));
@@ -460,10 +503,42 @@ mod tests {
     /// build_route_value preserves the metric value exactly.
     #[test]
     fn test_build_route_value_metric_preserved() {
-        let val = build_route_value("10.99.0.0/24", None, 1024, Some("kernel"));
+        let val = build_route_value("10.99.0.0/24", None, 1024, Some("kernel"), None, None, 0);
         let map = val.as_map().unwrap();
         assert_eq!(map["metric"].as_u64(), Some(1024));
         assert_eq!(map["protocol"].as_str(), Some("kernel"));
+    }
+
+    /// build_route_value includes mtu when provided.
+    #[test]
+    fn test_build_route_value_with_mtu() {
+        let val = build_route_value("10.0.0.0/24", None, 100, None, Some(1400), None, 0);
+        let map = val.as_map().unwrap();
+        assert_eq!(map["mtu"].as_u64(), Some(1400));
+    }
+
+    /// build_route_value includes table when non-default (not 254).
+    #[test]
+    fn test_build_route_value_with_table() {
+        let val = build_route_value("10.0.0.0/24", None, 100, None, None, Some(100), 0);
+        let map = val.as_map().unwrap();
+        assert_eq!(map["table"].as_u64(), Some(100));
+    }
+
+    /// build_route_value omits table when it equals main table (254).
+    #[test]
+    fn test_build_route_value_omits_main_table() {
+        let val = build_route_value("10.0.0.0/24", None, 100, None, None, Some(254), 0);
+        let map = val.as_map().unwrap();
+        assert!(!map.contains_key("table"));
+    }
+
+    /// build_route_value includes tos when non-zero.
+    #[test]
+    fn test_build_route_value_with_tos() {
+        let val = build_route_value("10.0.0.0/24", None, 100, None, None, None, 16);
+        let map = val.as_map().unwrap();
+        assert_eq!(map["tos"].as_u64(), Some(16));
     }
 
     // ── route_address_to_ip ───────────────────────────────────────────────────
@@ -724,7 +799,7 @@ pub async fn query_ethernet(
                 addrs
                     .iter()
                     .map(|s| {
-                        s.parse::<ipnetwork::Ipv4Network>()
+                        s.parse::<ipnetwork::IpNetwork>()
                             .map(Value::IpNetwork)
                             .unwrap_or_else(|_| Value::String(s.clone()))
                     })

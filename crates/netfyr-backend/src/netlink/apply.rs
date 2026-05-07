@@ -577,6 +577,7 @@ async fn apply_modify_fields(
         let to_remove: Vec<&String> = current_addrs
             .iter()
             .filter(|a| !desired_addrs.contains(a))
+            .filter(|a| !is_link_local(a))
             .collect();
         let to_replace: Vec<(usize, &String)> = desired_addrs
             .iter()
@@ -745,8 +746,10 @@ async fn apply_modify_fields(
         for route_val in &to_add {
             if let Some(map) = route_val.as_map() {
                 match extract_route_fields(map) {
-                    Ok((dst_ip, dst_prefix, gateway, metric)) => {
-                        match add_route(handle, index, dst_ip, dst_prefix, gateway, metric).await {
+                    Ok(rf) => {
+                        let dst_ip = rf.dst_ip;
+                        let dst_prefix = rf.dst_prefix;
+                        match add_route(handle, index, &rf).await {
                             Ok(()) => fields_changed.push("routes".to_string()),
                             Err(ref e) if is_eexist_backend(e) => {
                                 skipped.push(SkippedOperation {
@@ -773,12 +776,12 @@ async fn apply_modify_fields(
                     for route_val in &to_remove {
                         if let Some(map) = route_val.as_map() {
                             match extract_route_fields(map) {
-                                Ok((dst_ip, dst_prefix, gateway, _metric)) => {
+                                Ok(rf) => {
                                     match find_route_message(
                                         &route_msgs,
-                                        dst_ip,
-                                        dst_prefix,
-                                        gateway,
+                                        rf.dst_ip,
+                                        rf.dst_prefix,
+                                        rf.gateway,
                                     ) {
                                         Some(msg) => {
                                             match handle
@@ -1017,18 +1020,15 @@ fn route_address_to_string(addr: &RouteAddress) -> Option<String> {
 async fn add_route(
     handle: &Handle,
     index: u32,
-    dst_ip: IpAddr,
-    dst_prefix: u8,
-    gateway: Option<IpAddr>,
-    metric: u32,
+    rf: &RouteFields,
 ) -> Result<(), BackendError> {
     let builder = RouteMessageBuilder::<IpAddr>::new();
 
     let builder = builder
-        .destination_prefix(dst_ip, dst_prefix)
+        .destination_prefix(rf.dst_ip, rf.dst_prefix)
         .map_err(|e| BackendError::Internal(format!("invalid route destination: {e}")))?;
 
-    let builder = if let Some(gw) = gateway {
+    let builder = if let Some(gw) = rf.gateway {
         builder
             .gateway(gw)
             .map_err(|e| BackendError::Internal(format!("invalid route gateway: {e}")))?
@@ -1036,10 +1036,26 @@ async fn add_route(
         builder
     };
 
-    let msg = builder
+    let builder = if let Some(t) = rf.table {
+        builder.table_id(t)
+    } else {
+        builder
+    };
+
+    let mut msg = builder
         .output_interface(index)
-        .priority(metric)
+        .priority(rf.metric)
         .build();
+
+    msg.header.tos = rf.tos;
+
+    if let Some(m) = rf.mtu {
+        msg.attributes.push(
+            netlink_packet_route::route::RouteAttribute::Metrics(
+                vec![netlink_packet_route::route::RouteMetric::Mtu(m)]
+            )
+        );
+    }
 
     // Bypass RouteAddRequest to use NLM_F_APPEND instead of NLM_F_EXCL.
     let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewRoute(msg));
@@ -1150,7 +1166,7 @@ fn value_to_str(v: &Value) -> Option<String> {
 fn addr_to_cidr(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
-        Value::Map(m) => m.get("address")?.as_str().map(str::to_owned),
+        Value::Map(m) => value_to_str(m.get("address")?),
         Value::IpNetwork(net) => Some(net.to_string()),
         Value::IpAddr(ip) => Some(ip.to_string()),
         _ => None,
@@ -1165,6 +1181,16 @@ fn addr_preferred_lft(v: &Value) -> Option<u32> {
     v.as_map()?.get("preferred_lft")?.as_u64().map(|n| n as u32)
 }
 
+fn is_link_local(cidr: &str) -> bool {
+    cidr.split_once('/')
+        .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
+        .map(|ip| match ip {
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 fn is_kernel_route(route_val: &Value) -> bool {
     route_val
         .as_map()
@@ -1174,10 +1200,19 @@ fn is_kernel_route(route_val: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Extract destination, optional gateway, and metric from a route `Value::Map`.
+struct RouteFields {
+    dst_ip: IpAddr,
+    dst_prefix: u8,
+    gateway: Option<IpAddr>,
+    metric: u32,
+    mtu: Option<u32>,
+    table: Option<u32>,
+    tos: u8,
+}
+
 fn extract_route_fields(
     map: &IndexMap<String, Value>,
-) -> Result<(IpAddr, u8, Option<IpAddr>, u32), BackendError> {
+) -> Result<RouteFields, BackendError> {
     let destination = map
         .get("destination")
         .and_then(value_to_str)
@@ -1200,7 +1235,11 @@ fn extract_route_fields(
         .map(|m| m as u32)
         .unwrap_or(DEFAULT_ROUTE_METRIC);
 
-    Ok((dst_ip, dst_prefix, gateway, metric))
+    let mtu = map.get("mtu").and_then(|v| v.as_u64()).map(|m| m as u32);
+    let table = map.get("table").and_then(|v| v.as_u64()).map(|t| t as u32);
+    let tos = map.get("tos").and_then(|v| v.as_u64()).map(|t| t as u8).unwrap_or(0);
+
+    Ok(RouteFields { dst_ip, dst_prefix, gateway, metric, mtu, table, tos })
 }
 
 // ── Dry-run helpers ───────────────────────────────────────────────────────────
@@ -1364,12 +1403,15 @@ mod tests {
             Value::String("10.99.0.1".to_string()),
         );
 
-        let (dst, prefix, gw, metric) = extract_route_fields(&map).expect("valid route map must parse");
-        assert_eq!(dst.to_string(), "10.100.0.0");
-        assert_eq!(prefix, 24);
-        let gw = gw.expect("gateway must be Some");
+        let rf = extract_route_fields(&map).expect("valid route map must parse");
+        assert_eq!(rf.dst_ip.to_string(), "10.100.0.0");
+        assert_eq!(rf.dst_prefix, 24);
+        let gw = rf.gateway.expect("gateway must be Some");
         assert_eq!(gw.to_string(), "10.99.0.1");
-        assert_eq!(metric, DEFAULT_ROUTE_METRIC, "metric must default to DEFAULT_ROUTE_METRIC when absent");
+        assert_eq!(rf.metric, DEFAULT_ROUTE_METRIC, "metric must default to DEFAULT_ROUTE_METRIC when absent");
+        assert_eq!(rf.mtu, None);
+        assert_eq!(rf.table, None);
+        assert_eq!(rf.tos, 0);
     }
 
     /// Route map without a gateway must parse with gateway == None.
@@ -1381,10 +1423,9 @@ mod tests {
             Value::String("10.100.0.0/24".to_string()),
         );
 
-        let (_, _, gw, metric) =
-            extract_route_fields(&map).expect("route without gateway must parse");
-        assert!(gw.is_none(), "gateway must be None when absent from map");
-        assert_eq!(metric, DEFAULT_ROUTE_METRIC);
+        let rf = extract_route_fields(&map).expect("route without gateway must parse");
+        assert!(rf.gateway.is_none(), "gateway must be None when absent from map");
+        assert_eq!(rf.metric, DEFAULT_ROUTE_METRIC);
     }
 
     /// Route map with default destination 0.0.0.0/0 and gateway must parse.
@@ -1400,11 +1441,10 @@ mod tests {
             Value::String("10.0.0.1".to_string()),
         );
 
-        let (dst, prefix, gw, _metric) =
-            extract_route_fields(&map).expect("default route map must parse");
-        assert!(dst.is_unspecified());
-        assert_eq!(prefix, 0);
-        assert!(gw.is_some());
+        let rf = extract_route_fields(&map).expect("default route map must parse");
+        assert!(rf.dst_ip.is_unspecified());
+        assert_eq!(rf.dst_prefix, 0);
+        assert!(rf.gateway.is_some());
     }
 
     /// Missing destination field must return an error.
@@ -1443,9 +1483,8 @@ mod tests {
         );
         map.insert("metric".to_string(), Value::U64(200));
 
-        let (_, _, _, metric) =
-            extract_route_fields(&map).expect("route with explicit metric must parse");
-        assert_eq!(metric, 200, "explicit metric must be returned");
+        let rf = extract_route_fields(&map).expect("route with explicit metric must parse");
+        assert_eq!(rf.metric, 200, "explicit metric must be returned");
     }
 
     /// Invalid gateway IP must return an error.
@@ -1463,6 +1502,32 @@ mod tests {
 
         let result = extract_route_fields(&map);
         assert!(result.is_err(), "Invalid gateway IP must return error");
+    }
+
+    /// Route with mtu, table, and tos extracts all fields correctly.
+    #[test]
+    fn test_extract_route_fields_with_mtu_table_tos() {
+        let mut map = IndexMap::new();
+        map.insert("destination".to_string(), Value::String("10.0.0.0/8".to_string()));
+        map.insert("metric".to_string(), Value::U64(100));
+        map.insert("mtu".to_string(), Value::U64(1400));
+        map.insert("table".to_string(), Value::U64(200));
+        map.insert("tos".to_string(), Value::U64(16));
+
+        let rf = extract_route_fields(&map).expect("route with mtu/table/tos must parse");
+        assert_eq!(rf.mtu, Some(1400));
+        assert_eq!(rf.table, Some(200));
+        assert_eq!(rf.tos, 16);
+    }
+
+    /// Link-local IPv6 addresses are detected correctly.
+    #[test]
+    fn test_is_link_local() {
+        assert!(is_link_local("fe80::1/64"));
+        assert!(is_link_local("fe80::dead:beef/128"));
+        assert!(!is_link_local("fd00::1/64"));
+        assert!(!is_link_local("10.0.1.1/24"));
+        assert!(!is_link_local("::1/128"));
     }
 
     // ── build_planned_changes ─────────────────────────────────────────────────
@@ -1661,8 +1726,7 @@ mod tests {
     #[test]
     fn test_value_to_str_ipaddr_variant_returns_dotted_decimal() {
         use std::net::Ipv4Addr;
-        // Value::IpAddr(Ipv4Addr) is what From<Ipv4Addr> for Value creates.
-        let v = Value::IpAddr(Ipv4Addr::new(10, 0, 1, 50));
+        let v = Value::IpAddr(std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 1, 50)));
         assert_eq!(
             value_to_str(&v),
             Some("10.0.1.50".to_string()),
@@ -1757,8 +1821,7 @@ mod tests {
 
     #[test]
     fn test_addr_to_cidr_from_ip_addr() {
-        let ip = std::net::Ipv4Addr::new(10, 0, 1, 1);
-        let v = Value::IpAddr(ip);
+        let v = Value::IpAddr(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1)));
         assert_eq!(addr_to_cidr(&v), Some("10.0.1.1".to_string()));
     }
 

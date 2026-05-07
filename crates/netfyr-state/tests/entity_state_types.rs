@@ -111,7 +111,7 @@ fn test_state_priority() {
 #[test]
 fn test_state_serde_round_trip() {
     // Build a richly-populated State with various Value types
-    let net: ipnetwork::Ipv4Network = "10.0.1.0/24".parse().unwrap();
+    let net: ipnetwork::IpNetwork = "10.0.1.0/24".parse().unwrap();
 
     let mut addresses_map = IndexMap::new();
     addresses_map.insert("prefix".to_string(), Value::IpNetwork(net));
@@ -337,8 +337,7 @@ fn test_selector_default_has_no_name() {
 /// before trying IpNetwork.
 #[test]
 fn test_value_ip_addr_json_round_trip() {
-    use std::net::Ipv4Addr;
-    let ip = Ipv4Addr::new(10, 0, 1, 1);
+    let ip: std::net::IpAddr = std::net::Ipv4Addr::new(10, 0, 1, 1).into();
     let original = Value::IpAddr(ip);
 
     let json = serde_json::to_string(&original).expect("serialize");

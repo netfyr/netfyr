@@ -258,13 +258,42 @@ Maximum transmission unit in bytes.
 Valid range: 68\(en65535.
 .TP
 .B addresses
-(sequence of strings)
-IPv4 addresses assigned to the interface, in CIDR notation
-(e.g.,
-.BR 10.0.1.50/24 ).
+(sequence of strings or mappings)
+IP addresses assigned to the interface, in CIDR notation.
+Both IPv4 (e.g.,
+.BR 10.0.1.50/24 )
+and IPv6 (e.g.,
+.BR fd00::1/64 )
+are supported.
 Order is preserved: the first address becomes the primary (source) address.
 Duplicate addresses are rejected.
-IPv6 is not supported.
+.RS
+.PP
+Each item can be a plain string or a mapping with lifetime attributes:
+.TP
+.B address
+(string, required)
+The IP address in CIDR notation.
+.TP
+.B valid_lft
+(integer, optional)
+Valid lifetime in seconds.
+.TP
+.B preferred_lft
+(integer, optional)
+Preferred lifetime in seconds.
+.RE
+.IP
+Example:
+.RS 4
+.nf
+addresses:
+  \- 10.0.1.50/24
+  \- address: fd00::1/64
+    valid_lft: 3600
+    preferred_lft: 1800
+.fi
+.RE
 .TP
 .B routes
 (sequence of mappings)
@@ -275,16 +304,34 @@ Each route mapping supports the following keys:
 .B destination
 (string, required)
 Route destination in CIDR notation (e.g.,
-.BR 0.0.0.0/0 ).
+.BR 0.0.0.0/0
+or
+.BR ::/0 ).
 .TP
 .B gateway
 (string, optional)
 Next-hop IP address (e.g.,
-.BR 10.0.1.1 ).
+.BR 10.0.1.1
+or
+.BR fe80::1 ).
 .TP
 .B metric
 (integer, optional)
 Route metric (lower values are preferred).
+.TP
+.B mtu
+(integer, optional)
+Route MTU in bytes.
+.TP
+.B table
+(integer, optional)
+Routing table ID.
+Default is 254 (main table).
+.TP
+.B tos
+(integer, optional)
+Type of Service (TOS/DSCP) filter.
+Valid range: 0\(en255.
 .RE
 .TP
 .B state
@@ -308,23 +355,21 @@ netfyr
 netfyr
 .B I64
 .TP
-.B "YAML string (valid IPv4 address)"
+.B "YAML string (valid IP address)"
 netfyr
 .B IpAddr
 (e.g.,
-.BR 10.0.0.1 )
+.BR 10.0.0.1
+or
+.BR fd00::1 )
 .TP
-.B "YAML string (valid IPv4 CIDR prefix)"
+.B "YAML string (valid CIDR prefix)"
 netfyr
 .B IpNetwork
 (e.g.,
-.BR 10.0.0.0/24 )
-.PP
-IPv6 addresses are not supported.
-Strings containing IPv6 addresses (e.g.,
-.BR fe80::1 )
-are treated as plain strings and will fail schema validation if used in
-address fields.
+.BR 10.0.0.0/24
+or
+.BR fd00::/64 )
 .TP
 .B "YAML string (other)"
 netfyr
