@@ -23,7 +23,8 @@
     "enabled": {
       "type": "boolean",
       "description": "Whether the interface is administratively enabled",
-      "x-netfyr-writable": true
+      "x-netfyr-writable": true,
+      "x-netfyr-keep-when-absent": true
     },
     "mtu": {
       "type": "integer",

@@ -10,6 +10,7 @@
 //! - Error:    `{"error": "io.netfyr.ErrorName", "parameters": {"reason": "..."}}\0`
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
@@ -697,10 +698,23 @@ async fn handle_get_show_info(
                                     FieldChangeKind::Set {
                                         current: Some(old),
                                         desired,
-                                    } => format!(
-                                        "expected {}, actual {}",
-                                        desired.value, old.value
-                                    ),
+                                    } => {
+                                        if fc.field_name == "addresses" {
+                                            let filtered = filter_link_local_addresses(old);
+                                            if filtered.value == desired.value {
+                                                return None;
+                                            }
+                                            format!(
+                                                "expected {}, actual {}",
+                                                desired.value, filtered.value
+                                            )
+                                        } else {
+                                            format!(
+                                                "expected {}, actual {}",
+                                                desired.value, old.value
+                                            )
+                                        }
+                                    }
                                     FieldChangeKind::Set {
                                         current: None,
                                         desired,
@@ -750,6 +764,47 @@ async fn handle_get_show_info(
     };
 
     write_success(stream, serde_json::json!({ "info": show_info })).await
+}
+
+fn is_link_local(cidr: &str) -> bool {
+    cidr.split_once('/')
+        .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
+        .map(|ip| match ip {
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+fn is_link_local_value(v: &netfyr_state::Value) -> bool {
+    match v {
+        netfyr_state::Value::String(s) => is_link_local(s),
+        netfyr_state::Value::IpNetwork(net) => match net.ip() {
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+            _ => false,
+        },
+        netfyr_state::Value::Map(m) => m
+            .get("address")
+            .map(|v| is_link_local_value(v))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn filter_link_local_addresses(fv: &netfyr_state::FieldValue) -> netfyr_state::FieldValue {
+    if let netfyr_state::Value::List(items) = &fv.value {
+        let filtered: Vec<netfyr_state::Value> = items
+            .iter()
+            .filter(|v| !is_link_local_value(v))
+            .cloned()
+            .collect();
+        netfyr_state::FieldValue {
+            value: netfyr_state::Value::List(filtered),
+            provenance: fv.provenance.clone(),
+        }
+    } else {
+        fv.clone()
+    }
 }
 
 fn server_trigger_type_str(trigger: &netfyr_journal::Trigger) -> &'static str {
