@@ -2,7 +2,9 @@
 //!
 //! Implements the NUL-terminated JSON-over-UnixStream wire protocol used by
 //! `netfyr-varlink`. The server owns `PolicyStore`, `FactoryManager`, and
-//! `Reconciler` and processes requests sequentially (one connection at a time).
+//! `Reconciler` and handles multiple client connections concurrently by
+//! spawning a task per connection. Shared mutable state is protected by
+//! `Arc<tokio::sync::Mutex<DaemonState>>`.
 //!
 //! # Protocol
 //! - Request:  `{"method": "io.netfyr.MethodName", "parameters": {...}}\0`
@@ -12,6 +14,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -27,6 +30,7 @@ use netfyr_varlink::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::SignalKind;
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::factory_manager::FactoryManager;
@@ -36,6 +40,23 @@ use crate::reconciler::Reconciler;
 
 /// Maximum message size accepted from clients (16 MiB).
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Mutable server state shared across concurrent connection tasks.
+struct DaemonState {
+    policy_store: PolicyStore,
+    factory_manager: FactoryManager,
+    managed_entities: HashSet<String>,
+}
+
+/// Events published on the broadcast channel after key state changes.
+/// Fields are read by future Monitor subscribers.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum DaemonEvent {
+    PolicyChanged,
+    DhcpEvent { interface: String, kind: String },
+    ExternalChange { interfaces: Vec<String> },
+}
 
 /// Returns `true` if the given method+parameters combination requires root
 /// (uid 0). Write methods that mutate system state require root; read-only
@@ -122,9 +143,9 @@ async fn write_error(stream: &mut UnixStream, error_name: &str, reason: &str) ->
 async fn handle_submit_policies(
     stream: &mut UnixStream,
     params: &serde_json::Value,
-    policy_store: &mut PolicyStore,
-    factory_manager: &mut FactoryManager,
+    state: &tokio::sync::Mutex<DaemonState>,
     reconciler: &Reconciler,
+    event_tx: &broadcast::Sender<DaemonEvent>,
 ) -> Result<()> {
     // Parse policies from parameters.
     let varlink_policies: Vec<VarlinkPolicy> = match params.get("policies") {
@@ -147,46 +168,53 @@ async fn handle_submit_policies(
         }
     }
 
-    // Replace all policies in the store.
-    if let Err(e) = policy_store.replace_all(policies) {
-        error!("Failed to persist policies: {}", e);
-        return write_error(stream, "InternalError", &e.to_string()).await;
-    }
+    let varlink_report = {
+        let mut guard = state.lock().await;
 
-    // Sync factories (stop removed, start new).
-    match factory_manager.sync(policy_store.policies()).await {
-        Ok(failed) if !failed.is_empty() => {
-            warn!(failed = ?failed, "Some factories failed to start");
-        }
-        Err(e) => {
-            error!("Factory sync error: {}", e);
-        }
-        _ => {}
-    }
-
-    // Reconcile and apply. Flag is set so the netlink monitor discards
-    // self-generated notifications produced by this apply.
-    reconciler.set_applying(true);
-    let apply_result = match reconciler
-        .reconcile_and_apply(
-            policy_store,
-            factory_manager,
-            Trigger::PolicyApply { source: "daemon".into() },
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            reconciler.set_applying(false);
-            error!("Reconciliation failed: {}", e);
+        // Replace all policies in the store.
+        if let Err(e) = guard.policy_store.replace_all(policies) {
+            error!("Failed to persist policies: {}", e);
             return write_error(stream, "InternalError", &e.to_string()).await;
         }
+
+        // Sync factories (stop removed, start new).
+        let current_policies = guard.policy_store.policies().to_vec();
+        match guard.factory_manager.sync(&current_policies).await {
+            Ok(failed) if !failed.is_empty() => {
+                warn!(failed = ?failed, "Some factories failed to start");
+            }
+            Err(e) => {
+                error!("Factory sync error: {}", e);
+            }
+            _ => {}
+        }
+
+        // Reconcile and apply.
+        reconciler.set_applying(true);
+        let apply_result = match reconciler
+            .reconcile_and_apply(
+                &guard.policy_store,
+                &guard.factory_manager,
+                Trigger::PolicyApply { source: "daemon".into() },
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                reconciler.set_applying(false);
+                error!("Reconciliation failed: {}", e);
+                return write_error(stream, "InternalError", &e.to_string()).await;
+            }
+        };
+        reconciler.set_applying(false);
+
+        guard.managed_entities =
+            reconciler.managed_entity_names(&guard.policy_store, &guard.factory_manager);
+
+        convert_apply_report_with_conflicts(apply_result.report, &apply_result.conflicts)
     };
-    reconciler.set_applying(false);
 
-    let varlink_report =
-        convert_apply_report_with_conflicts(apply_result.report, &apply_result.conflicts);
-
+    event_tx.send(DaemonEvent::PolicyChanged).ok();
     write_success(stream, serde_json::json!({ "report": varlink_report })).await
 }
 
@@ -236,7 +264,7 @@ async fn handle_query(
 async fn handle_dry_run(
     stream: &mut UnixStream,
     params: &serde_json::Value,
-    factory_manager: &FactoryManager,
+    state: &tokio::sync::Mutex<DaemonState>,
     reconciler: &Reconciler,
 ) -> Result<()> {
     let varlink_policies: Vec<VarlinkPolicy> = match params.get("policies") {
@@ -261,16 +289,18 @@ async fn handle_dry_run(
     // Use an ephemeral store for the dry-run — don't touch the real policy store.
     let temp_store = PolicyStore::ephemeral(policies);
 
-    let (reconcile_diff, _conflicts) =
-        match reconciler.dry_run(&temp_store, factory_manager).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Dry-run failed: {}", e);
-                return write_error(stream, "InternalError", &e.to_string()).await;
-            }
-        };
-
-    let varlink_diff = VarlinkStateDiff::from(reconcile_diff);
+    let varlink_diff = {
+        let guard = state.lock().await;
+        let (reconcile_diff, _conflicts) =
+            match reconciler.dry_run(&temp_store, &guard.factory_manager).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Dry-run failed: {}", e);
+                    return write_error(stream, "InternalError", &e.to_string()).await;
+                }
+            };
+        VarlinkStateDiff::from(reconcile_diff)
+    };
 
     write_success(stream, serde_json::json!({ "diff": varlink_diff })).await
 }
@@ -278,32 +308,35 @@ async fn handle_dry_run(
 /// `io.netfyr.GetStatus` — return daemon status.
 async fn handle_get_status(
     stream: &mut UnixStream,
-    policy_store: &PolicyStore,
-    factory_manager: &FactoryManager,
+    state: &tokio::sync::Mutex<DaemonState>,
     start_time: Instant,
 ) -> Result<()> {
-    let uptime_seconds = start_time.elapsed().as_secs() as i64;
-    let active_policies = policy_store.len() as i64;
+    let status = {
+        let guard = state.lock().await;
+        let uptime_seconds = start_time.elapsed().as_secs() as i64;
+        let active_policies = guard.policy_store.len() as i64;
 
-    let running_factories: Vec<VarlinkFactoryStatus> = factory_manager
-        .factory_statuses()
-        .into_iter()
-        .map(|fs| VarlinkFactoryStatus {
-            policy_id: fs.policy_name,
-            factory_type: "dhcpv4".to_string(),
-            interface_name: fs.interface,
-            state: if fs.has_lease { "running" } else { "waiting" }.to_string(),
-            lease_ip: fs.lease_ip,
-            lease_address: fs.lease_address,
-            lease_time_secs: fs.lease_time_secs.map(|v| v as i64),
-            lease_remaining_secs: fs.lease_remaining_secs.map(|v| v as i64),
-        })
-        .collect();
+        let running_factories: Vec<VarlinkFactoryStatus> = guard
+            .factory_manager
+            .factory_statuses()
+            .into_iter()
+            .map(|fs| VarlinkFactoryStatus {
+                policy_id: fs.policy_name,
+                factory_type: "dhcpv4".to_string(),
+                interface_name: fs.interface,
+                state: if fs.has_lease { "running" } else { "waiting" }.to_string(),
+                lease_ip: fs.lease_ip,
+                lease_address: fs.lease_address,
+                lease_time_secs: fs.lease_time_secs.map(|v| v as i64),
+                lease_remaining_secs: fs.lease_remaining_secs.map(|v| v as i64),
+            })
+            .collect();
 
-    let status = VarlinkDaemonStatus {
-        uptime_seconds,
-        active_policies,
-        running_factories,
+        VarlinkDaemonStatus {
+            uptime_seconds,
+            active_policies,
+            running_factories,
+        }
     };
 
     write_success(stream, serde_json::json!({ "status": status })).await
@@ -426,7 +459,7 @@ async fn handle_get_journal_entry(
 async fn handle_revert(
     stream: &mut UnixStream,
     params: &serde_json::Value,
-    policy_store: &PolicyStore,
+    state: &tokio::sync::Mutex<DaemonState>,
     reconciler: &Reconciler,
 ) -> Result<()> {
     let target_seq = match params.get("target_seq").and_then(|v| v.as_u64()) {
@@ -476,8 +509,13 @@ async fn handle_revert(
         }
     };
 
+    let policies = {
+        let guard = state.lock().await;
+        guard.policy_store.policies().to_vec()
+    };
+
     let result = match reconciler
-        .revert(&target_state, target_seq, policy_store.policies(), dry_run)
+        .revert(&target_state, target_seq, &policies, dry_run)
         .await
     {
         Ok(r) => r,
@@ -554,8 +592,7 @@ async fn handle_revert(
 /// `io.netfyr.GetShowInfo` — return interface-centric system overview.
 async fn handle_get_show_info(
     stream: &mut UnixStream,
-    policy_store: &PolicyStore,
-    factory_manager: &FactoryManager,
+    state: &tokio::sync::Mutex<DaemonState>,
     reconciler: &Reconciler,
     start_time: Instant,
 ) -> Result<()> {
@@ -574,28 +611,37 @@ async fn handle_get_show_info(
         }
     };
 
-    // Compute drift: compare desired (from policies) against actual (from system).
-    let drift_diff = match reconciler.dry_run(policy_store, factory_manager).await {
-        Ok((diff, _conflicts)) => Some(diff),
-        Err(e) => {
-            warn!("GetShowInfo drift check failed, continuing without drift: {}", e);
-            None
-        }
-    };
+    let (drift_diff, policies, factory_by_iface) = {
+        let guard = state.lock().await;
 
-    // Index factory statuses by interface name for O(1) lookup.
-    let factory_by_iface: std::collections::HashMap<String, _> = factory_manager
-        .factory_statuses()
-        .into_iter()
-        .map(|fs| (fs.interface.clone(), fs))
-        .collect();
+        // Compute drift: compare desired (from policies) against actual (from system).
+        let drift = match reconciler.dry_run(&guard.policy_store, &guard.factory_manager).await {
+            Ok((diff, _conflicts)) => Some(diff),
+            Err(e) => {
+                warn!("GetShowInfo drift check failed, continuing without drift: {}", e);
+                None
+            }
+        };
+
+        let policies = guard.policy_store.policies().to_vec();
+
+        // Index factory statuses by interface name for O(1) lookup.
+        let factory_by_iface: std::collections::HashMap<String, _> = guard
+            .factory_manager
+            .factory_statuses()
+            .into_iter()
+            .map(|fs| (fs.interface.clone(), fs))
+            .collect();
+
+        (drift, policies, factory_by_iface)
+    };
 
     // Build per-interface info, deduplicating by name.
     let mut seen: HashSet<String> = HashSet::new();
     let mut interfaces: Vec<VarlinkInterfaceInfo> = Vec::new();
 
-    for state in state_set.iter() {
-        let name = match &state.selector.name {
+    for iface_state in state_set.iter() {
+        let name = match &iface_state.selector.name {
             Some(n) => n.clone(),
             None => continue,
         };
@@ -604,18 +650,18 @@ async fn handle_get_show_info(
             continue;
         }
 
-        let interface_selector = &state.selector;
+        let interface_selector = &iface_state.selector;
 
         // Extract link state fields from the backend query.
-        let enabled = state
+        let enabled = iface_state
             .fields
             .get("enabled")
             .and_then(|fv| fv.value.as_bool());
-        let carrier = state
+        let carrier = iface_state
             .fields
             .get("carrier")
             .and_then(|fv| fv.value.as_bool());
-        let addresses: Option<Vec<String>> = state
+        let addresses: Option<Vec<String>> = iface_state
             .fields
             .get("addresses")
             .and_then(|fv| fv.value.as_list())
@@ -623,8 +669,7 @@ async fn handle_get_show_info(
             .filter(|v: &Vec<String>| !v.is_empty());
 
         // Find policies that target this interface.
-        let matching_policies: Vec<VarlinkPolicyInfo> = policy_store
-            .policies()
+        let matching_policies: Vec<VarlinkPolicyInfo> = policies
             .iter()
             .filter_map(|policy| {
                 let matches = match policy.factory_type {
@@ -857,19 +902,16 @@ fn server_parse_since(s: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> 
 
 /// Handle all requests on a single connection until the client disconnects.
 ///
-/// Processes requests sequentially. On each request, reads a NUL-terminated
-/// JSON message, dispatches by `method`, and writes a response. Returns when
-/// the client closes the connection (EOF) or an I/O error occurs.
-///
-/// Note: While a connection is active, factory events queue in the mpsc
-/// channel and are processed after this function returns. This is acceptable
-/// because CLI connections are short-lived (typically one request).
+/// Processes requests sequentially within the connection. On each request,
+/// reads a NUL-terminated JSON message, dispatches by `method`, and writes
+/// a response. Returns when the client closes the connection (EOF) or an
+/// I/O error occurs.
 async fn handle_connection(
     stream: &mut UnixStream,
-    policy_store: &mut PolicyStore,
-    factory_manager: &mut FactoryManager,
+    state: &tokio::sync::Mutex<DaemonState>,
     reconciler: &Reconciler,
     start_time: Instant,
+    event_tx: &broadcast::Sender<DaemonEvent>,
 ) {
     loop {
         let msg = match read_message(stream).await {
@@ -934,29 +976,24 @@ async fn handle_connection(
         let result = match method.as_str() {
             "io.netfyr.SubmitPolicies" => {
                 handle_submit_policies(
-                    stream,
-                    &params,
-                    policy_store,
-                    factory_manager,
-                    reconciler,
+                    stream, &params, state, reconciler, event_tx,
                 )
                 .await
             }
             "io.netfyr.Query" => handle_query(stream, &params, reconciler).await,
             "io.netfyr.DryRun" => {
-                handle_dry_run(stream, &params, factory_manager, reconciler).await
+                handle_dry_run(stream, &params, state, reconciler).await
             }
             "io.netfyr.GetStatus" => {
-                handle_get_status(stream, policy_store, factory_manager, start_time).await
+                handle_get_status(stream, state, start_time).await
             }
             "io.netfyr.GetHistory" => handle_get_history(stream, &params).await,
             "io.netfyr.GetJournalEntry" => handle_get_journal_entry(stream, &params).await,
             "io.netfyr.Revert" => {
-                handle_revert(stream, &params, policy_store, reconciler).await
+                handle_revert(stream, &params, state, reconciler).await
             }
             "io.netfyr.GetShowInfo" => {
-                handle_get_show_info(stream, policy_store, factory_manager, reconciler, start_time)
-                    .await
+                handle_get_show_info(stream, state, reconciler, start_time).await
             }
             other => {
                 write_error(
@@ -980,7 +1017,7 @@ async fn handle_connection(
 /// Start the Varlink server and run the main event loop.
 ///
 /// Binds a `UnixListener` at `socket_path` and multiplexes five event sources:
-/// 1. Incoming Varlink connections — processed to completion before looping.
+/// 1. Incoming Varlink connections — each spawned as a concurrent task.
 /// 2. Factory events (DHCP lease changes) — trigger reconciliation.
 /// 3. SIGTERM signal — graceful shutdown.
 /// 4. SIGINT / Ctrl-C — graceful shutdown.
@@ -990,7 +1027,7 @@ async fn handle_connection(
 /// calls `factory_manager.stop_all()` before returning.
 pub async fn serve_varlink(
     socket_path: &str,
-    mut policy_store: PolicyStore,
+    policy_store: PolicyStore,
     mut factory_manager: FactoryManager,
     reconciler: Reconciler,
     start_time: Instant,
@@ -1023,10 +1060,21 @@ pub async fn serve_varlink(
         }
     };
 
-    // Track which entity names are covered by the current effective policy set.
-    // Only events for these entities are recorded as external changes.
-    let mut managed_entities: HashSet<String> =
+    // Extract the factory event receiver before wrapping FactoryManager in the
+    // mutex — we cannot hold the mutex across async recv() in the select loop.
+    let mut factory_event_rx = factory_manager.take_event_receiver();
+
+    let managed_entities =
         reconciler.managed_entity_names(&policy_store, &factory_manager);
+
+    let state = Arc::new(tokio::sync::Mutex::new(DaemonState {
+        policy_store,
+        factory_manager,
+        managed_entities,
+    }));
+
+    let reconciler = Arc::new(reconciler);
+    let (event_tx, _) = broadcast::channel::<DaemonEvent>(64);
 
     // Set up SIGTERM signal handler.
     let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
@@ -1038,17 +1086,19 @@ pub async fn serve_varlink(
                 match accept_result {
                     Ok((mut stream, _)) => {
                         debug!("Accepted Varlink connection");
-                        handle_connection(
-                            &mut stream,
-                            &mut policy_store,
-                            &mut factory_manager,
-                            &reconciler,
-                            start_time,
-                        )
-                        .await;
-                        // Refresh managed entities after potential SubmitPolicies.
-                        managed_entities =
-                            reconciler.managed_entity_names(&policy_store, &factory_manager);
+                        let conn_state = Arc::clone(&state);
+                        let conn_reconciler = Arc::clone(&reconciler);
+                        let conn_event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_connection(
+                                &mut stream,
+                                &conn_state,
+                                &conn_reconciler,
+                                start_time,
+                                &conn_event_tx,
+                            )
+                            .await;
+                        });
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);
@@ -1057,72 +1107,53 @@ pub async fn serve_varlink(
             }
 
             // ── Branch 2: factory event (DHCP lease change) ───────────────────
-            Some(event) = factory_manager.next_event() => {
-                match event {
-                    FactoryEvent::LeaseAcquired { ref policy_name, .. } => {
-                        info!(policy = %policy_name, "DHCP lease acquired; re-reconciling");
-                        reconciler.set_applying(true);
-                        if let Err(e) = reconciler
-                            .reconcile_and_apply(
-                                &policy_store,
-                                &factory_manager,
-                                Trigger::DhcpEvent {
-                                    policy_name: policy_name.to_string(),
-                                    event_kind: "lease_acquired".into(),
-                                },
-                            )
-                            .await
-                        {
-                            error!("Reconciliation after lease acquisition failed: {}", e);
-                        }
-                        reconciler.set_applying(false);
-                        managed_entities =
-                            reconciler.managed_entity_names(&policy_store, &factory_manager);
+            Some(event) = factory_event_rx.recv() => {
+                let (policy_name, event_kind, log_level) = match &event {
+                    FactoryEvent::LeaseAcquired { policy_name, .. } => {
+                        (policy_name.clone(), "lease_acquired", "info")
                     }
-                    FactoryEvent::LeaseRenewed { ref policy_name, .. } => {
-                        debug!(policy = %policy_name, "DHCP lease renewed; re-reconciling");
-                        reconciler.set_applying(true);
-                        if let Err(e) = reconciler
-                            .reconcile_and_apply(
-                                &policy_store,
-                                &factory_manager,
-                                Trigger::DhcpEvent {
-                                    policy_name: policy_name.to_string(),
-                                    event_kind: "lease_renewed".into(),
-                                },
-                            )
-                            .await
-                        {
-                            error!("Reconciliation after lease renewal failed: {}", e);
-                        }
-                        reconciler.set_applying(false);
-                        managed_entities =
-                            reconciler.managed_entity_names(&policy_store, &factory_manager);
+                    FactoryEvent::LeaseRenewed { policy_name, .. } => {
+                        (policy_name.clone(), "lease_renewed", "debug")
                     }
-                    FactoryEvent::LeaseExpired { ref policy_name } => {
-                        info!(policy = %policy_name, "DHCP lease expired; re-reconciling");
-                        reconciler.set_applying(true);
-                        if let Err(e) = reconciler
-                            .reconcile_and_apply(
-                                &policy_store,
-                                &factory_manager,
-                                Trigger::DhcpEvent {
-                                    policy_name: policy_name.to_string(),
-                                    event_kind: "lease_expired".into(),
-                                },
-                            )
-                            .await
-                        {
-                            error!("Reconciliation after lease expiry failed: {}", e);
-                        }
-                        reconciler.set_applying(false);
-                        managed_entities =
-                            reconciler.managed_entity_names(&policy_store, &factory_manager);
+                    FactoryEvent::LeaseExpired { policy_name } => {
+                        (policy_name.clone(), "lease_expired", "info")
                     }
-                    FactoryEvent::Error { ref policy_name, ref error } => {
+                    FactoryEvent::Error { policy_name, error } => {
                         warn!(policy = %policy_name, error = %error, "DHCP factory error");
+                        continue;
                     }
+                };
+                match log_level {
+                    "info" => info!(policy = %policy_name, "DHCP {event_kind}; re-reconciling"),
+                    _ => debug!(policy = %policy_name, "DHCP {event_kind}; re-reconciling"),
                 }
+                let interface = {
+                    let mut guard = state.lock().await;
+                    reconciler.set_applying(true);
+                    if let Err(e) = reconciler
+                        .reconcile_and_apply(
+                            &guard.policy_store,
+                            &guard.factory_manager,
+                            Trigger::DhcpEvent {
+                                policy_name: policy_name.clone(),
+                                event_kind: event_kind.into(),
+                            },
+                        )
+                        .await
+                    {
+                        error!("Reconciliation after {event_kind} failed: {}", e);
+                    }
+                    reconciler.set_applying(false);
+                    guard.managed_entities =
+                        reconciler.managed_entity_names(&guard.policy_store, &guard.factory_manager);
+                    policy_name.clone()
+                };
+                event_tx
+                    .send(DaemonEvent::DhcpEvent {
+                        interface,
+                        kind: event_kind.into(),
+                    })
+                    .ok();
             }
 
             // ── Branch 3: SIGTERM ─────────────────────────────────────────────
@@ -1149,6 +1180,12 @@ pub async fn serve_varlink(
                         let count = changes.len();
                         debug!(count, "discarding netlink events during self-apply");
                     } else {
+                        let (managed, policies) = {
+                            let guard = state.lock().await;
+                            (guard.managed_entities.clone(),
+                             guard.policy_store.policies().to_vec())
+                        };
+                        let policy_store_ref = PolicyStore::ephemeral(policies);
                         let mut changed_names: Vec<String> = Vec::new();
                         let mut seen: HashSet<String> = HashSet::new();
                         for change in changes {
@@ -1160,24 +1197,28 @@ pub async fn serve_varlink(
                                     continue;
                                 }
                             };
-                            if !managed_entities.contains(&ifname) {
+                            if !managed.contains(&ifname) {
                                 debug!(%ifname, "dropping change: interface not managed");
                                 continue;
                             }
                             if seen.insert(ifname.clone()) {
-                                changed_names.push(ifname);
+                                changed_names.push(ifname.clone());
                             }
                         }
                         if changed_names.is_empty() {
                             debug!("all netlink changes filtered, no journal entry");
                         } else {
+                            let ifaces = changed_names.clone();
                             debug!(?changed_names, "recording external changes");
                             if let Err(e) = reconciler
-                                .record_external_change(changed_names, &policy_store)
+                                .record_external_change(changed_names, &policy_store_ref)
                                 .await
                             {
                                 error!("Failed to record external change: {}", e);
                             }
+                            event_tx
+                                .send(DaemonEvent::ExternalChange { interfaces: ifaces })
+                                .ok();
                         }
                     }
                 }
@@ -1191,8 +1232,11 @@ pub async fn serve_varlink(
     }
 
     info!("Releasing DHCP leases...");
-    if let Err(e) = factory_manager.stop_all().await {
-        error!("Error during factory shutdown: {}", e);
+    {
+        let mut guard = state.lock().await;
+        if let Err(e) = guard.factory_manager.stop_all().await {
+            error!("Error during factory shutdown: {}", e);
+        }
     }
 
     // Remove socket file so systemd socket activation can rebind cleanly.
@@ -1220,6 +1264,23 @@ mod tests {
     /// Create a pair of connected Unix stream sockets for testing.
     async fn make_stream_pair() -> (UnixStream, UnixStream) {
         UnixStream::pair().unwrap()
+    }
+
+    /// Wrap a PolicyStore and FactoryManager in a test DaemonState mutex.
+    fn make_test_state(
+        policy_store: PolicyStore,
+        factory_manager: FactoryManager,
+    ) -> tokio::sync::Mutex<DaemonState> {
+        tokio::sync::Mutex::new(DaemonState {
+            policy_store,
+            factory_manager,
+            managed_entities: HashSet::new(),
+        })
+    }
+
+    /// Create a broadcast sender for tests.
+    fn make_test_event_tx() -> broadcast::Sender<DaemonEvent> {
+        broadcast::channel(16).0
     }
 
     /// Build a minimal static policy for use in tests.
@@ -1352,11 +1413,10 @@ mod tests {
             make_test_policy("policy-b"),
             make_test_policy("policy-c"),
         ];
-        let policy_store = PolicyStore::ephemeral(policies);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(policies), FactoryManager::new());
         let start_time = Instant::now();
 
-        handle_get_status(&mut server, &policy_store, &factory_manager, start_time)
+        handle_get_status(&mut server, &state, start_time)
             .await
             .unwrap();
 
@@ -1375,11 +1435,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_status_returns_empty_running_factories_list() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let start_time = Instant::now();
 
-        handle_get_status(&mut server, &policy_store, &factory_manager, start_time)
+        handle_get_status(&mut server, &state, start_time)
             .await
             .unwrap();
 
@@ -1397,11 +1456,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_status_uptime_seconds_is_non_negative() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let start_time = Instant::now();
 
-        handle_get_status(&mut server, &policy_store, &factory_manager, start_time)
+        handle_get_status(&mut server, &state, start_time)
             .await
             .unwrap();
 
@@ -1416,11 +1474,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_status_response_has_no_error_field() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let start_time = Instant::now();
 
-        handle_get_status(&mut server, &policy_store, &factory_manager, start_time)
+        handle_get_status(&mut server, &state, start_time)
             .await
             .unwrap();
 
@@ -1437,13 +1494,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_dry_run_with_empty_policies_returns_success() {
         let (mut server, mut client) = make_stream_pair().await;
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_dry_run(
             &mut server,
             &serde_json::json!({"policies": []}),
-            &factory_manager,
+            &state,
             &reconciler,
         )
         .await
@@ -1461,13 +1518,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_dry_run_response_has_diff_field_in_parameters() {
         let (mut server, mut client) = make_stream_pair().await;
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_dry_run(
             &mut server,
             &serde_json::json!({"policies": []}),
-            &factory_manager,
+            &state,
             &reconciler,
         )
         .await
@@ -1485,13 +1542,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_dry_run_with_missing_policies_parameter_returns_error() {
         let (mut server, mut client) = make_stream_pair().await;
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_dry_run(
             &mut server,
             &serde_json::json!({}), // no 'policies' key
-            &factory_manager,
+            &state,
             &reconciler,
         )
         .await
@@ -1578,16 +1635,16 @@ mod tests {
     #[tokio::test]
     async fn test_handle_submit_policies_with_empty_list_returns_success() {
         let (mut server, mut client) = make_stream_pair().await;
-        let mut policy_store = PolicyStore::ephemeral(vec![]);
-        let mut factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
 
         handle_submit_policies(
             &mut server,
             &serde_json::json!({"policies": []}),
-            &mut policy_store,
-            &mut factory_manager,
+            &state,
             &reconciler,
+            &event_tx,
         )
         .await
         .unwrap();
@@ -1604,16 +1661,16 @@ mod tests {
     #[tokio::test]
     async fn test_handle_submit_policies_response_has_report_field() {
         let (mut server, mut client) = make_stream_pair().await;
-        let mut policy_store = PolicyStore::ephemeral(vec![]);
-        let mut factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
 
         handle_submit_policies(
             &mut server,
             &serde_json::json!({"policies": []}),
-            &mut policy_store,
-            &mut factory_manager,
+            &state,
             &reconciler,
+            &event_tx,
         )
         .await
         .unwrap();
@@ -1631,24 +1688,28 @@ mod tests {
     async fn test_handle_submit_policies_replaces_policy_store_with_new_set() {
         let (mut server, mut client) = make_stream_pair().await;
         // Pre-populate with one policy.
-        let mut policy_store = PolicyStore::ephemeral(vec![make_test_policy("old-policy")]);
-        let mut factory_manager = FactoryManager::new();
+        let state = make_test_state(
+            PolicyStore::ephemeral(vec![make_test_policy("old-policy")]),
+            FactoryManager::new(),
+        );
         let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
 
         // Submit empty list — old-policy must be replaced with nothing.
         handle_submit_policies(
             &mut server,
             &serde_json::json!({"policies": []}),
-            &mut policy_store,
-            &mut factory_manager,
+            &state,
             &reconciler,
+            &event_tx,
         )
         .await
         .unwrap();
 
         let _msg = read_message(&mut client).await.unwrap();
+        let guard = state.lock().await;
         assert!(
-            policy_store.is_empty(),
+            guard.policy_store.is_empty(),
             "policy store must be empty after submit with empty policy list (replace-all semantics)"
         );
     }
@@ -1657,16 +1718,16 @@ mod tests {
     #[tokio::test]
     async fn test_handle_submit_policies_with_missing_policies_field_returns_error() {
         let (mut server, mut client) = make_stream_pair().await;
-        let mut policy_store = PolicyStore::ephemeral(vec![]);
-        let mut factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
 
         handle_submit_policies(
             &mut server,
             &serde_json::json!({}), // missing 'policies' key
-            &mut policy_store,
-            &mut factory_manager,
+            &state,
             &reconciler,
+            &event_tx,
         )
         .await
         .unwrap();
@@ -1807,20 +1868,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_show_info_daemon_status_is_running() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
         let start_time = Instant::now();
 
-        handle_get_show_info(
-            &mut server,
-            &policy_store,
-            &factory_manager,
-            &reconciler,
-            start_time,
-        )
-        .await
-        .unwrap();
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
 
         let msg = read_message(&mut client).await.unwrap();
         assert!(
@@ -1837,20 +1891,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_show_info_daemon_uptime_seconds_is_present() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
         let start_time = Instant::now();
 
-        handle_get_show_info(
-            &mut server,
-            &policy_store,
-            &factory_manager,
-            &reconciler,
-            start_time,
-        )
-        .await
-        .unwrap();
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
 
         let msg = read_message(&mut client).await.unwrap();
         let uptime = &msg["parameters"]["info"]["daemon"]["uptime_seconds"];
@@ -1868,20 +1915,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_show_info_interfaces_is_array() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
         let start_time = Instant::now();
 
-        handle_get_show_info(
-            &mut server,
-            &policy_store,
-            &factory_manager,
-            &reconciler,
-            start_time,
-        )
-        .await
-        .unwrap();
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
 
         let msg = read_message(&mut client).await.unwrap();
         assert!(
@@ -1894,20 +1934,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_get_show_info_response_has_no_error_field() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
         let start_time = Instant::now();
 
-        handle_get_show_info(
-            &mut server,
-            &policy_store,
-            &factory_manager,
-            &reconciler,
-            start_time,
-        )
-        .await
-        .unwrap();
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
 
         let msg = read_message(&mut client).await.unwrap();
         assert!(
@@ -1923,20 +1956,13 @@ mod tests {
     async fn test_handle_get_show_info_policies_appear_in_matching_interface() {
         let (mut server, mut client) = make_stream_pair().await;
         let lo_policy = make_test_policy("lo-policy");
-        let policy_store = PolicyStore::ephemeral(vec![lo_policy]);
-        let factory_manager = FactoryManager::new();
+        let state = make_test_state(PolicyStore::ephemeral(vec![lo_policy]), FactoryManager::new());
         let reconciler = Reconciler::new();
         let start_time = Instant::now();
 
-        handle_get_show_info(
-            &mut server,
-            &policy_store,
-            &factory_manager,
-            &reconciler,
-            start_time,
-        )
-        .await
-        .unwrap();
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
 
         let msg = read_message(&mut client).await.unwrap();
         assert!(
@@ -1956,10 +1982,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_revert_missing_target_seq_returns_internal_error() {
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
-        handle_revert(&mut server, &serde_json::json!({}), &policy_store, &reconciler)
+        handle_revert(&mut server, &serde_json::json!({}), &state, &reconciler)
             .await
             .unwrap();
 
@@ -1993,13 +2019,13 @@ mod tests {
         unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
 
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_revert(
             &mut server,
             &serde_json::json!({"target_seq": 9999u64}),
-            &policy_store,
+            &state,
             &reconciler,
         )
         .await
@@ -2037,13 +2063,13 @@ mod tests {
         unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
 
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_revert(
             &mut server,
             &serde_json::json!({"target_seq": 1u64, "dry_run": true}),
-            &policy_store,
+            &state,
             &reconciler,
         )
         .await
@@ -2080,13 +2106,13 @@ mod tests {
         unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
 
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_revert(
             &mut server,
             &serde_json::json!({"target_seq": 1u64, "dry_run": true}),
-            &policy_store,
+            &state,
             &reconciler,
         )
         .await
@@ -2121,13 +2147,13 @@ mod tests {
         unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.path().to_str().unwrap()) };
 
         let (mut server, mut client) = make_stream_pair().await;
-        let policy_store = PolicyStore::ephemeral(vec![]);
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
         let reconciler = Reconciler::new();
 
         handle_revert(
             &mut server,
             &serde_json::json!({"target_seq": 1u64, "dry_run": true}),
-            &policy_store,
+            &state,
             &reconciler,
         )
         .await
@@ -2152,20 +2178,17 @@ mod tests {
         bytes.push(0u8);
         client.write_all(&bytes).await.unwrap();
 
-        // Read the error response from server
-        let _policy_store = PolicyStore::ephemeral(vec![]);
-        let _factory_manager = FactoryManager::new();
-        let _reconciler = Reconciler::new();
-        let _start_time = Instant::now();
-
         // Run handle_connection in a background task
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
+        let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
         let server_task = tokio::spawn(async move {
             handle_connection(
                 &mut server,
-                &mut PolicyStore::ephemeral(vec![]),
-                &mut FactoryManager::new(),
-                &Reconciler::new(),
+                &state,
+                &reconciler,
                 Instant::now(),
+                &event_tx,
             )
             .await;
         });

@@ -192,10 +192,14 @@ impl FactoryManager {
         Ok(())
     }
 
-    /// Receive the next factory event (lease acquired, renewed, expired, or
-    /// error). Returns `None` when all senders have been dropped (shutdown).
-    pub async fn next_event(&mut self) -> Option<FactoryEvent> {
-        self.event_rx.recv().await
+    /// Extract the factory event receiver for use in the main event loop.
+    ///
+    /// Must be called once before wrapping `FactoryManager` in a mutex,
+    /// because the receiver cannot be polled while the mutex is held across
+    /// an async `.recv().await`.
+    pub fn take_event_receiver(&mut self) -> mpsc::Receiver<FactoryEvent> {
+        let (_, placeholder) = mpsc::channel(1);
+        std::mem::replace(&mut self.event_rx, placeholder)
     }
 
     /// Returns status information for each running factory, for `GetStatus`.
