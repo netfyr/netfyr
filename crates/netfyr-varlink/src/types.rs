@@ -552,6 +552,12 @@ pub struct VarlinkDaemonInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VarlinkInterfaceInfo {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addresses: Option<Vec<String>>,
     /// Absent when in daemon-free mode (CLI fabricates locally).
     /// Present but possibly empty when the daemon has policy data.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -559,6 +565,19 @@ pub struct VarlinkInterfaceInfo {
     /// Present only for interfaces with a DHCP factory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dhcp: Option<VarlinkDhcpInfo>,
+    /// `"applied"` or `"drifted"` — only present for managed interfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_state: Option<String>,
+    /// Per-field drift details — only present when `config_state` is `"drifted"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_drift: Option<Vec<VarlinkDriftEntry>>,
+}
+
+/// Wire-format drift entry describing a single field mismatch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VarlinkDriftEntry {
+    pub field_name: String,
+    pub description: String,
 }
 
 /// Wire-format policy reference within `InterfaceInfo`.

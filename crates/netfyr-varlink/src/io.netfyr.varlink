@@ -113,8 +113,18 @@ type DaemonInfo (
 
 type InterfaceInfo (
     name: string,
+    enabled: ?bool,
+    carrier: ?bool,
+    addresses: ?[]string,
     policies: ?[]PolicyInfo,
-    dhcp: ?DhcpInfo
+    dhcp: ?DhcpInfo,
+    config_state: ?string,
+    config_drift: ?[]DriftEntry
+)
+
+type DriftEntry (
+    field_name: string,
+    description: string
 )
 
 type PolicyInfo (

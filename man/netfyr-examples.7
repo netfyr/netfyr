@@ -339,10 +339,69 @@ Applied 1 change (1 entity modified).
 In daemon mode, a warning is printed because the active policies are
 not changed.
 The next reconciliation cycle may re\-apply the current desired state.
+.SH "SYSTEM OVERVIEW"
+Check the current state of all interfaces and detect configuration
+drift with
+.BR "netfyr show" :
+.PP
+.RS 4
+.nf
+$ netfyr show
+Daemon
+  Status:  running
+  Uptime:  20h 52m
+
+Interfaces
+  enp1s0
+    State:     up, carrier
+    Addresses: 192.168.1.10/24
+    Policies:  enp1s0\-static (static)
+    Config:    applied
+
+  eth0
+    State:     up, no\-carrier
+
+  wlan0
+    State:     up, carrier
+    Addresses: 10.0.0.5/24
+    Policies:  wlan\-dhcp (dhcpv4)
+    Config:    drifted
+               \- mtu: expected 9000, actual 1500
+.fi
+.RE
+.PP
+The
+.B State
+line shows administrative state (up/down) and carrier detection.
+The
+.B Config
+line appears only for managed interfaces (those with active policies)
+and reports whether the system matches the desired configuration.
+When drift is detected, the individual field mismatches are listed.
+.PP
+Use JSON output for scripting:
+.PP
+.RS 4
+.nf
+$ netfyr show \-o json | jq '.interfaces[] | select(.config_state == "drifted")'
+{
+  "name": "wlan0",
+  "enabled": true,
+  "carrier": true,
+  "addresses": ["10.0.0.5/24"],
+  "policies": [{"name": "wlan\-dhcp", "type": "dhcpv4"}],
+  "config_state": "drifted",
+  "config_drift": [
+    {"field_name": "mtu", "description": "expected 9000, actual 1500"}
+  ]
+}
+.fi
+.RE
 .SH "SEE ALSO"
 .BR netfyr (1),
 .BR netfyr\-apply (1),
 .BR netfyr\-query (1),
+.BR netfyr\-show (1),
 .BR netfyr\-history (1),
 .BR netfyr\-revert (1),
 .BR netfyr\-daemon (8),

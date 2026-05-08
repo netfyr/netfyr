@@ -1,11 +1,11 @@
 //! `netfyr show` — system overview: daemon status and interface details.
 
-use std::collections::BTreeSet;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
+use colored::Colorize;
 
 use netfyr_backend::{BackendRegistry, NetlinkBackend};
 use netfyr_state::StateSet;
@@ -91,14 +91,48 @@ pub async fn run_show(args: ShowArgs) -> Result<ExitCode> {
 async fn build_fallback_info() -> Result<VarlinkShowInfo> {
     let registry = create_backend_registry();
     let state_set = registry.query_all().await?;
-    let names = extract_interface_names(&state_set);
+    let interfaces = build_fallback_interfaces(&state_set);
     Ok(VarlinkShowInfo {
         daemon: VarlinkDaemonInfo { status: "not_running".to_string(), uptime_seconds: None },
-        interfaces: names
-            .into_iter()
-            .map(|name| VarlinkInterfaceInfo { name, policies: None, dhcp: None })
-            .collect(),
+        interfaces,
     })
+}
+
+fn build_fallback_interfaces(state_set: &StateSet) -> Vec<VarlinkInterfaceInfo> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut interfaces = Vec::new();
+
+    for state in state_set.iter() {
+        let name: String = match &state.selector.name {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+
+        let enabled = state.fields.get("enabled").and_then(|fv| fv.value.as_bool());
+        let carrier = state.fields.get("carrier").and_then(|fv| fv.value.as_bool());
+        let addresses: Option<Vec<String>> = state
+            .fields
+            .get("addresses")
+            .and_then(|fv| fv.value.as_list())
+            .map(|list| list.iter().map(|v| v.to_string()).collect())
+            .filter(|v: &Vec<String>| !v.is_empty());
+
+        interfaces.push(VarlinkInterfaceInfo {
+            name,
+            enabled,
+            carrier,
+            addresses,
+            policies: None,
+            dhcp: None,
+            config_state: None,
+            config_drift: None,
+        });
+    }
+
+    interfaces
 }
 
 fn create_backend_registry() -> BackendRegistry {
@@ -109,13 +143,6 @@ fn create_backend_registry() -> BackendRegistry {
     registry
 }
 
-fn extract_interface_names(state_set: &StateSet) -> Vec<String> {
-    let names: BTreeSet<String> = state_set
-        .iter()
-        .filter_map(|s| s.selector.name.clone())
-        .collect();
-    names.into_iter().collect()
-}
 
 // ── format_text ───────────────────────────────────────────────────────────────
 
@@ -143,6 +170,17 @@ pub fn format_text(info: &VarlinkShowInfo) -> String {
     for (i, iface) in info.interfaces.iter().enumerate() {
         out.push_str(&format!("  {}\n", iface.name));
 
+        if let Some(enabled) = iface.enabled {
+            let state_text = format_state(enabled, iface.carrier.unwrap_or(false));
+            out.push_str(&format!("    State:     {state_text}\n"));
+        }
+
+        if let Some(addresses) = &iface.addresses {
+            if !addresses.is_empty() {
+                out.push_str(&format!("    Addresses: {}\n", addresses.join(", ")));
+            }
+        }
+
         if let Some(policies) = &iface.policies {
             if !policies.is_empty() {
                 let policy_str: Vec<String> = policies
@@ -167,6 +205,24 @@ pub fn format_text(info: &VarlinkShowInfo) -> String {
             }
         }
 
+        if let Some(config_state) = &iface.config_state {
+            let colored_state = if config_state == "applied" {
+                config_state.green().to_string()
+            } else {
+                config_state.red().to_string()
+            };
+            out.push_str(&format!("    Config:    {colored_state}\n"));
+
+            if let Some(drift) = &iface.config_drift {
+                for entry in drift {
+                    out.push_str(&format!(
+                        "               {}\n",
+                        format!("- {}: {}", entry.field_name, entry.description).yellow()
+                    ));
+                }
+            }
+        }
+
         if i + 1 < n {
             out.push('\n');
         }
@@ -175,12 +231,21 @@ pub fn format_text(info: &VarlinkShowInfo) -> String {
     out
 }
 
+fn format_state(enabled: bool, carrier: bool) -> String {
+    match (enabled, carrier) {
+        (true, true) => "up, carrier".green().to_string(),
+        (true, false) => "up, no-carrier".yellow().to_string(),
+        (false, true) => "down, carrier".yellow().to_string(),
+        (false, false) => "down".red().to_string(),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netfyr_varlink::{VarlinkDaemonInfo, VarlinkDhcpInfo, VarlinkInterfaceInfo, VarlinkPolicyInfo, VarlinkShowInfo};
+    use netfyr_varlink::{VarlinkDaemonInfo, VarlinkDhcpInfo, VarlinkDriftEntry, VarlinkInterfaceInfo, VarlinkPolicyInfo, VarlinkShowInfo};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -214,11 +279,29 @@ mod tests {
     }
 
     fn make_iface(name: &str, policies: Option<Vec<VarlinkPolicyInfo>>, dhcp: Option<VarlinkDhcpInfo>) -> VarlinkInterfaceInfo {
-        VarlinkInterfaceInfo { name: name.to_string(), policies, dhcp }
+        VarlinkInterfaceInfo {
+            name: name.to_string(),
+            enabled: Some(true),
+            carrier: Some(true),
+            addresses: None,
+            policies,
+            dhcp,
+            config_state: None,
+            config_drift: None,
+        }
     }
 
     fn make_bare_iface(name: &str) -> VarlinkInterfaceInfo {
-        VarlinkInterfaceInfo { name: name.to_string(), policies: None, dhcp: None }
+        VarlinkInterfaceInfo {
+            name: name.to_string(),
+            enabled: None,
+            carrier: None,
+            addresses: None,
+            policies: None,
+            dhcp: None,
+            config_state: None,
+            config_drift: None,
+        }
     }
 
     fn make_show_info(daemon: VarlinkDaemonInfo, interfaces: Vec<VarlinkInterfaceInfo>) -> VarlinkShowInfo {
@@ -842,6 +925,199 @@ mod tests {
         assert!(types.contains(&"dhcpv4"), "policies must include a dhcpv4 entry");
     }
 
+    // ── format_text: State line ─────────────────────────────────────────────
+
+    /// Interface with enabled=true and carrier=true shows "up, carrier" in State line.
+    #[test]
+    fn test_format_text_up_carrier_shows_state_line() {
+        colored::control::set_override(false);
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None)],
+        );
+        let text = format_text(&info);
+        assert!(
+            text.contains("State:     up, carrier"),
+            "up+carrier interface must show 'State:     up, carrier', got:\n{text}"
+        );
+    }
+
+    /// Interface with enabled=true and carrier=false shows "up, no-carrier".
+    #[test]
+    fn test_format_text_up_no_carrier_shows_state_line() {
+        colored::control::set_override(false);
+        let mut iface = make_bare_iface("eth0");
+        iface.enabled = Some(true);
+        iface.carrier = Some(false);
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let text = format_text(&info);
+        assert!(
+            text.contains("State:     up, no-carrier"),
+            "up+no-carrier interface must show 'up, no-carrier', got:\n{text}"
+        );
+    }
+
+    /// Interface with enabled=false shows "down" in State line.
+    #[test]
+    fn test_format_text_down_shows_state_line() {
+        colored::control::set_override(false);
+        let mut iface = make_bare_iface("eth0");
+        iface.enabled = Some(false);
+        iface.carrier = Some(false);
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let text = format_text(&info);
+        assert!(
+            text.contains("State:     down"),
+            "down interface must show 'down', got:\n{text}"
+        );
+    }
+
+    /// Interface without enabled field (fallback or absent) omits State line.
+    #[test]
+    fn test_format_text_no_enabled_omits_state_line() {
+        let info = make_show_info(make_daemon_running(100), vec![make_bare_iface("lo")]);
+        let text = format_text(&info);
+        assert!(
+            !text.contains("State:"),
+            "interface without enabled must not show State line, got:\n{text}"
+        );
+    }
+
+    // ── format_text: Addresses line ──────────────────────────────────────────
+
+    /// Interface with addresses shows them comma-separated on Addresses line.
+    #[test]
+    fn test_format_text_addresses_shown_comma_separated() {
+        colored::control::set_override(false);
+        let mut iface = make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None);
+        iface.addresses = Some(vec!["192.168.1.10/24".to_string(), "fd00::1/64".to_string()]);
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let text = format_text(&info);
+        assert!(
+            text.contains("Addresses: 192.168.1.10/24, fd00::1/64"),
+            "addresses must appear comma-separated, got:\n{text}"
+        );
+    }
+
+    /// Interface with no addresses omits Addresses line.
+    #[test]
+    fn test_format_text_no_addresses_omits_addresses_line() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None)],
+        );
+        let text = format_text(&info);
+        assert!(
+            !text.contains("Addresses:"),
+            "interface without addresses must not show Addresses line, got:\n{text}"
+        );
+    }
+
+    // ── format_text: Config drift ────────────────────────────────────────────
+
+    /// Managed interface with config_state=applied shows "Config:    applied".
+    #[test]
+    fn test_format_text_config_applied_shown() {
+        colored::control::set_override(false);
+        let mut iface = make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None);
+        iface.config_state = Some("applied".to_string());
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let text = format_text(&info);
+        assert!(
+            text.contains("Config:    applied"),
+            "applied config must show 'Config:    applied', got:\n{text}"
+        );
+    }
+
+    /// Managed interface with config_state=drifted shows "Config:    drifted" and drift details.
+    #[test]
+    fn test_format_text_config_drifted_shows_details() {
+        colored::control::set_override(false);
+        let mut iface = make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None);
+        iface.config_state = Some("drifted".to_string());
+        iface.config_drift = Some(vec![
+            VarlinkDriftEntry {
+                field_name: "mtu".to_string(),
+                description: "expected 9000, actual 1500".to_string(),
+            },
+        ]);
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let text = format_text(&info);
+        assert!(
+            text.contains("Config:    drifted"),
+            "drifted config must show 'Config:    drifted', got:\n{text}"
+        );
+        assert!(
+            text.contains("- mtu: expected 9000, actual 1500"),
+            "drift details must appear, got:\n{text}"
+        );
+    }
+
+    /// Unmanaged interface (no policies) omits Config line.
+    #[test]
+    fn test_format_text_unmanaged_omits_config_line() {
+        let info = make_show_info(make_daemon_running(100), vec![make_bare_iface("lo")]);
+        let text = format_text(&info);
+        assert!(
+            !text.contains("Config:"),
+            "unmanaged interface must not show Config line, got:\n{text}"
+        );
+    }
+
+    // ── format_json: New fields ──────────────────────────────────────────────
+
+    /// JSON output includes enabled and carrier when present.
+    #[test]
+    fn test_format_json_includes_enabled_and_carrier() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None)],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&format_json(&info).unwrap()).unwrap();
+        let iface = &parsed["interfaces"][0];
+        assert_eq!(iface["enabled"], true, "enabled must be true");
+        assert_eq!(iface["carrier"], true, "carrier must be true");
+    }
+
+    /// JSON output includes addresses when present.
+    #[test]
+    fn test_format_json_includes_addresses() {
+        let mut iface = make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None);
+        iface.addresses = Some(vec!["10.0.0.1/24".to_string()]);
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let parsed: serde_json::Value = serde_json::from_str(&format_json(&info).unwrap()).unwrap();
+        let addrs = parsed["interfaces"][0]["addresses"].as_array()
+            .expect("addresses must be an array");
+        assert_eq!(addrs[0], "10.0.0.1/24");
+    }
+
+    /// JSON output includes config_state and config_drift when present.
+    #[test]
+    fn test_format_json_includes_config_state_and_drift() {
+        let mut iface = make_iface("veth-e2e0", Some(vec![make_static_policy_info("pol")]), None);
+        iface.config_state = Some("drifted".to_string());
+        iface.config_drift = Some(vec![VarlinkDriftEntry {
+            field_name: "mtu".to_string(),
+            description: "expected 9000, actual 1500".to_string(),
+        }]);
+        let info = make_show_info(make_daemon_running(100), vec![iface]);
+        let parsed: serde_json::Value = serde_json::from_str(&format_json(&info).unwrap()).unwrap();
+        let iface_json = &parsed["interfaces"][0];
+        assert_eq!(iface_json["config_state"], "drifted");
+        let drift = iface_json["config_drift"].as_array().expect("config_drift must be an array");
+        assert_eq!(drift[0]["field_name"], "mtu");
+        assert_eq!(drift[0]["description"], "expected 9000, actual 1500");
+    }
+
+    /// JSON output omits config_state for unmanaged interfaces.
+    #[test]
+    fn test_format_json_omits_config_state_for_unmanaged() {
+        let info = make_show_info(make_daemon_running(100), vec![make_bare_iface("lo")]);
+        let parsed: serde_json::Value = serde_json::from_str(&format_json(&info).unwrap()).unwrap();
+        let iface_obj = parsed["interfaces"][0].as_object().unwrap();
+        assert!(!iface_obj.contains_key("config_state"), "unmanaged interface must not have config_state");
+    }
+
     // ── CLI argument parsing ──────────────────────────────────────────────────
 
     /// Scenario: `netfyr show` can be parsed without arguments (defaults to text output).
@@ -895,6 +1171,18 @@ pub fn format_json(info: &VarlinkShowInfo) -> Result<String> {
         .map(|iface| {
             let mut obj = serde_json::json!({ "name": iface.name });
 
+            if let Some(enabled) = iface.enabled {
+                obj["enabled"] = serde_json::json!(enabled);
+            }
+            if let Some(carrier) = iface.carrier {
+                obj["carrier"] = serde_json::json!(carrier);
+            }
+            if let Some(addresses) = &iface.addresses {
+                if !addresses.is_empty() {
+                    obj["addresses"] = serde_json::json!(addresses);
+                }
+            }
+
             if let Some(policies) = &iface.policies {
                 if !policies.is_empty() {
                     let policy_arr: Vec<serde_json::Value> = policies
@@ -917,6 +1205,22 @@ pub fn format_json(info: &VarlinkShowInfo) -> Result<String> {
                     dhcp_obj["lease_remaining_secs"] = serde_json::json!(remaining);
                 }
                 obj["dhcp"] = dhcp_obj;
+            }
+
+            if let Some(config_state) = &iface.config_state {
+                obj["config_state"] = serde_json::json!(config_state);
+            }
+            if let Some(config_drift) = &iface.config_drift {
+                let drift_arr: Vec<serde_json::Value> = config_drift
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "field_name": d.field_name,
+                            "description": d.description,
+                        })
+                    })
+                    .collect();
+                obj["config_drift"] = serde_json::json!(drift_arr);
             }
 
             obj

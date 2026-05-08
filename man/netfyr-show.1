@@ -9,6 +9,23 @@ netfyr\-show \- Show system overview
 Show system overview
 .PP
 Display daemon status, all network interfaces, and their active policies and DHCP lease state. Works with or without the daemon.
+.PP
+For each interface the output includes the administrative state (up/down),
+carrier detection, configured IP addresses, associated policies, and
+DHCP lease details when applicable.
+.PP
+For managed interfaces (those with active policies), a configuration
+drift indicator shows whether the actual system state matches the
+desired state declared by the policies. When drift is detected, the
+individual field mismatches are listed.
+.PP
+In text mode, output is colorized: green for healthy state (up with
+carrier, config applied), yellow for warnings (no carrier, drift details),
+and red for errors (interface down, config drifted). Colors respect the
+.B \-\-color
+flag and the
+.B NO_COLOR
+environment variable.
 .SH OPTIONS
 .TP
 \fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: text]

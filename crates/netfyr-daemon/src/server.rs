@@ -16,11 +16,12 @@ use std::time::Instant;
 use anyhow::Result;
 use netfyr_backend::FactoryEvent;
 use netfyr_journal::Trigger;
-use netfyr_reconcile::DiffKind;
+use netfyr_reconcile::{DiffKind, FieldChangeKind};
 use netfyr_varlink::{
     convert_apply_report_with_conflicts, VarlinkApplyReport, VarlinkChangeEntry, VarlinkDaemonInfo,
-    VarlinkDaemonStatus, VarlinkDhcpInfo, VarlinkFactoryStatus, VarlinkInterfaceInfo, VarlinkPolicy,
-    VarlinkPolicyInfo, VarlinkSelector, VarlinkShowInfo, VarlinkState, VarlinkStateDiff,
+    VarlinkDaemonStatus, VarlinkDhcpInfo, VarlinkDriftEntry, VarlinkFactoryStatus,
+    VarlinkInterfaceInfo, VarlinkPolicy, VarlinkPolicyInfo, VarlinkSelector, VarlinkShowInfo,
+    VarlinkState, VarlinkStateDiff,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -572,6 +573,15 @@ async fn handle_get_show_info(
         }
     };
 
+    // Compute drift: compare desired (from policies) against actual (from system).
+    let drift_diff = match reconciler.dry_run(policy_store, factory_manager).await {
+        Ok((diff, _conflicts)) => Some(diff),
+        Err(e) => {
+            warn!("GetShowInfo drift check failed, continuing without drift: {}", e);
+            None
+        }
+    };
+
     // Index factory statuses by interface name for O(1) lookup.
     let factory_by_iface: std::collections::HashMap<String, _> = factory_manager
         .factory_statuses()
@@ -594,6 +604,22 @@ async fn handle_get_show_info(
         }
 
         let interface_selector = &state.selector;
+
+        // Extract link state fields from the backend query.
+        let enabled = state
+            .fields
+            .get("enabled")
+            .and_then(|fv| fv.value.as_bool());
+        let carrier = state
+            .fields
+            .get("carrier")
+            .and_then(|fv| fv.value.as_bool());
+        let addresses: Option<Vec<String>> = state
+            .fields
+            .get("addresses")
+            .and_then(|fv| fv.value.as_list())
+            .map(|list| list.iter().map(|v| v.to_string()).collect())
+            .filter(|v: &Vec<String>| !v.is_empty());
 
         // Find policies that target this interface.
         let matching_policies: Vec<VarlinkPolicyInfo> = policy_store
@@ -654,10 +680,67 @@ async fn handle_get_show_info(
             }
         });
 
+        // Determine config drift for managed interfaces.
+        let is_managed = !matching_policies.is_empty();
+        let (config_state, config_drift) = if is_managed {
+            if let Some(ref diff) = drift_diff {
+                let iface_op = diff.operations.iter().find(|op| {
+                    op.selector.name.as_deref() == Some(&name)
+                });
+                match iface_op {
+                    Some(op) => {
+                        let drift_entries: Vec<VarlinkDriftEntry> = op
+                            .field_changes
+                            .iter()
+                            .filter_map(|fc| {
+                                let desc = match &fc.change {
+                                    FieldChangeKind::Set {
+                                        current: Some(old),
+                                        desired,
+                                    } => format!(
+                                        "expected {}, actual {}",
+                                        desired.value, old.value
+                                    ),
+                                    FieldChangeKind::Set {
+                                        current: None,
+                                        desired,
+                                    } => format!("missing (expected {})", desired.value),
+                                    FieldChangeKind::Unset { current } => {
+                                        format!("unexpected (actual {})", current.value)
+                                    }
+                                    FieldChangeKind::Unchanged { .. } => return None,
+                                };
+                                Some(VarlinkDriftEntry {
+                                    field_name: fc.field_name.clone(),
+                                    description: desc,
+                                })
+                            })
+                            .collect();
+
+                        if drift_entries.is_empty() {
+                            (Some("applied".to_string()), None)
+                        } else {
+                            (Some("drifted".to_string()), Some(drift_entries))
+                        }
+                    }
+                    None => (Some("applied".to_string()), None),
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         interfaces.push(VarlinkInterfaceInfo {
             name,
+            enabled,
+            carrier,
+            addresses,
             policies: Some(matching_policies),
             dhcp,
+            config_state,
+            config_drift,
         });
     }
 

@@ -10,10 +10,10 @@ pub mod types;
 pub use client::{VarlinkClient, VarlinkError};
 pub use types::{
     VarlinkApplyReport, VarlinkChangeEntry, VarlinkConflictEntry, VarlinkDaemonInfo,
-    VarlinkDaemonStatus, VarlinkDhcpInfo, VarlinkDiffOperation, VarlinkFactoryStatus,
-    VarlinkFieldChange, VarlinkInterfaceInfo, VarlinkPolicy, VarlinkPolicyInfo,
-    VarlinkSelector, VarlinkShowInfo, VarlinkState, VarlinkStateDef, VarlinkStateDiff,
-    convert_apply_report_with_conflicts, json_to_state_fields, json_to_value,
+    VarlinkDaemonStatus, VarlinkDhcpInfo, VarlinkDiffOperation, VarlinkDriftEntry,
+    VarlinkFactoryStatus, VarlinkFieldChange, VarlinkInterfaceInfo, VarlinkPolicy,
+    VarlinkPolicyInfo, VarlinkSelector, VarlinkShowInfo, VarlinkState, VarlinkStateDef,
+    VarlinkStateDiff, convert_apply_report_with_conflicts, json_to_state_fields, json_to_value,
     state_fields_to_json, value_to_json,
 };
 
