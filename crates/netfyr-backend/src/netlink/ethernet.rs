@@ -649,6 +649,178 @@ mod tests {
             assert!(result, "carrier byte {byte} must produce true");
         }
     }
+
+    // ── route_protocol_str ────────────────────────────────────────────────────────
+
+    /// Scenario: kernel-managed routes are identified by protocol string "kernel".
+    /// route_protocol_str must return "kernel" for RouteProtocol::Kernel so that
+    /// the filter closure can reject these routes.
+    #[test]
+    fn test_route_protocol_str_kernel_returns_kernel() {
+        use netlink_packet_route::route::RouteProtocol;
+        assert_eq!(route_protocol_str(RouteProtocol::Kernel), "kernel");
+    }
+
+    /// route_protocol_str returns "boot" for RouteProtocol::Boot (routes added
+    /// manually via `ip route add` without an explicit protocol).
+    #[test]
+    fn test_route_protocol_str_boot_returns_boot() {
+        use netlink_packet_route::route::RouteProtocol;
+        assert_eq!(route_protocol_str(RouteProtocol::Boot), "boot");
+    }
+
+    /// route_protocol_str returns "static" for RouteProtocol::Static (routes
+    /// installed by a routing daemon or explicitly tagged with proto static).
+    #[test]
+    fn test_route_protocol_str_static_returns_static() {
+        use netlink_packet_route::route::RouteProtocol;
+        assert_eq!(route_protocol_str(RouteProtocol::Static), "static");
+    }
+
+    /// route_protocol_str returns "dhcp" for RouteProtocol::Dhcp (routes installed
+    /// by a DHCP client).
+    #[test]
+    fn test_route_protocol_str_dhcp_returns_dhcp() {
+        use netlink_packet_route::route::RouteProtocol;
+        assert_eq!(route_protocol_str(RouteProtocol::Dhcp), "dhcp");
+    }
+
+    /// route_protocol_str returns "ra" for RouteProtocol::Ra (routes installed by
+    /// IPv6 Router Advertisement).
+    #[test]
+    fn test_route_protocol_str_ra_returns_ra() {
+        use netlink_packet_route::route::RouteProtocol;
+        assert_eq!(route_protocol_str(RouteProtocol::Ra), "ra");
+    }
+
+    // ── Route filter predicate (kernel routes excluded) ───────────────────────────
+
+    /// Scenario: kernel-managed routes (protocol=kernel) are excluded.
+    /// The filter closure in query_ethernet must reject a route value whose
+    /// "protocol" field is "kernel".
+    #[test]
+    fn test_route_filter_predicate_excludes_kernel_protocol() {
+        let kernel_route =
+            build_route_value("10.0.0.0/24", None, 0, Some("kernel"), None, None, 0);
+        let passes = kernel_route
+            .as_map()
+            .and_then(|m| m.get("protocol"))
+            .and_then(|v| v.as_str())
+            .map(|s| s != "kernel")
+            .unwrap_or(true);
+        assert!(!passes, "route with protocol=kernel must be excluded by the filter");
+    }
+
+    /// Scenario: non-kernel routes pass through the filter.
+    /// Routes with protocol in {static, dhcp, boot, ra} must not be filtered out.
+    #[test]
+    fn test_route_filter_predicate_passes_non_kernel_protocols() {
+        for proto in &["static", "dhcp", "boot", "ra", "other"] {
+            let route =
+                build_route_value("0.0.0.0/0", Some("10.0.0.1"), 0, Some(proto), None, None, 0);
+            let passes = route
+                .as_map()
+                .and_then(|m| m.get("protocol"))
+                .and_then(|v| v.as_str())
+                .map(|s| s != "kernel")
+                .unwrap_or(true);
+            assert!(passes, "route with protocol={proto} must pass the filter");
+        }
+    }
+
+    /// Scenario: routes without a protocol field pass the filter (default: include).
+    /// The filter uses `unwrap_or(true)`, so an absent protocol key means the route
+    /// is included.
+    #[test]
+    fn test_route_filter_predicate_passes_route_without_protocol() {
+        let route = build_route_value("::/0", Some("fe80::1"), 1024, None, None, None, 0);
+        // Confirm there is no protocol key.
+        let map = route.as_map().unwrap();
+        assert!(
+            !map.contains_key("protocol"),
+            "route built with protocol=None must have no 'protocol' key"
+        );
+        let passes = route
+            .as_map()
+            .and_then(|m| m.get("protocol"))
+            .and_then(|v| v.as_str())
+            .map(|s| s != "kernel")
+            .unwrap_or(true);
+        assert!(
+            passes,
+            "route without 'protocol' field must default to included (unwrap_or(true))"
+        );
+    }
+
+    // ── Protocol field stripping ──────────────────────────────────────────────────
+
+    /// Scenario: the protocol field is stripped from all returned routes.
+    /// After the filter, the protocol key must be absent from each route Value::Map
+    /// so it does not appear in the query output. Other fields must survive.
+    #[test]
+    fn test_route_protocol_field_stripped_from_static_route() {
+        let route =
+            build_route_value("0.0.0.0/0", Some("10.0.0.1"), 0, Some("static"), None, None, 0);
+        // Replicate the stripping closure from query_ethernet.
+        let stripped = match route {
+            Value::Map(mut m) => {
+                m.shift_remove("protocol");
+                Value::Map(m)
+            }
+            other => other,
+        };
+        let map = stripped.as_map().expect("must remain a Map after stripping");
+        assert!(!map.contains_key("protocol"), "protocol key must be absent after stripping");
+        assert!(map.contains_key("destination"), "destination must survive stripping");
+        assert!(map.contains_key("gateway"), "gateway must survive stripping");
+        assert!(map.contains_key("metric"), "metric must survive stripping");
+    }
+
+    /// Stripping protocol from a route that has no protocol key is a no-op and
+    /// must not change the map length.
+    #[test]
+    fn test_route_protocol_strip_noop_when_key_is_absent() {
+        let route = build_route_value("192.168.0.0/24", None, 0, None, None, None, 0);
+        let pre_len = route.as_map().unwrap().len();
+        let stripped = match route {
+            Value::Map(mut m) => {
+                m.shift_remove("protocol");
+                Value::Map(m)
+            }
+            other => other,
+        };
+        assert_eq!(
+            stripped.as_map().unwrap().len(),
+            pre_len,
+            "stripping an absent key must not change map length"
+        );
+    }
+
+    /// Protocol stripping preserves optional fields mtu, table, and tos.
+    #[test]
+    fn test_route_protocol_strip_preserves_mtu_table_tos() {
+        let route = build_route_value(
+            "10.0.0.0/24",
+            Some("10.0.0.1"),
+            100,
+            Some("dhcp"),
+            Some(1400),
+            Some(100),
+            8,
+        );
+        let stripped = match route {
+            Value::Map(mut m) => {
+                m.shift_remove("protocol");
+                Value::Map(m)
+            }
+            other => other,
+        };
+        let map = stripped.as_map().unwrap();
+        assert!(!map.contains_key("protocol"), "protocol must be stripped");
+        assert_eq!(map["mtu"].as_u64(), Some(1400), "mtu must survive stripping");
+        assert_eq!(map["table"].as_u64(), Some(100), "table must survive stripping");
+        assert_eq!(map["tos"].as_u64(), Some(8), "tos must survive stripping");
+    }
 }
 
 // ── Main query function ───────────────────────────────────────────────────────
