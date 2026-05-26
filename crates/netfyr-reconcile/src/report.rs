@@ -205,6 +205,14 @@ fn format_value_element(v: &Value) -> String {
                 }
                 return parts.join(" ");
             }
+            // Address map: extract bare CIDR string from the "address" key.
+            // Only applies when no "destination" key is present (to avoid
+            // ambiguity with route maps that may also carry an address field).
+            if !map.contains_key("destination") {
+                if let Some(addr) = map.get("address") {
+                    return format!("{}", addr);
+                }
+            }
             format!("{}", v)
         }
         _ => format!("{}", v),
@@ -723,6 +731,82 @@ mod tests {
             report.unchanged_entities[0],
             ("ethernet".to_string(), "eth0".to_string()),
             "unchanged entity must be (ethernet, eth0)"
+        );
+    }
+
+    // ── Scenarios 19 & 20: List comparison keys in format_text ───────────────
+
+    /// Build a `Value::Map` address entry (address + valid_lft) via serde_yaml.
+    fn make_addr_map(address: &str, valid_lft: u64) -> Value {
+        use netfyr_state::yaml::deserialize_value;
+        let yaml_str = format!("address: \"{address}\"\nvalid_lft: {valid_lft}");
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&yaml_str).expect("valid yaml");
+        deserialize_value(&yaml_val).expect("valid Value")
+    }
+
+    #[test]
+    fn test_format_text_list_comparison_keys_same_address_no_output() {
+        // Criterion 19: desired and actual share the same address key (10.0.1.50/24)
+        // but differ in valid_lft. Because x-netfyr-comparison-keys=["address"] treats
+        // them as equal, there must be no operations and no output at all.
+        let desired_addrs = Value::List(vec![make_addr_map("10.0.1.50/24", 1800)]);
+        let actual_addrs = Value::List(vec![make_addr_map("10.0.1.50/24", 3600)]);
+
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("addresses", desired_addrs)]));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("addresses", actual_addrs)]));
+
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+
+        assert!(report.is_empty(), "report must be empty: same address key, valid_lft ignored");
+        // The only output should be the "No changes" footer — no + / - / ~ lines.
+        let text = report.format_text();
+        assert!(
+            !text.contains('+') || text.contains("No changes:"),
+            "with matching address keys there must be no + diff lines in format_text, got:\n{text}"
+        );
+        assert!(
+            !text.contains("    -") && !text.contains("    +"),
+            "no field-level diff lines expected, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_format_text_list_comparison_keys_different_address_shows_add_remove_elements() {
+        // Criterion 20: desired has 10.0.1.51/24, actual has 10.0.1.50/24.
+        // The "address" key differs → Modify op; format_text must show
+        // the per-element diff with +10.0.1.51/24 and -10.0.1.50/24.
+        let desired_addrs = Value::List(vec![make_addr_map("10.0.1.51/24", 3600)]);
+        let actual_addrs = Value::List(vec![make_addr_map("10.0.1.50/24", 3600)]);
+
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("addresses", desired_addrs)]));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("addresses", actual_addrs)]));
+
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+        let text = report.format_text();
+
+        assert!(
+            text.contains("    addresses:"),
+            "list field header '    addresses:' must appear in format_text, got:\n{text}"
+        );
+        assert!(
+            text.contains("      +10.0.1.51/24"),
+            "added address element must show '      +10.0.1.51/24', got:\n{text}"
+        );
+        assert!(
+            text.contains("      -10.0.1.50/24"),
+            "removed address element must show '      -10.0.1.50/24', got:\n{text}"
         );
     }
 
