@@ -915,6 +915,101 @@ mod tests {
         }
     }
 
+    // ── Spec-407: Factory reverts to pending state on LeaseExpired ───────────────
+
+    /// Scenario: Factory state after LeaseExpired reverts to pending state.
+    ///
+    /// Per SPEC-407: "the produced state reverts to the pending state with only
+    /// `enabled: true`". This test verifies the pending_state() helper produces
+    /// exactly that — one field, `enabled: true`, no addresses, routes, or dns.
+    ///
+    /// The DHCP client calls pending_state() and stores the result in shared_state
+    /// before sending FactoryEvent::LeaseExpired. This test validates the contract
+    /// of pending_state() as the canonical "post-expiry" factory state.
+    #[test]
+    fn test_pending_state_after_lease_expiry_has_only_enabled_true() {
+        let state = super::pending_state("veth-dhcp0", "e2e-lease-expiry", 100);
+
+        // Must have exactly one field: enabled=true.
+        assert_eq!(
+            state.fields.len(),
+            1,
+            "pending state (returned after LeaseExpired) must have exactly one field, got: {:?}",
+            state.fields.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.fields.get("enabled").and_then(|fv| fv.value.as_bool()),
+            Some(true),
+            "pending state must have enabled=true so the interface stays UP during re-discovery"
+        );
+
+        // Must NOT include any lease-derived fields.
+        assert!(
+            state.fields.get("addresses").is_none(),
+            "pending state must not have 'addresses' — the expired address must be removed"
+        );
+        assert!(
+            state.fields.get("routes").is_none(),
+            "pending state must not have 'routes' — the expired default route must be removed"
+        );
+        assert!(
+            state.fields.get("dns_servers").is_none(),
+            "pending state must not have 'dns_servers'"
+        );
+    }
+
+    /// Scenario: pending_state carries the correct policy_ref and selector.
+    ///
+    /// The reconciler uses policy_ref to attribute the enabled=true field to the
+    /// correct policy, and the selector to identify which interface to keep UP
+    /// during re-discovery after lease expiry.
+    #[test]
+    fn test_pending_state_after_lease_expiry_has_correct_selector_and_policy_ref() {
+        let state = super::pending_state("veth-dhcp0", "e2e-lease-expiry", 100);
+
+        assert_eq!(
+            state.selector.name.as_deref(),
+            Some("veth-dhcp0"),
+            "pending state selector must match the interface name"
+        );
+        assert_eq!(
+            state.policy_ref.as_deref(),
+            Some("e2e-lease-expiry"),
+            "pending state policy_ref must match the policy name"
+        );
+        assert_eq!(
+            state.entity_type, "ethernet",
+            "pending state entity_type must be 'ethernet'"
+        );
+    }
+
+    /// Scenario: LeaseExpired event carries no state — the daemon clears the
+    /// factory's produced address from the desired state before re-reconciling.
+    ///
+    /// Unlike LeaseAcquired and LeaseRenewed, the LeaseExpired variant has no
+    /// `state` field. The daemon should NOT use any stale state for reconciliation;
+    /// it should rely on the factory's current_state() which has already been
+    /// reverted to pending (enabled=true only) by the DHCP client task.
+    #[test]
+    fn test_factory_event_lease_expired_carries_no_address_state() {
+        // Construct LeaseExpired — note it only has policy_name, no State field.
+        let event = FactoryEvent::LeaseExpired {
+            policy_name: "e2e-lease-expiry".to_string(),
+        };
+
+        // Pattern-match to verify: if the pattern compiles, the variant has no
+        // state field. The compile-time check is the key assertion here.
+        let FactoryEvent::LeaseExpired { policy_name } = event else {
+            panic!("expected LeaseExpired variant");
+        };
+        assert_eq!(
+            policy_name, "e2e-lease-expiry",
+            "LeaseExpired must carry the correct policy_name for daemon routing"
+        );
+        // There is intentionally no `state` field to destructure — the factory
+        // reverts shared_state to pending_state() before sending this event.
+    }
+
     // ── FactoryEvent::Error variant: policy_name identity ─────────────────────
 
     /// Verifying FactoryEvent::Error carries the right policy name is critical for
