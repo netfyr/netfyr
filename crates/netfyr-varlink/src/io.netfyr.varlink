@@ -98,7 +98,10 @@ type FactoryStatus (
     factory_type: string,
     interface_name: string,
     state: string,
-    lease_ip: ?string
+    lease_ip: ?string,
+    lease_address: ?string,
+    lease_time_secs: ?int,
+    lease_remaining_secs: ?int
 )
 
 type ShowInfo (

@@ -187,7 +187,11 @@ impl VarlinkClient {
         seq: u64,
     ) -> Result<Option<serde_json::Value>, VarlinkError> {
         let params = serde_json::json!({ "seq": seq });
-        let response = self.call("io.netfyr.GetJournalEntry", params).await?;
+        let response = match self.call("io.netfyr.GetJournalEntry", params).await {
+            Ok(r) => r,
+            Err(VarlinkError::EntryNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let entry = &response["entry"];
         if entry.is_null() {
             Ok(None)
@@ -1180,22 +1184,86 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// AC: get_journal_entry returns None when the entry is null (not found).
+    /// AC: get_journal_entry returns None when the server returns EntryNotFound.
     #[tokio::test]
-    async fn test_get_journal_entry_returns_none_when_entry_is_null() {
+    async fn test_get_journal_entry_returns_none_when_entry_not_found() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = temp_socket(&dir);
 
-        let server = spawn_mock_server(
+        let server = spawn_error_server(
             path.clone(),
-            serde_json::json!({ "entry": null }),
+            "io.netfyr.EntryNotFound",
+            "Entry #9999 not found",
         );
 
         let mut client = VarlinkClient::connect(&path).await.unwrap();
         let result = client.get_journal_entry(9999).await;
-        assert!(result.is_ok(), "get_journal_entry must succeed, got {result:?}");
-        assert!(result.unwrap().is_none(), "entry must be None when server returns null");
+        assert!(result.is_ok(), "get_journal_entry must succeed (EntryNotFound → None), got {result:?}");
+        assert!(result.unwrap().is_none(), "entry must be None when server returns EntryNotFound");
 
+        server.await.unwrap();
+    }
+
+    /// Scenario: Non-root client cannot revert with dry_run=false — PermissionDenied is returned.
+    ///
+    /// The server enforces this at the authorization layer (SO_PEERCRED check). The client
+    /// must propagate it as VarlinkError::PermissionDenied with the full reason string.
+    #[tokio::test]
+    async fn test_non_root_cannot_revert_dry_run_false_returns_permission_denied_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        let server = spawn_error_server(
+            path.clone(),
+            "io.netfyr.PermissionDenied",
+            "method 'io.netfyr.Revert' requires root (uid 0), but client has uid 1000",
+        );
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.revert(5, false).await;
+
+        assert!(
+            matches!(result, Err(VarlinkError::PermissionDenied(_))),
+            "revert(dry_run=false) as non-root must return PermissionDenied, got {result:?}"
+        );
+        if let Err(VarlinkError::PermissionDenied(msg)) = result {
+            assert!(
+                msg.contains("requires root"),
+                "PermissionDenied reason must mention 'requires root'; got: {msg}"
+            );
+        }
+        server.await.unwrap();
+    }
+
+    /// Scenario: Non-root client can revert with dry_run=true — the call succeeds.
+    ///
+    /// dry_run=true is not a write operation, so no root authorization is required.
+    /// Verified by checking that the client returns Ok when the server sends a success response.
+    #[tokio::test]
+    async fn test_non_root_can_revert_dry_run_true_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = temp_socket(&dir);
+
+        // Server returns a success response (no PermissionDenied).
+        let response_params = serde_json::json!({
+            "report": {
+                "succeeded": 0,
+                "failed": 0,
+                "skipped": 0,
+                "changes": [],
+                "conflicts": []
+            },
+            "entry_timestamp": "2026-04-20T14:30:00Z"
+        });
+        let server = spawn_mock_server(path.clone(), response_params);
+
+        let mut client = VarlinkClient::connect(&path).await.unwrap();
+        let result = client.revert(5, true).await;
+
+        assert!(
+            result.is_ok(),
+            "revert(dry_run=true) must succeed for non-root clients, got {result:?}"
+        );
         server.await.unwrap();
     }
 

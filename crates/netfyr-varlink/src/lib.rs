@@ -46,9 +46,9 @@ mod tests {
         );
     }
 
-    /// Scenario: Interface definition file defines exactly 4 methods.
+    /// Scenario: Interface definition file defines exactly 8 methods.
     #[test]
-    fn test_varlink_interface_file_defines_four_methods() {
+    fn test_varlink_interface_file_defines_required_methods() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let varlink_file = std::path::Path::new(manifest_dir)
             .join("src")
@@ -112,6 +112,67 @@ mod tests {
         )
         .unwrap();
         assert!(content.contains("method GetStatus"), "Interface must define GetStatus method");
+    }
+
+    /// Scenario: Interface defines GetHistory method.
+    #[test]
+    fn test_varlink_interface_defines_get_history_method() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .unwrap();
+        assert!(content.contains("method GetHistory"), "Interface must define GetHistory method");
+    }
+
+    /// Scenario: Interface defines GetJournalEntry method.
+    #[test]
+    fn test_varlink_interface_defines_get_journal_entry_method() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .unwrap();
+        assert!(
+            content.contains("method GetJournalEntry"),
+            "Interface must define GetJournalEntry method"
+        );
+    }
+
+    /// Scenario: Interface defines Revert method.
+    #[test]
+    fn test_varlink_interface_defines_revert_method() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .unwrap();
+        assert!(content.contains("method Revert"), "Interface must define Revert method");
+    }
+
+    /// Scenario: Interface defines GetShowInfo method.
+    #[test]
+    fn test_varlink_interface_defines_get_show_info_method() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .unwrap();
+        assert!(content.contains("method GetShowInfo"), "Interface must define GetShowInfo method");
+    }
+
+    /// Scenario: Interface defines EntryNotFound error type.
+    #[test]
+    fn test_varlink_interface_defines_entry_not_found_error() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .unwrap();
+        assert!(
+            content.contains("error EntryNotFound"),
+            "Interface must define EntryNotFound error"
+        );
     }
 
     /// DEFAULT_SOCKET_PATH constant is set to the expected daemon socket path.
