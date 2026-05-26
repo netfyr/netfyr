@@ -1137,6 +1137,107 @@ mod tests {
         );
     }
 
+    // ── Scenario 19: List field comparison keys — same key, different non-key field ──
+
+    /// Build a `Value::Map` for an address entry using serde_yaml (avoids a direct
+    /// `indexmap` dependency in this crate's test code).
+    fn make_addr_map(address: &str, valid_lft: u64) -> Value {
+        use netfyr_state::yaml::deserialize_value;
+        let yaml_str = format!("address: \"{address}\"\nvalid_lft: {valid_lft}");
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&yaml_str).expect("valid yaml");
+        deserialize_value(&yaml_val).expect("valid Value")
+    }
+
+    #[test]
+    fn test_list_comparison_keys_same_address_key_different_valid_lft_generates_no_diff() {
+        // Criterion 19: desired and actual both have address=10.0.1.50/24 but
+        // different valid_lft (1800 vs 3600). Because the ethernet schema sets
+        // x-netfyr-comparison-keys=["address"] on addresses, only the "address"
+        // key determines equality — valid_lft is ignored → StateDiff is empty.
+        let desired_addrs = Value::List(vec![make_addr_map("10.0.1.50/24", 1800)]);
+        let actual_addrs = Value::List(vec![make_addr_map("10.0.1.50/24", 3600)]);
+
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("addresses", desired_addrs)]));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("addresses", actual_addrs)]));
+
+        // Real SchemaRegistry carries x-netfyr-comparison-keys=["address"] for addresses.
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "addresses with matching 'address' key but different valid_lft must be treated as \
+             unchanged when x-netfyr-comparison-keys=[\"address\"] is set; \
+             diff had {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Scenario 20: List field comparison keys — different key → add+remove ────
+
+    #[test]
+    fn test_list_comparison_keys_different_address_key_generates_modify() {
+        // Criterion 20: desired has address=10.0.1.51/24, actual has 10.0.1.50/24.
+        // The "address" key differs → the diff engine treats this as a different
+        // element and generates a Modify operation with an addresses Set change.
+        let desired_addrs = Value::List(vec![make_addr_map("10.0.1.51/24", 3600)]);
+        let actual_addrs = Value::List(vec![make_addr_map("10.0.1.50/24", 3600)]);
+
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("addresses", desired_addrs)]));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("addresses", actual_addrs)]));
+
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have exactly 1 Modify operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Modify, "operation must be Modify for eth0");
+
+        let addr_change = find_change(op, "addresses").expect("addresses must have a change");
+        match addr_change {
+            FieldChangeKind::Set { current: Some(old), desired: new } => {
+                // deserialize_value converts "10.0.x.y/24" to Value::IpNetwork, so
+                // we check both String and IpNetwork representations of the address key.
+                let addr_key_matches = |list_val: &FieldValue, addr: &str| -> bool {
+                    if let Value::List(items) = &list_val.value {
+                        items.iter().any(|item| {
+                            if let Value::Map(m) = item {
+                                match m.get("address") {
+                                    Some(Value::String(s)) => s.as_str() == addr,
+                                    Some(Value::IpNetwork(net)) => net.to_string() == addr,
+                                    _ => false,
+                                }
+                            } else {
+                                false
+                            }
+                        })
+                    } else {
+                        false
+                    }
+                };
+                assert!(
+                    addr_key_matches(new, "10.0.1.51/24"),
+                    "desired addresses must contain key 10.0.1.51/24, got: {:?}",
+                    new.value
+                );
+                assert!(
+                    addr_key_matches(old, "10.0.1.50/24"),
+                    "current addresses must contain key 10.0.1.50/24, got: {:?}",
+                    old.value
+                );
+            }
+            other => panic!("Expected Set{{current: Some(_), desired: _}} for addresses, got: {:?}", other),
+        }
+    }
+
     // ── Edge case: writable field in unknown entity type is always diffed ─────
 
     #[test]
