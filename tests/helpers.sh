@@ -368,3 +368,117 @@ assert_json_address_order() {
         prev_offset="$offset"
     done
 }
+
+# require_binaries -- Resolve NETFYR_BIN and NETFYR_DAEMON_BIN from environment
+# or default paths, then validate both exist and are executable. Exits 1 if
+# either is missing. SCRIPT_DIR must be set before calling (standard convention).
+require_binaries() {
+    NETFYR_BIN="${NETFYR_BIN:-$SCRIPT_DIR/../target/debug/netfyr}"
+    NETFYR_DAEMON_BIN="${NETFYR_DAEMON_BIN:-$SCRIPT_DIR/../target/debug/netfyr-daemon}"
+
+    if [[ ! -x "$NETFYR_BIN" ]]; then
+        echo "FAIL: netfyr binary not found at $NETFYR_BIN" >&2
+        exit 1
+    fi
+    if [[ ! -x "$NETFYR_DAEMON_BIN" ]]; then
+        echo "FAIL: netfyr-daemon binary not found at $NETFYR_DAEMON_BIN" >&2
+        exit 1
+    fi
+}
+
+# daemon_test_setup -- Create temp directories, export socket/policy env vars,
+# and register an EXIT trap that cleans up the daemon and temp files.
+# Sets: TMPDIR_TEST, SOCKET_PATH, POLICY_DIR
+# Exports: NETFYR_SOCKET_PATH, NETFYR_POLICY_DIR
+daemon_test_setup() {
+    TMPDIR_TEST=$(mktemp -d)
+    SOCKET_PATH="$TMPDIR_TEST/netfyr.sock"
+    POLICY_DIR="$TMPDIR_TEST/policies"
+    mkdir -p "$POLICY_DIR"
+
+    export NETFYR_SOCKET_PATH="$SOCKET_PATH"
+    export NETFYR_POLICY_DIR="$POLICY_DIR"
+
+    DAEMON_PID=""
+
+    trap '_daemon_test_cleanup' EXIT
+}
+
+# _daemon_test_cleanup -- Private EXIT trap handler installed by daemon_test_setup.
+# Kills the daemon, calls cleanup (kills dnsmasq), and removes the temp directory.
+_daemon_test_cleanup() {
+    if [[ -n "${DAEMON_PID:-}" ]]; then
+        kill "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+    cleanup
+    rm -rf "${TMPDIR_TEST:-}"
+}
+
+# setup_journal -- Create a journal subdirectory and export NETFYR_JOURNAL_DIR.
+# Must be called after daemon_test_setup.
+# Sets: JOURNAL_DIR
+# Exports: NETFYR_JOURNAL_DIR
+setup_journal() {
+    JOURNAL_DIR="$TMPDIR_TEST/journal"
+    mkdir -p "$JOURNAL_DIR"
+    export NETFYR_JOURNAL_DIR="$JOURNAL_DIR"
+}
+
+# start_daemon [ENV_PAIRS...] -- Start the daemon in the background with the
+# exported environment variables. Accepts optional extra KEY=VALUE env pairs.
+# Waits up to 5 seconds for the socket to appear. Sets DAEMON_PID.
+# Set DAEMON_STDERR=/path/to/file before calling to capture daemon stderr.
+start_daemon() {
+    local daemon_stderr="${DAEMON_STDERR:-/dev/null}"
+
+    local env_args=(
+        "NETFYR_SOCKET_PATH=$SOCKET_PATH"
+        "NETFYR_POLICY_DIR=$POLICY_DIR"
+    )
+    if [[ -n "${NETFYR_JOURNAL_DIR:-}" ]]; then
+        env_args+=("NETFYR_JOURNAL_DIR=$NETFYR_JOURNAL_DIR")
+    fi
+
+    env "${env_args[@]}" "$@" "$NETFYR_DAEMON_BIN" 2>"$daemon_stderr" &
+    DAEMON_PID=$!
+
+    local i
+    for i in $(seq 1 50); do
+        [[ -S "$SOCKET_PATH" ]] && return 0
+        sleep 0.1
+    done
+    echo "FAIL: daemon socket did not appear at $SOCKET_PATH" >&2
+    exit 1
+}
+
+# stop_daemon -- Kill the daemon and wait for it to exit. Clears DAEMON_PID.
+# Removes the socket file so a subsequent start_daemon creates a fresh one.
+stop_daemon() {
+    if [[ -n "${DAEMON_PID:-}" ]]; then
+        kill "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+        DAEMON_PID=""
+    fi
+    rm -f "$SOCKET_PATH"
+}
+
+# restart_daemon [ENV_PAIRS...] -- Stop the current daemon and start a new one
+# with the same directories. Passes extra env pairs to the new daemon instance.
+restart_daemon() {
+    stop_daemon
+    start_daemon "$@"
+}
+
+# setup_dhcp_topology CLIENT_VETH SERVER_VETH SERVER_IP RANGE_START RANGE_END [LEASE_TIME]
+# Convenience wrapper: creates a veth pair, assigns the server IP, and starts dnsmasq.
+# LEASE_TIME defaults to 120 seconds.
+setup_dhcp_topology() {
+    local client_veth="$1" server_veth="$2"
+    local server_ip="$3" range_start="$4" range_end="$5"
+    local lease_time="${6:-120}"
+
+    create_veth "$client_veth" "$server_veth"
+    add_address "$server_veth" "${server_ip}/24"
+    start_dnsmasq "$server_veth" "$server_ip" "$range_start" "$range_end" "$lease_time"
+}
