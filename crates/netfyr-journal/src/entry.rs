@@ -205,6 +205,73 @@ mod tests {
         assert_eq!(value["target_seq"].as_u64(), Some(42));
     }
 
+    /// Scenario: Daemon records lease expiry in the journal with the correct trigger.
+    ///
+    /// When the daemon receives FactoryEvent::LeaseExpired and triggers
+    /// re-reconciliation, it records a Trigger::DhcpEvent with
+    /// event_kind="lease_expired". This verifies that trigger serializes correctly
+    /// so that `netfyr history` can display "lease expired" events and tests like
+    /// 403-dhcp-lease-renewal.sh can filter journal entries by event_kind.
+    #[test]
+    fn test_dhcp_event_trigger_with_lease_expired_event_kind_serializes_correctly() {
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "e2e-lease-expiry".to_string(),
+            event_kind: "lease_expired".to_string(),
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            value["type"].as_str(),
+            Some("dhcp_event"),
+            "LeaseExpired journal trigger must have type='dhcp_event'"
+        );
+        assert_eq!(
+            value["event_kind"].as_str(),
+            Some("lease_expired"),
+            "LeaseExpired journal trigger must have event_kind='lease_expired'"
+        );
+        assert_eq!(
+            value["policy_name"].as_str(),
+            Some("e2e-lease-expiry"),
+            "LeaseExpired journal trigger must carry the correct policy_name"
+        );
+    }
+
+    /// Scenario: Factory re-acquires lease after expiry.
+    ///
+    /// After LeaseExpired, the factory restarts DORA discovery. When a new lease
+    /// is acquired, the daemon triggers re-reconciliation with a DhcpEvent of
+    /// event_kind="lease_acquired". This verifies the re-acquisition trigger
+    /// round-trips through JSON correctly.
+    #[test]
+    fn test_dhcp_event_trigger_lease_acquired_after_expiry_round_trips() {
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "e2e-lease-expiry".to_string(),
+            event_kind: "lease_acquired".to_string(),
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        let restored: Trigger = serde_json::from_str(&json).unwrap();
+
+        // Verify the round-trip preserves the fields correctly.
+        match restored {
+            Trigger::DhcpEvent { policy_name, event_kind } => {
+                assert_eq!(
+                    policy_name, "e2e-lease-expiry",
+                    "re-acquisition trigger must preserve policy_name"
+                );
+                assert_eq!(
+                    event_kind, "lease_acquired",
+                    "re-acquisition trigger must preserve event_kind='lease_acquired'"
+                );
+            }
+            other => panic!(
+                "expected DhcpEvent trigger after JSON round-trip, got: {:?}",
+                other
+            ),
+        }
+    }
+
     /// AC: ExternalChange trigger contains changed_entities list.
     #[test]
     fn test_external_change_trigger_contains_changed_entities() {
