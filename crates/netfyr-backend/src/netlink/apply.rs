@@ -31,6 +31,11 @@ use super::ethernet::query_ethernet;
 /// Default route metric applied when the desired state does not specify one.
 const DEFAULT_ROUTE_METRIC: u32 = 100;
 
+/// Fields this backend can write. Any field not in this set is read-only and
+/// will be skipped with reason "read-only field" (defensive check — SPEC-203
+/// should exclude read-only fields from the diff before they reach here).
+const WRITABLE_FIELDS: &[&str] = &["mtu", "enabled", "addresses", "routes"];
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Apply all ethernet operations in `diff` to the running kernel state.
@@ -818,6 +823,29 @@ async fn apply_modify_fields(
                 }
                 Err(e) => failures.push(make_field_failure(name, e, "routes")),
             }
+        }
+    }
+
+    // ── Phase 4: Read-only field defensive check ──────────────────────────────
+
+    for field in changed_fields.keys() {
+        if !WRITABLE_FIELDS.contains(&field.as_str()) {
+            skipped.push(SkippedOperation {
+                operation: DiffOpKind::Modify,
+                entity_type: ETHERNET.to_string(),
+                selector: Selector::with_name(name),
+                reason: "read-only field".to_string(),
+            });
+        }
+    }
+    for field in removed_fields {
+        if !WRITABLE_FIELDS.contains(&field.as_str()) {
+            skipped.push(SkippedOperation {
+                operation: DiffOpKind::Modify,
+                entity_type: ETHERNET.to_string(),
+                selector: Selector::with_name(name),
+                reason: "read-only field".to_string(),
+            });
         }
     }
 
@@ -1829,6 +1857,192 @@ mod tests {
     fn test_addr_to_cidr_from_non_address() {
         let v = Value::U64(1500);
         assert_eq!(addr_to_cidr(&v), None);
+    }
+
+    // ── is_kernel_route ───────────────────────────────────────────────────────
+
+    /// Scenario: Modify operation must not remove kernel routes.
+    /// A route map with protocol="kernel" is detected as a kernel route.
+    #[test]
+    fn test_is_kernel_route_returns_true_for_protocol_kernel() {
+        let mut m = IndexMap::new();
+        m.insert("destination".to_string(), Value::String("10.0.0.0/8".to_string()));
+        m.insert("protocol".to_string(), Value::String("kernel".to_string()));
+        let v = Value::Map(m);
+        assert!(is_kernel_route(&v), "route with protocol='kernel' must be detected as a kernel route");
+    }
+
+    /// A route map with protocol="static" is NOT a kernel route.
+    #[test]
+    fn test_is_kernel_route_returns_false_for_static_protocol() {
+        let mut m = IndexMap::new();
+        m.insert("destination".to_string(), Value::String("0.0.0.0/0".to_string()));
+        m.insert("protocol".to_string(), Value::String("static".to_string()));
+        let v = Value::Map(m);
+        assert!(!is_kernel_route(&v), "route with protocol='static' must not be a kernel route");
+    }
+
+    /// A route map without a protocol field is NOT a kernel route.
+    #[test]
+    fn test_is_kernel_route_returns_false_when_protocol_absent() {
+        let mut m = IndexMap::new();
+        m.insert("destination".to_string(), Value::String("10.0.0.0/24".to_string()));
+        m.insert("gateway".to_string(), Value::String("10.0.0.1".to_string()));
+        let v = Value::Map(m);
+        assert!(!is_kernel_route(&v), "route without protocol field must not be a kernel route");
+    }
+
+    /// A non-map Value (e.g., a plain string) is never a kernel route.
+    #[test]
+    fn test_is_kernel_route_returns_false_for_non_map_value() {
+        let v = Value::String("10.0.0.0/24".to_string());
+        assert!(!is_kernel_route(&v), "non-map value must not be detected as a kernel route");
+    }
+
+    /// A map with protocol set to a numeric value is NOT a kernel route.
+    #[test]
+    fn test_is_kernel_route_returns_false_for_numeric_protocol() {
+        let mut m = IndexMap::new();
+        m.insert("destination".to_string(), Value::String("0.0.0.0/0".to_string()));
+        m.insert("protocol".to_string(), Value::U64(4));
+        let v = Value::Map(m);
+        assert!(!is_kernel_route(&v), "numeric protocol field must not be treated as 'kernel'");
+    }
+
+    // ── addr_valid_lft ────────────────────────────────────────────────────────
+
+    /// Scenario: Map-format addresses with valid_lft have CacheInfo set.
+    /// addr_valid_lft must extract the valid_lft field from a map Value.
+    #[test]
+    fn test_addr_valid_lft_returns_value_from_map() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("valid_lft".to_string(), Value::U64(3600));
+        let v = Value::Map(m);
+        assert_eq!(
+            addr_valid_lft(&v),
+            Some(3600),
+            "addr_valid_lft must return 3600 when valid_lft=3600 is in the map"
+        );
+    }
+
+    /// addr_valid_lft returns None when the valid_lft field is absent from the map.
+    #[test]
+    fn test_addr_valid_lft_returns_none_when_field_missing() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        let v = Value::Map(m);
+        assert_eq!(
+            addr_valid_lft(&v),
+            None,
+            "addr_valid_lft must return None when valid_lft is absent"
+        );
+    }
+
+    /// addr_valid_lft returns None for a plain-string address value (no map).
+    #[test]
+    fn test_addr_valid_lft_returns_none_for_non_map_value() {
+        let v = Value::String("10.0.1.50/24".to_string());
+        assert_eq!(
+            addr_valid_lft(&v),
+            None,
+            "addr_valid_lft must return None for a non-map Value"
+        );
+    }
+
+    /// addr_valid_lft returns None when valid_lft is present but has a non-integer type.
+    #[test]
+    fn test_addr_valid_lft_returns_none_when_field_is_non_integer() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("valid_lft".to_string(), Value::String("forever".to_string()));
+        let v = Value::Map(m);
+        assert_eq!(
+            addr_valid_lft(&v),
+            None,
+            "addr_valid_lft must return None when valid_lft is a non-integer"
+        );
+    }
+
+    // ── addr_preferred_lft ────────────────────────────────────────────────────
+
+    /// addr_preferred_lft extracts the preferred_lft field from a map Value.
+    #[test]
+    fn test_addr_preferred_lft_returns_value_from_map() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("preferred_lft".to_string(), Value::U64(1800));
+        let v = Value::Map(m);
+        assert_eq!(
+            addr_preferred_lft(&v),
+            Some(1800),
+            "addr_preferred_lft must return 1800 when preferred_lft=1800 is in the map"
+        );
+    }
+
+    /// addr_preferred_lft returns None when preferred_lft is absent from the map.
+    #[test]
+    fn test_addr_preferred_lft_returns_none_when_field_missing() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        let v = Value::Map(m);
+        assert_eq!(
+            addr_preferred_lft(&v),
+            None,
+            "addr_preferred_lft must return None when preferred_lft is absent"
+        );
+    }
+
+    /// addr_preferred_lft returns None for a plain-string value (no map).
+    #[test]
+    fn test_addr_preferred_lft_returns_none_for_non_map_value() {
+        let v = Value::String("10.0.1.50/24".to_string());
+        assert_eq!(
+            addr_preferred_lft(&v),
+            None,
+            "addr_preferred_lft must return None for a non-map Value"
+        );
+    }
+
+    /// A map with both valid_lft and preferred_lft returns both correctly.
+    #[test]
+    fn test_addr_lft_both_fields_present_in_map() {
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("valid_lft".to_string(), Value::U64(7200));
+        m.insert("preferred_lft".to_string(), Value::U64(3600));
+        let v = Value::Map(m);
+        assert_eq!(addr_valid_lft(&v), Some(7200), "valid_lft must be 7200");
+        assert_eq!(addr_preferred_lft(&v), Some(3600), "preferred_lft must be 3600");
+    }
+
+    // ── WRITABLE_FIELDS constant ──────────────────────────────────────────────
+
+    /// Scenario: Modify operation skips read-only fields (defensive).
+    /// The WRITABLE_FIELDS constant must include the expected writable fields.
+    #[test]
+    fn test_writable_fields_contains_mtu_enabled_addresses_routes() {
+        let writable = WRITABLE_FIELDS;
+        for expected in &["mtu", "enabled", "addresses", "routes"] {
+            assert!(
+                writable.contains(expected),
+                "WRITABLE_FIELDS must contain '{}'; got: {:?}",
+                expected, writable
+            );
+        }
+    }
+
+    /// Read-only fields carrier, speed, mac, driver, dns_servers must NOT be in WRITABLE_FIELDS.
+    #[test]
+    fn test_writable_fields_does_not_contain_carrier_speed_mac_driver() {
+        let writable = WRITABLE_FIELDS;
+        for read_only in &["carrier", "speed", "mac", "driver", "dns_servers", "name"] {
+            assert!(
+                !writable.contains(read_only),
+                "WRITABLE_FIELDS must NOT contain '{}'; got: {:?}",
+                read_only, writable
+            );
+        }
     }
 }
 
