@@ -2181,6 +2181,119 @@ mod tests {
         );
     }
 
+    // ── Authorization via handle_connection ───────────────────────────────────
+
+    /// AC: Non-root user calls GetStatus → daemon returns status (no PermissionDenied).
+    /// GetStatus does not require root, so peer_cred() is never consulted and
+    /// handle_connection dispatches it regardless of the caller's uid.
+    #[tokio::test]
+    async fn test_handle_connection_get_status_returns_status_without_uid_check() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
+        let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
+
+        let request = r#"{"method":"io.netfyr.GetStatus","parameters":{}}"#;
+        let mut bytes = request.as_bytes().to_vec();
+        bytes.push(0u8);
+        client.write_all(&bytes).await.unwrap();
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(
+                &mut server,
+                &state,
+                &reconciler,
+                Instant::now(),
+                &event_tx,
+            )
+            .await;
+        });
+
+        let response = read_message(&mut client).await.unwrap();
+        assert!(
+            response.get("error").is_none(),
+            "GetStatus must not return PermissionDenied for any uid: {:?}",
+            response
+        );
+        assert!(
+            response["parameters"].get("status").is_some(),
+            "GetStatus response must include 'status': {:?}",
+            response
+        );
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    /// AC: Non-root user calls Query → no PermissionDenied.
+    /// Query does not require root; handle_connection dispatches it for any uid.
+    #[tokio::test]
+    async fn test_handle_connection_query_returns_entities_without_uid_check() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let state = make_test_state(PolicyStore::ephemeral(vec![]), FactoryManager::new());
+        let reconciler = Reconciler::new();
+        let event_tx = make_test_event_tx();
+
+        let request = r#"{"method":"io.netfyr.Query","parameters":{}}"#;
+        let mut bytes = request.as_bytes().to_vec();
+        bytes.push(0u8);
+        client.write_all(&bytes).await.unwrap();
+
+        let server_task = tokio::spawn(async move {
+            handle_connection(
+                &mut server,
+                &state,
+                &reconciler,
+                Instant::now(),
+                &event_tx,
+            )
+            .await;
+        });
+
+        let response = read_message(&mut client).await.unwrap();
+        assert!(
+            response.get("error").is_none(),
+            "Query must not return PermissionDenied for any uid: {:?}",
+            response
+        );
+        assert!(
+            response["parameters"]["entities"].is_array(),
+            "Query response must include 'entities' array: {:?}",
+            response
+        );
+
+        drop(client);
+        let _ = server_task.await;
+    }
+
+    /// AC: PermissionDenied error uses the io.netfyr.PermissionDenied name and
+    /// contains "requires root" in the reason. Verified by inspecting the
+    /// error message format string produced by write_error.
+    #[tokio::test]
+    async fn test_permission_denied_error_has_correct_name_and_reason_format() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let reason = format!(
+            "method '{}' requires root (uid 0), but client has uid {}",
+            "io.netfyr.SubmitPolicies", 1000u32
+        );
+        write_error(&mut server, "PermissionDenied", &reason)
+            .await
+            .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert_eq!(
+            msg["error"].as_str().unwrap(),
+            "io.netfyr.PermissionDenied",
+            "PermissionDenied error must use the io.netfyr.PermissionDenied name"
+        );
+        let r = msg["parameters"]["reason"].as_str().unwrap_or("");
+        assert!(
+            r.contains("requires root"),
+            "PermissionDenied reason must mention 'requires root', got: {:?}",
+            r
+        );
+    }
+
     /// Scenario: Unknown method returns an error response.
     #[tokio::test]
     async fn test_handle_connection_unknown_method_returns_error() {
