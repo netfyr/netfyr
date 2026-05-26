@@ -12,3 +12,8 @@ members = [
     "crates/netfyr-test-utils",
     "xtask",
 ]
+
+[workspace.features]
+dhcp = []
+systemd = []
+varlink = []

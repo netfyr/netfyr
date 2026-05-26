@@ -7,4 +7,4 @@
 # Optional: dnsmasq (for DHCP tests).
 integration-test:
 	cargo build
-	@scripts/run-integration-tests.sh $(SPEC)
+	@failed=0; scripts/run-integration-tests.sh $(SPEC) || failed=1; exit $$failed

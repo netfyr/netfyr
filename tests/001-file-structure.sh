@@ -29,6 +29,8 @@ library_crates=(
     "netfyr-backend"
     "netfyr-policy"
     "netfyr-varlink"
+    "netfyr-journal"
+    "netfyr-test-utils"
 )
 
 for crate in "${library_crates[@]}"; do
@@ -45,7 +47,7 @@ for crate in "${library_crates[@]}"; do
     fi
 done
 
-# Binary crates must have Cargo.toml and src/main.rs.
+# Binary crates (under crates/) must have Cargo.toml and src/main.rs.
 binary_crates=(
     "netfyr-cli"
     "netfyr-daemon"
@@ -65,6 +67,18 @@ for crate in "${binary_crates[@]}"; do
     fi
 done
 
+# xtask lives at the workspace root (not under crates/) and must have
+# Cargo.toml and src/main.rs per the standard Rust xtask pattern.
+xtask_dir="$PROJECT_ROOT/xtask"
+if [[ ! -f "$xtask_dir/Cargo.toml" ]]; then
+    echo "FAIL: 001-file-structure: xtask/Cargo.toml does not exist" >&2
+    failed=1
+fi
+if [[ ! -f "$xtask_dir/src/main.rs" ]]; then
+    echo "FAIL: 001-file-structure: xtask/src/main.rs does not exist" >&2
+    failed=1
+fi
+
 # Verify each crate's Cargo.toml has edition = "2021" and version = "0.1.0".
 all_spec_crates=(
     "netfyr-state"
@@ -72,8 +86,10 @@ all_spec_crates=(
     "netfyr-backend"
     "netfyr-policy"
     "netfyr-varlink"
+    "netfyr-journal"
     "netfyr-cli"
     "netfyr-daemon"
+    "netfyr-test-utils"
 )
 
 for crate in "${all_spec_crates[@]}"; do
@@ -93,6 +109,19 @@ for crate in "${all_spec_crates[@]}"; do
         failed=1
     fi
 done
+
+# xtask Cargo.toml must also have edition = "2021" and version = "0.1.0".
+xtask_toml="$PROJECT_ROOT/xtask/Cargo.toml"
+if [[ -f "$xtask_toml" ]]; then
+    if ! grep -q 'edition = "2021"' "$xtask_toml"; then
+        echo "FAIL: 001-file-structure: xtask/Cargo.toml missing 'edition = \"2021\"'" >&2
+        failed=1
+    fi
+    if ! grep -q 'version = "0.1.0"' "$xtask_toml"; then
+        echo "FAIL: 001-file-structure: xtask/Cargo.toml missing 'version = \"0.1.0\"'" >&2
+        failed=1
+    fi
+fi
 
 if [[ "$failed" -eq 1 ]]; then
     exit 1

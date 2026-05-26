@@ -830,7 +830,7 @@ fn is_link_local_value(v: &netfyr_state::Value) -> bool {
         },
         netfyr_state::Value::Map(m) => m
             .get("address")
-            .map(|v| is_link_local_value(v))
+            .map(is_link_local_value)
             .unwrap_or(false),
         _ => false,
     }

@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash *)",
+      "Bash(MANWIDTH=80 man -l /home/test/work/netfyr/man/netfyr-examples.7)",
+      "Bash(git add *)",
+      "Bash(git commit --amend -m ' *)",
+      "Bash(git commit -m ' *)",
+      "Bash(python3 -m json.tool)",
+      "Bash(python3 *)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(ps *)",
+      "Bash(kill 109982 *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(podman ps *)",
+      "Bash(podman exec *)",
+      "Bash(podman logs *)"
+    ]
+  }
+}

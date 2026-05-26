@@ -758,7 +758,7 @@ fn inject_dhcp_addresses(
             continue;
         }
         if let Some(addr_fv) = state.fields.get("addresses") {
-            let has_lifetime = addr_fv.value.as_list().map_or(false, |list| {
+            let has_lifetime = addr_fv.value.as_list().is_some_and(|list| {
                 list.iter().any(|v| v.as_map().and_then(|m| m.get("valid_lft")).is_some())
             });
             if has_lifetime {
