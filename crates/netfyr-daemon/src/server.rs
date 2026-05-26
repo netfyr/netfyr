@@ -447,10 +447,18 @@ async fn handle_get_journal_entry(
         }
     };
 
-    let entry_value = match entry {
-        Some(e) => serde_json::to_value(&e).unwrap_or(serde_json::Value::Null),
-        None => serde_json::Value::Null,
+    let e = match entry {
+        Some(e) => e,
+        None => {
+            return write_error(
+                stream,
+                "EntryNotFound",
+                &format!("Entry #{} not found", seq),
+            )
+            .await;
+        }
     };
+    let entry_value = serde_json::to_value(&e).map_err(|err| anyhow::anyhow!("{}", err))?;
 
     write_success(stream, serde_json::json!({ "entry": entry_value })).await
 }
@@ -1773,9 +1781,9 @@ mod tests {
         );
     }
 
-    /// AC: handle_get_journal_entry returns entry when seq matches, null when not found.
+    /// AC: handle_get_journal_entry returns entry when seq matches, EntryNotFound when not found.
     #[tokio::test]
-    async fn test_handle_get_journal_entry_returns_entry_or_null() {
+    async fn test_handle_get_journal_entry_returns_entry_or_entry_not_found() {
         let dir = tempfile::TempDir::new().unwrap();
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1796,15 +1804,20 @@ mod tests {
             "seq=1 must return a non-null entry, got: {msg:?}"
         );
 
-        // seq=9999 must return null (not found)
+        // seq=9999 must return EntryNotFound error (not null)
         let (mut server2, mut client2) = make_stream_pair().await;
         handle_get_journal_entry(&mut server2, &serde_json::json!({"seq": 9999}))
             .await
             .unwrap();
         let msg2 = read_message(&mut client2).await.unwrap();
         assert!(
-            msg2["parameters"]["entry"].is_null(),
-            "non-existent seq must return null entry, got: {msg2:?}"
+            msg2.get("error").is_some(),
+            "non-existent seq must produce an error response, got: {msg2:?}"
+        );
+        let error_name = msg2["error"].as_str().unwrap_or("");
+        assert!(
+            error_name.contains("EntryNotFound"),
+            "error must be EntryNotFound for non-existent seq, got: {msg2:?}"
         );
 
         unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
