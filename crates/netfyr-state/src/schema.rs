@@ -339,6 +339,21 @@ impl SchemaRegistry {
     pub fn field_info(&self, entity_type: &str, field: &str) -> Option<FieldSchemaInfo> {
         self.schemas.get(entity_type)?.fields.get(field).cloned()
     }
+
+    /// Returns the comparison keys for a list field in an entity type.
+    ///
+    /// Returns `Some(keys)` when the field declares `x-netfyr-comparison-keys`
+    /// in its schema; returns `None` if the entity type or field is not found,
+    /// or if the field has no comparison keys. Callers that receive `None`
+    /// should fall back to full-value equality.
+    pub fn comparison_keys(&self, entity_type: &str, field_name: &str) -> Option<Vec<String>> {
+        let keys = &self.schemas.get(entity_type)?.fields.get(field_name)?.comparison_keys;
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys.clone())
+        }
+    }
 }
 
 impl Default for SchemaRegistry {
@@ -1571,6 +1586,121 @@ mod tests {
             "ethernet read-only fields diverged from pinned set.\n\
              If you changed a field's writable attribute, update this test \
              AND the query code in netfyr-backend."
+        );
+    }
+
+    // ── Feature: comparison_keys() method (SPEC-408) ──────────────────────────
+
+    /// Scenario: comparison_keys returns Some(["address"]) for the addresses field
+    ///
+    /// The "addresses" field in ip.json declares x-netfyr-comparison-keys=["address"].
+    /// This is the key mechanism behind DHCP renewal stability: valid_lft/preferred_lft
+    /// changes during T1 renewal are ignored because only the "address" key determines
+    /// whether two list items are the same.
+    #[test]
+    fn test_comparison_keys_addresses_returns_some_with_address_key() {
+        let registry = SchemaRegistry::new();
+        let keys = registry.comparison_keys("ethernet", "addresses");
+        assert_eq!(
+            keys,
+            Some(vec!["address".to_string()]),
+            "comparison_keys(\"ethernet\", \"addresses\") must return Some([\"address\"]) \
+             — this is required for DHCP renewal stability (SPEC-408)"
+        );
+    }
+
+    /// Scenario: comparison_keys returns None for a field that has no x-netfyr-comparison-keys
+    ///
+    /// Fields without x-netfyr-comparison-keys (like mtu) use full-value equality.
+    /// Callers that receive None must fall back to full PartialEq comparison.
+    #[test]
+    fn test_comparison_keys_returns_none_for_field_without_comparison_keys() {
+        let registry = SchemaRegistry::new();
+        let keys = registry.comparison_keys("ethernet", "mtu");
+        assert_eq!(
+            keys,
+            None,
+            "comparison_keys(\"ethernet\", \"mtu\") must return None \
+             because mtu has no x-netfyr-comparison-keys annotation"
+        );
+    }
+
+    /// Scenario: comparison_keys returns None for an unknown entity type
+    ///
+    /// An unknown entity type has no registered schema, so no comparison keys
+    /// can exist for any of its fields. The diff engine falls back to full-value
+    /// equality for all fields of unregistered entity types.
+    #[test]
+    fn test_comparison_keys_unknown_entity_type_returns_none() {
+        let registry = SchemaRegistry::new();
+        let keys = registry.comparison_keys("nonexistent_type", "addresses");
+        assert!(
+            keys.is_none(),
+            "comparison_keys for an unknown entity type must return None, \
+             got: {:?}",
+            keys
+        );
+    }
+
+    /// Scenario: comparison_keys returns None for an unknown field name
+    ///
+    /// A field not in the schema has no comparison key annotation.
+    /// The diff engine falls back to full-value equality.
+    #[test]
+    fn test_comparison_keys_unknown_field_returns_none() {
+        let registry = SchemaRegistry::new();
+        let keys = registry.comparison_keys("ethernet", "no_such_field");
+        assert!(
+            keys.is_none(),
+            "comparison_keys for an unknown field must return None, \
+             got: {:?}",
+            keys
+        );
+    }
+
+    /// Scenario: comparison_keys returns None for routes (no comparison keys defined)
+    ///
+    /// The routes field has no x-netfyr-comparison-keys in ip.json, so
+    /// full-value equality is used when comparing routes.
+    #[test]
+    fn test_comparison_keys_routes_returns_none() {
+        let registry = SchemaRegistry::new();
+        let keys = registry.comparison_keys("ethernet", "routes");
+        assert!(
+            keys.is_none(),
+            "comparison_keys(\"ethernet\", \"routes\") must return None \
+             because routes has no x-netfyr-comparison-keys annotation"
+        );
+    }
+
+    /// Scenario: addresses field with same IP key but changed preferred_lft also
+    /// produces no diff
+    ///
+    /// During DHCP renewal, both valid_lft and preferred_lft change. Because
+    /// x-netfyr-comparison-keys=["address"] only checks the "address" key,
+    /// changes to either lifetime field must be invisible to the diff engine.
+    /// This test verifies via SchemaRegistry that the comparison_keys for
+    /// "addresses" exclude both lifetime fields.
+    #[test]
+    fn test_comparison_keys_for_addresses_excludes_preferred_lft() {
+        let registry = SchemaRegistry::new();
+        let keys = registry
+            .comparison_keys("ethernet", "addresses")
+            .expect("addresses must have comparison keys");
+        assert!(
+            !keys.contains(&"preferred_lft".to_string()),
+            "comparison_keys for addresses must NOT include preferred_lft \
+             — lifetime changes during DHCP renewal must not trigger a diff"
+        );
+        assert!(
+            !keys.contains(&"valid_lft".to_string()),
+            "comparison_keys for addresses must NOT include valid_lft \
+             — lifetime changes during DHCP renewal must not trigger a diff"
+        );
+        assert!(
+            keys.contains(&"address".to_string()),
+            "comparison_keys for addresses must include \"address\" \
+             — this is the identity key for DHCP renewal stability"
         );
     }
 }
