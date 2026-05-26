@@ -30,15 +30,18 @@ if ! grep -qi 'declarative\|network configuration\|netlink' "$README"; then
     failed=1
 fi
 
-# Must list all seven crates with their roles.
+# Must list all ten crates with their roles.
 required_crates=(
     "netfyr-state"
     "netfyr-reconcile"
     "netfyr-backend"
     "netfyr-policy"
     "netfyr-varlink"
+    "netfyr-journal"
     "netfyr-cli"
     "netfyr-daemon"
+    "netfyr-test-utils"
+    "xtask"
 )
 
 for crate in "${required_crates[@]}"; do

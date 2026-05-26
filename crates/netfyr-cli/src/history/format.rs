@@ -208,9 +208,10 @@ pub(crate) fn format_text_list_with_width(
         let excess_ent = ideal_ent.saturating_sub(MIN_ENT);
         let excess_chg = ideal_changes.saturating_sub(MIN_CHANGES);
         let excess_total = excess_trig + excess_ent + excess_chg;
-        if excess_total > 0 {
-            let t = MIN_TRIG + (remaining * excess_trig / excess_total);
-            let e = MIN_ENT + (remaining * excess_ent / excess_total);
+        if let Some(t_extra) = (remaining * excess_trig).checked_div(excess_total) {
+            let e_extra = remaining * excess_ent / excess_total;
+            let t = MIN_TRIG + t_extra;
+            let e = MIN_ENT + e_extra;
             let c = available - t - e;
             (t, e, c)
         } else {

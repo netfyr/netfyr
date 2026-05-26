@@ -564,7 +564,7 @@ async fn apply_modify_fields(
             .and_then(|fv| fv.value.as_list())
             .map(|list| {
                 list.iter()
-                    .filter_map(|v| addr_to_cidr(v))
+                    .filter_map(addr_to_cidr)
                     .collect()
             })
             .unwrap_or_default();

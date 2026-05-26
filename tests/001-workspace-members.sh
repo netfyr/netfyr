@@ -33,8 +33,11 @@ required_members=(
     "crates/netfyr-backend"
     "crates/netfyr-policy"
     "crates/netfyr-varlink"
+    "crates/netfyr-journal"
     "crates/netfyr-cli"
     "crates/netfyr-daemon"
+    "crates/netfyr-test-utils"
+    "xtask"
 )
 
 for member in "${required_members[@]}"; do
@@ -43,6 +46,16 @@ for member in "${required_members[@]}"; do
         failed=1
     fi
 done
+
+# Verify the workspace contains exactly 10 members (not more, not fewer).
+actual_count=$(grep -c '"crates/' "$CARGO_TOML" 2>/dev/null || echo 0)
+# Add 1 for xtask (which is not under crates/)
+xtask_count=$(grep -c '"xtask"' "$CARGO_TOML" 2>/dev/null || echo 0)
+total_count=$((actual_count + xtask_count))
+if [[ "$total_count" -ne 10 ]]; then
+    echo "FAIL: 001-workspace-members: expected exactly 10 workspace members, found $total_count" >&2
+    failed=1
+fi
 
 # Verify the [workspace] section and resolver = "2" are present.
 if ! grep -q '^\[workspace\]' "$CARGO_TOML"; then

@@ -312,7 +312,7 @@ pub(crate) fn entities_summary_with_state(
         let names: Vec<String> = state_entities
             .iter()
             .filter(|s| !SYSTEM_ENTITY_TYPES.contains(&s.entity_type.as_str()))
-            .map(|s| state_entity_display_name(s))
+            .map(state_entity_display_name)
             .collect();
         if names.is_empty() {
             return "(none)".to_string();
@@ -349,7 +349,7 @@ pub(crate) fn entities_summary_with_state(
     if count <= 6 {
         // Prioritize lifecycle (add/remove) entities, show first 2
         let mut sorted = items.clone();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|k| std::cmp::Reverse(k.1));
         let shown: Vec<&str> = sorted[..2].iter().map(|(s, _)| s.as_str()).collect();
         return format!("{} (+{} more)", shown.join(", "), count - 2);
     }

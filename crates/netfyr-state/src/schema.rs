@@ -195,9 +195,7 @@ impl SchemaRegistry {
     pub fn new() -> Self {
         let fragments = load_fragments();
         let mut schemas = HashMap::new();
-        for (name, src) in [(ETHERNET, ETHERNET_SCHEMA)] {
-            schemas.insert(name.to_string(), load_entity_schema(name, src, &fragments));
-        }
+        schemas.insert(ETHERNET.to_string(), load_entity_schema(ETHERNET, ETHERNET_SCHEMA, &fragments));
         SchemaRegistry { schemas }
     }
 
