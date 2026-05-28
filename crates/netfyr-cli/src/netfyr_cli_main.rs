@@ -5,11 +5,6 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if std::env::args().len() == 1 {
-        println!("netfyr");
-        std::process::exit(0);
-    }
-
     let cli = Cli::parse();
     resolve_color_mode(&cli.color);
 

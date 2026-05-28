@@ -122,7 +122,9 @@ fn test_cli_binary_is_produced() {
     );
 }
 
-/// AC: Running the netfyr-cli binary prints "netfyr" to stdout.
+/// AC: Running the netfyr-cli binary with no arguments prints help containing "netfyr" to stderr.
+///
+/// SPEC-301: clap SubcommandRequiredElseHelp writes help to stderr and exits 2 when no subcommand is given.
 #[test]
 fn test_cli_binary_prints_netfyr() {
     let root = workspace_root();
@@ -139,17 +141,11 @@ fn test_cli_binary_prints_netfyr() {
         .output()
         .expect("failed to run netfyr-cli binary");
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "netfyr-cli exited with non-zero status: {}",
-        output.status
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        stdout.trim(),
-        "netfyr",
-        "netfyr-cli stdout was {:?}, expected \"netfyr\"",
-        stdout
+        stderr.contains("netfyr"),
+        "netfyr-cli stderr was {:?}, expected it to contain \"netfyr\"",
+        stderr
     );
 }
 

@@ -511,20 +511,11 @@ pub fn display_apply_report(report: &ApplyReport, conflicts: &ConflictReport) {
             op.error
         );
     }
-    for op in &report.skipped {
-        println!(
-            "  {} {} {}: {}",
-            "s".dimmed(),
-            op.entity_type,
-            op.selector.key(),
-            op.reason
-        );
-    }
 
     // Summary line.
     let succeeded = report.succeeded.len();
     let failed = report.failed.len();
-    let total = succeeded + failed + report.skipped.len();
+    let total = succeeded + failed;
 
     if failed == 0 && succeeded == 0 {
         // Nothing happened (all skipped or empty).
@@ -564,16 +555,19 @@ pub fn display_apply_report(report: &ApplyReport, conflicts: &ConflictReport) {
         } else {
             format!(" ({})", parts.join(", "))
         };
-        println!("{}", format!("Applied {} changes{}.", succeeded, suffix).green());
+        let change_word = if succeeded == 1 { "change" } else { "changes" };
+        println!("{}", format!("Applied {} {}{}.", succeeded, change_word, suffix).green());
     } else if succeeded > 0 {
+        let change_word = if total == 1 { "change" } else { "changes" };
         println!(
             "{}",
-            format!("Applied {} of {} changes. {} failed.", succeeded, total, failed).yellow()
+            format!("Applied {} of {} {}. {} failed.", succeeded, total, change_word, failed).yellow()
         );
     } else {
+        let change_word = if failed == 1 { "change" } else { "changes" };
         println!(
             "{}",
-            format!("All {} changes failed.", failed).red()
+            format!("All {} {} failed.", failed, change_word).red()
         );
     }
 }
@@ -602,8 +596,8 @@ fn display_varlink_apply_report(report: &VarlinkApplyReport, policy_count: usize
         }
     }
 
-    // Per-change lines.
-    for entry in &report.changes {
+    // Per-change lines. Skipped operations are not shown (spec: only succeeded and failed).
+    for entry in report.changes.iter().filter(|e| e.status != "skipped") {
         let (prefix, colored_line) = match entry.status.as_str() {
             "applied" => {
                 let prefix = match entry.kind.as_str() {
@@ -620,14 +614,6 @@ fn display_varlink_apply_report(report: &VarlinkApplyReport, policy_count: usize
             }
             "failed" => {
                 let prefix = "x".red().to_string();
-                let line = format!(
-                    "  {} {} {}: {}",
-                    prefix, entry.entity_type, entry.entity_name, entry.description
-                );
-                (prefix, line)
-            }
-            "skipped" => {
-                let prefix = "s".dimmed().to_string();
                 let line = format!(
                     "  {} {} {}: {}",
                     prefix, entry.entity_type, entry.entity_name, entry.description
@@ -653,33 +639,33 @@ fn display_varlink_apply_report(report: &VarlinkApplyReport, policy_count: usize
     let failed = report.failed;
 
     if failed == 0 {
+        let change_word = if succeeded == 1 { "change" } else { "changes" };
         println!(
             "{}",
             format!(
-                "Submitted {} {} to daemon. Applied {} changes.",
-                policy_count, policy_word, succeeded
+                "Submitted {} {} to daemon. Applied {} {}.",
+                policy_count, policy_word, succeeded, change_word
             )
             .green()
         );
     } else if succeeded > 0 {
+        let total = succeeded + failed;
+        let change_word = if total == 1 { "change" } else { "changes" };
         println!(
             "{}",
             format!(
-                "Submitted {} {} to daemon. Applied {} of {} changes. {} failed.",
-                policy_count,
-                policy_word,
-                succeeded,
-                succeeded + failed,
-                failed
+                "Submitted {} {} to daemon. Applied {} of {} {}. {} failed.",
+                policy_count, policy_word, succeeded, total, change_word, failed
             )
             .yellow()
         );
     } else {
+        let change_word = if failed == 1 { "change" } else { "changes" };
         println!(
             "{}",
             format!(
-                "Submitted {} {} to daemon. All {} changes failed.",
-                policy_count, policy_word, failed
+                "Submitted {} {} to daemon. All {} {} failed.",
+                policy_count, policy_word, failed, change_word
             )
             .red()
         );
