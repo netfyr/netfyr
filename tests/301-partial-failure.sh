@@ -30,15 +30,15 @@ POLICY_DIR=$(mktemp -d)
 
 # Policy for the existing interface — change its MTU.
 cat > "$POLICY_DIR/veth-test0.yaml" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 mtu: 1400
 EOF
 
 # Policy for a non-existent interface — this should fail at apply time.
 cat > "$POLICY_DIR/veth-nonexistent99.yaml" <<'EOF'
-type: ethernet
-name: veth-nonexistent99
+selector:
+  name: veth-nonexistent99
 mtu: 1400
 EOF
 

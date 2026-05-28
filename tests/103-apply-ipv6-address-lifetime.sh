@@ -25,8 +25,8 @@ create_veth veth-test0 veth-test1
 
 POLICY_FILE=$(mktemp --suffix=.yaml)
 cat > "$POLICY_FILE" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 addresses:
   - address: "fd00:aa::1/64"
     valid_lft: 120

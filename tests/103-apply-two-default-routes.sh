@@ -32,8 +32,8 @@ add_address veth-rt1 10.99.91.1/24
 # Apply a default route via each interface (same metric, different gateways).
 POLICY0=$(mktemp --suffix=.yaml)
 cat > "$POLICY0" <<'EOF'
-type: ethernet
-name: veth-rt0
+selector:
+  name: veth-rt0
 addresses:
   - "10.99.90.1/24"
 routes:
@@ -44,8 +44,8 @@ EOF
 
 POLICY1=$(mktemp --suffix=.yaml)
 cat > "$POLICY1" <<'EOF'
-type: ethernet
-name: veth-rt1
+selector:
+  name: veth-rt1
 addresses:
   - "10.99.91.1/24"
 routes:

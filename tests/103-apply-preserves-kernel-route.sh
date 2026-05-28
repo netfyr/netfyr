@@ -42,8 +42,8 @@ fi
 # Apply a static policy that sets addresses and a default route.
 POLICY_FILE=$(mktemp --suffix=.yaml)
 cat > "$POLICY_FILE" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 addresses:
   - "10.99.50.1/24"
 routes:

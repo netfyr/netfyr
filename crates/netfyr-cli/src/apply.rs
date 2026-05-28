@@ -916,7 +916,7 @@ mod tests {
     fn test_load_policies_bare_state_yaml_factory_type_is_static() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("eth0.yaml");
-        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
 
         let policy_set = load_policies(&[path]).unwrap();
         let policy = policy_set.get("eth0").expect("policy 'eth0' must exist");
@@ -932,7 +932,7 @@ mod tests {
     fn test_load_policies_bare_state_yaml_default_priority_is_100() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("eth0.yaml");
-        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
 
         let policy_set = load_policies(&[path]).unwrap();
         let policy = policy_set.get("eth0").expect("policy 'eth0' must exist");
@@ -944,7 +944,7 @@ mod tests {
     fn test_load_policies_bare_state_policy_name_derived_from_filename() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("myinterface.yaml");
-        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
 
         let policy_set = load_policies(&[path]).unwrap();
         assert!(
@@ -957,8 +957,8 @@ mod tests {
     #[test]
     fn test_load_policies_directory_loads_multiple_yaml_files() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("eth0.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
-        fs::write(dir.path().join("eth1.yaml"), "type: ethernet\nname: eth1\nmtu: 9000\n").unwrap();
+        fs::write(dir.path().join("eth0.yaml"), "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.path().join("eth1.yaml"), "selector:\n  name: eth1\nmtu: 9000\n").unwrap();
 
         let policy_set = load_policies(&[dir.path().to_path_buf()]).unwrap();
         assert_eq!(policy_set.len(), 2, "directory with two YAML files must produce two policies");
@@ -968,8 +968,8 @@ mod tests {
     #[test]
     fn test_load_policies_directory_each_policy_accessible_by_name() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("eth0.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
-        fs::write(dir.path().join("eth1.yaml"), "type: ethernet\nname: eth1\nmtu: 9000\n").unwrap();
+        fs::write(dir.path().join("eth0.yaml"), "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.path().join("eth1.yaml"), "selector:\n  name: eth1\nmtu: 9000\n").unwrap();
 
         let policy_set = load_policies(&[dir.path().to_path_buf()]).unwrap();
         assert!(policy_set.get("eth0").is_some(), "policy 'eth0' must be loaded from eth0.yaml");
@@ -1203,7 +1203,7 @@ mod tests {
     fn test_load_policies_single_valid_file_returns_one_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("eth0.yaml");
-        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
 
         let policy_set = load_policies(&[path]).unwrap();
         assert_eq!(policy_set.len(), 1, "single YAML file must produce exactly one policy");
@@ -1215,8 +1215,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path0 = dir.path().join("eth0.yaml");
         let path1 = dir.path().join("eth1.yaml");
-        fs::write(&path0, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
-        fs::write(&path1, "type: ethernet\nname: eth1\nmtu: 9000\n").unwrap();
+        fs::write(&path0, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path1, "selector:\n  name: eth1\nmtu: 9000\n").unwrap();
 
         let policy_set = load_policies(&[path0, path1]).unwrap();
         assert_eq!(policy_set.len(), 2, "two file paths must produce two policies in combined set");
@@ -1240,8 +1240,8 @@ mod tests {
         // Both files have stem "eth0" so both produce policy name "eth0" (bare-state auto-wrap).
         let path1 = dir1.path().join("eth0.yaml");
         let path2 = dir2.path().join("eth0.yaml");
-        fs::write(&path1, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
-        fs::write(&path2, "type: ethernet\nname: eth0\nmtu: 9000\n").unwrap();
+        fs::write(&path1, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path2, "selector:\n  name: eth0\nmtu: 9000\n").unwrap();
 
         let result = load_policies(&[path1, path2]);
         assert!(result.is_err(), "duplicate policy names across paths must return Err");

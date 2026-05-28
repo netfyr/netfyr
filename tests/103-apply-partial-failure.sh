@@ -32,15 +32,15 @@ TMPDIR_POLICY=$(mktemp -d)
 
 # Policy 1: valid interface — should succeed.
 cat > "$TMPDIR_POLICY/veth-test0.yaml" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 mtu: 1400
 EOF
 
 # Policy 2: non-existent interface — should fail.
 cat > "$TMPDIR_POLICY/eth99.yaml" <<'EOF'
-type: ethernet
-name: eth99
+selector:
+  name: eth99
 mtu: 9000
 EOF
 
