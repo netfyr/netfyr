@@ -5,10 +5,11 @@
 
 pub mod apply;
 pub mod ethernet;
+pub mod interface;
 pub mod query;
 
 use async_trait::async_trait;
-use netfyr_state::{entity_types::ETHERNET, EntityType, Selector, StateDiff, StateSet};
+use netfyr_state::{entity_types::{ETHERNET, WIFI}, EntityType, Selector, StateDiff, StateSet};
 
 use crate::{ApplyReport, BackendError, DryRunReport, NetworkBackend};
 
@@ -18,7 +19,7 @@ use query::establish_connection;
 
 /// `NetworkBackend` implementation backed by Linux netlink (rtnetlink).
 ///
-/// Currently supports the `"ethernet"` entity type.  A new netlink connection
+/// Supports the `"ethernet"` and `"wifi"` entity types. A new netlink connection
 /// is opened per query call — see [`query::establish_connection`] for rationale.
 pub struct NetlinkBackend {
     supported_entities: Vec<EntityType>,
@@ -28,7 +29,7 @@ impl NetlinkBackend {
     /// Create a new `NetlinkBackend` with the default supported entity types.
     pub fn new() -> Self {
         Self {
-            supported_entities: vec![ETHERNET.to_string()],
+            supported_entities: vec![ETHERNET.to_string(), WIFI.to_string()],
         }
     }
 }
@@ -53,7 +54,11 @@ impl NetworkBackend for NetlinkBackend {
         match entity_type.as_str() {
             ETHERNET => {
                 let handle = establish_connection().await?;
-                ethernet::query_ethernet(&handle, selector).await
+                interface::query_interfaces(&handle, Some(ETHERNET), selector).await
+            }
+            WIFI => {
+                let handle = establish_connection().await?;
+                interface::query_interfaces(&handle, Some(WIFI), selector).await
             }
             _ => Err(BackendError::UnsupportedEntityType(entity_type.clone())),
         }
@@ -99,19 +104,30 @@ mod tests {
         );
     }
 
-    /// Scenario: query_all includes all ethernet interfaces — the backend must advertise
-    /// exactly one entity type ("ethernet") so query_all iterates over it.
+    /// Scenario: NetlinkBackend supports entity type "wifi".
     #[test]
-    fn test_netlink_backend_supported_entities_has_exactly_one_ethernet_entry() {
+    fn test_netlink_backend_supports_wifi_entity_type() {
+        let backend = NetlinkBackend::new();
+        assert!(
+            backend.supported_entities().contains(&"wifi".to_string()),
+            "NetlinkBackend::new() must include 'wifi' in supported_entities"
+        );
+    }
+
+    /// Scenario: query_all includes all interfaces — the backend must advertise
+    /// exactly two entity types ("ethernet" and "wifi").
+    #[test]
+    fn test_netlink_backend_supported_entities_has_exactly_two_entries() {
         let backend = NetlinkBackend::new();
         let entities = backend.supported_entities();
         assert_eq!(
             entities.len(),
-            1,
-            "NetlinkBackend must support exactly one entity type; got: {:?}",
+            2,
+            "NetlinkBackend must support exactly two entity types; got: {:?}",
             entities
         );
-        assert_eq!(entities[0], "ethernet");
+        assert!(entities.contains(&"ethernet".to_string()));
+        assert!(entities.contains(&"wifi".to_string()));
     }
 
     /// NetlinkBackend::default() must produce the same supported_entities as ::new().
@@ -131,10 +147,10 @@ mod tests {
     #[tokio::test]
     async fn test_query_unsupported_entity_type_returns_error() {
         let backend = NetlinkBackend::new();
-        let result = backend.query(&"wifi".to_string(), None).await;
+        let result = backend.query(&"bond".to_string(), None).await;
         match result {
             Err(BackendError::UnsupportedEntityType(t)) => {
-                assert_eq!(t, "wifi", "error must name the unsupported entity type");
+                assert_eq!(t, "bond", "error must name the unsupported entity type");
             }
             other => panic!("expected UnsupportedEntityType, got {:?}", other),
         }

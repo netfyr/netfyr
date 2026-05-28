@@ -24,7 +24,7 @@ use crate::report::{
 };
 use crate::BackendError;
 
-use super::ethernet::query_ethernet;
+use super::interface::query_interfaces;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -881,7 +881,7 @@ async fn resolve_link_index(handle: &Handle, name: &str) -> Result<u32, BackendE
 /// Query the current `State` for a named interface (for delta computation).
 async fn get_current_state(handle: &Handle, name: &str) -> Result<State, BackendError> {
     let sel = Selector::with_name(name);
-    let state_set = query_ethernet(handle, Some(&sel)).await?;
+    let state_set = query_interfaces(handle, None, Some(&sel)).await?;
     // Collect the first state before `state_set` is dropped.
     let first = state_set.iter().next().cloned();
     first.ok_or_else(|| BackendError::NotFound {
