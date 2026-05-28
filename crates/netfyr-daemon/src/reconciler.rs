@@ -1197,7 +1197,7 @@ mod tests {
         use netfyr_policy::parse_policy_yaml;
         let reconciler = Reconciler::new();
         let yaml = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
-                    state:\n  type: ethernet\n  name: managed-iface0\n  mtu: 1400\n";
+                    selector:\n  name: managed-iface0\nstate:\n  mtu: 1400\n";
         let policies = parse_policy_yaml(yaml).unwrap();
         let store = PolicyStore::ephemeral(policies);
         let fm = FactoryManager::new();
@@ -1214,7 +1214,7 @@ mod tests {
         use netfyr_policy::parse_policy_yaml;
         let reconciler = Reconciler::new();
         let yaml = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
-                    state:\n  type: ethernet\n  name: managed-iface0\n  mtu: 1400\n";
+                    selector:\n  name: managed-iface0\nstate:\n  mtu: 1400\n";
         let policies = parse_policy_yaml(yaml).unwrap();
         let store = PolicyStore::ephemeral(policies);
         let fm = FactoryManager::new();
@@ -1231,9 +1231,9 @@ mod tests {
         use netfyr_policy::parse_policy_yaml;
         let reconciler = Reconciler::new();
         let yaml = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
-                    state:\n  type: ethernet\n  name: iface-a\n  mtu: 1400\n\
+                    selector:\n  name: iface-a\nstate:\n  mtu: 1400\n\
                     ---\nkind: policy\nname: p2\nfactory: static\npriority: 100\n\
-                    state:\n  type: ethernet\n  name: iface-b\n  mtu: 1500\n";
+                    selector:\n  name: iface-b\nstate:\n  mtu: 1500\n";
         let policies = parse_policy_yaml(yaml).unwrap();
         let store = PolicyStore::ephemeral(policies);
         let fm = FactoryManager::new();

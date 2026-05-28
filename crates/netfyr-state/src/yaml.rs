@@ -6,21 +6,13 @@
 //! `serde_yaml::Value` manipulation to avoid conflicting with the existing
 //! JSON-oriented `Serialize`/`Deserialize` derives on `State`.
 
-use crate::{FieldValue, MacAddr, MacAddrParseError, Provenance, Selector, State, StateMetadata, Value};
+use crate::{FieldValue, MacAddrParseError, Provenance, Selector, State, StateMetadata, Value};
 use indexmap::IndexMap;
 use ipnetwork::IpNetwork;
 use serde::de::Deserialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-
-// ── Property classification constants ─────────────────────────────────────────
-
-/// Properties that map to the Selector (matching properties).
-const SELECTOR_KEYS: &[&str] = &["name", "driver", "mac", "pci_path", "labels"];
-
-/// Properties with special meaning (not stored in State).
-const META_KEYS: &[&str] = &["kind", "type"];
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -181,133 +173,6 @@ pub fn serialize_value(v: &Value) -> serde_yaml::Value {
 
 // ── State parsing ─────────────────────────────────────────────────────────────
 
-/// Backward-compatible flat-format parser. Used by `parse_state_value` for
-/// `netfyr-policy`. Will be removed by SPEC-007 when the policy layer migrates
-/// to the selector sub-mapping format.
-///
-/// Requires a top-level `type:` key; extracts selector fields (name, driver,
-/// mac, pci_path, labels) from the top level; everything else becomes a field.
-fn parse_raw_to_state_flat(raw: serde_yaml::Value) -> Result<State, YamlError> {
-    let map = match raw {
-        serde_yaml::Value::Mapping(m) => m,
-        _ => return Err(YamlError::ExpectedMapping),
-    };
-
-    // Check optional `kind` field.
-    let kind_key = serde_yaml::Value::String("kind".to_string());
-    if let Some(kind_val) = map.get(&kind_key) {
-        match kind_val {
-            serde_yaml::Value::String(k) if k == "state" => {}
-            serde_yaml::Value::String(k) => return Err(YamlError::InvalidKind(k.clone())),
-            _ => return Err(YamlError::InvalidKind("<non-string>".to_string())),
-        }
-    }
-
-    // Extract required `type` → entity_type.
-    let type_key = serde_yaml::Value::String("type".to_string());
-    let entity_type = match map.get(&type_key) {
-        Some(serde_yaml::Value::String(t)) => t.clone(),
-        Some(_) => {
-            return Err(YamlError::ExpectedString {
-                key: "type".to_string(),
-            })
-        }
-        None => return Err(YamlError::MissingType),
-    };
-
-    // Build selector from SELECTOR_KEYS.
-    let mut selector = Selector::default();
-
-    let extract_str = |map: &serde_yaml::Mapping, key: &str| -> Result<Option<String>, YamlError> {
-        let k = serde_yaml::Value::String(key.to_string());
-        match map.get(&k) {
-            None => Ok(None),
-            Some(serde_yaml::Value::String(s)) => Ok(Some(s.clone())),
-            Some(_) => Err(YamlError::ExpectedString {
-                key: key.to_string(),
-            }),
-        }
-    };
-
-    if let Some(name) = extract_str(&map, "name")? {
-        selector.name = Some(name);
-    }
-    if let Some(driver) = extract_str(&map, "driver")? {
-        selector.driver = Some(driver);
-    }
-    if let Some(pci_path) = extract_str(&map, "pci_path")? {
-        selector.pci_path = Some(pci_path);
-    }
-    if let Some(mac_str) = extract_str(&map, "mac")? {
-        let mac = MacAddr::from_str(&mac_str).map_err(|source| YamlError::InvalidMac {
-            value: mac_str,
-            source,
-        })?;
-        selector.mac = Some(mac);
-    }
-
-    // Parse optional labels mapping.
-    let labels_key = serde_yaml::Value::String("labels".to_string());
-    if let Some(labels_val) = map.get(&labels_key) {
-        match labels_val {
-            serde_yaml::Value::Mapping(labels_map) => {
-                for (lk, lv) in labels_map {
-                    let label_key = match lk {
-                        serde_yaml::Value::String(s) => s.clone(),
-                        _ => {
-                            return Err(YamlError::ExpectedString {
-                                key: "labels.<key>".to_string(),
-                            })
-                        }
-                    };
-                    let label_val = match lv {
-                        serde_yaml::Value::String(s) => s.clone(),
-                        _ => {
-                            return Err(YamlError::ExpectedString {
-                                key: format!("labels.{label_key}"),
-                            })
-                        }
-                    };
-                    selector.labels.insert(label_key, label_val);
-                }
-            }
-            _ => {
-                return Err(YamlError::ExpectedMapping);
-            }
-        }
-    }
-
-    // All remaining keys (not in META_KEYS or SELECTOR_KEYS) become fields.
-    let mut fields = IndexMap::new();
-    for (k, v) in &map {
-        let key_str = match k {
-            serde_yaml::Value::String(s) => s.as_str(),
-            _ => continue, // skip non-string keys silently
-        };
-        if META_KEYS.contains(&key_str) || SELECTOR_KEYS.contains(&key_str) {
-            continue;
-        }
-        let value = deserialize_value(v)?;
-        fields.insert(
-            key_str.to_string(),
-            FieldValue {
-                value,
-                provenance: Provenance::UserConfigured {
-                    policy_ref: String::new(),
-                },
-            },
-        );
-    }
-
-    Ok(State {
-        entity_type,
-        selector,
-        fields,
-        metadata: StateMetadata::new(),
-        policy_ref: None,
-        priority: 100,
-    })
-}
 
 /// Parses one YAML document (selector sub-mapping format) into a `State`.
 ///
@@ -379,15 +244,13 @@ fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError> {
 
 /// Parses a raw `serde_yaml::Value` (flat-format mapping) into a `State`.
 ///
-/// This is the public interface to the flat-format parser. It accepts the same
-/// input as the old `parse_yaml` document-by-document. Used by `netfyr-policy`
-/// to convert embedded `state:` / `states:` sub-documents inside policy YAML
-/// into `State` values without re-serializing them to strings first.
+/// Parses an embedded `state:` / `states:` sub-document from policy YAML.
 ///
-/// Requires a top-level `type:` key. Will be updated to use the selector
-/// sub-mapping format by SPEC-007.
+/// Uses the selector sub-mapping format: no `type:` key required; the target
+/// entity is identified by the enclosing policy's `selector:`. All top-level
+/// keys (except `kind` and `selector`) become fields.
 pub fn parse_state_value(raw: serde_yaml::Value) -> Result<State, YamlError> {
-    parse_raw_to_state_flat(raw)
+    parse_raw_to_state(raw)
 }
 
 /// Parses a YAML string that may contain one or more `---`-separated documents.
