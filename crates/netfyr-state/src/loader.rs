@@ -113,18 +113,19 @@ mod tests {
     #[test]
     fn test_load_dir_loads_all_yaml_and_yml_files_three_entities() {
         let dir = temp_dir("load_all");
-        fs::write(dir.join("eth0.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
-        fs::write(dir.join("dns.yaml"), "type: dns\nname: primary\n").unwrap();
-        fs::write(dir.join("bond.yml"), "type: bond\nname: bond0\n").unwrap();
+        fs::write(dir.join("eth0.yaml"), "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.join("dns.yaml"), "selector:\n  name: primary\n").unwrap();
+        fs::write(dir.join("bond.yml"), "selector:\n  name: bond0\n").unwrap();
 
         let result = load_dir(&dir);
         let _ = fs::remove_dir_all(&dir);
 
         let set = result.expect("load_dir should succeed");
         assert_eq!(set.len(), 3, "expected 3 entities");
-        assert!(set.get("ethernet", "eth0").is_some(), "ethernet/eth0 should be present");
-        assert!(set.get("dns", "primary").is_some(), "dns/primary should be present");
-        assert!(set.get("bond", "bond0").is_some(), "bond/bond0 should be present");
+        // entity_type is empty in policy input format; selector_key comes from selector.name
+        assert!(set.get("", "eth0").is_some(), "eth0 should be present");
+        assert!(set.get("", "primary").is_some(), "primary should be present");
+        assert!(set.get("", "bond0").is_some(), "bond0 should be present");
     }
 
     /// Scenario: Load multi-document file from directory — 2 entities from one file
@@ -133,7 +134,7 @@ mod tests {
         let dir = temp_dir("multi_doc");
         fs::write(
             dir.join("interfaces.yaml"),
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
         )
         .unwrap();
 
@@ -142,18 +143,18 @@ mod tests {
 
         let set = result.expect("load_dir should succeed");
         assert_eq!(set.len(), 2, "expected 2 entities from a two-document file");
-        assert!(set.get("ethernet", "eth0").is_some());
-        assert!(set.get("ethernet", "eth1").is_some());
+        assert!(set.get("", "eth0").is_some());
+        assert!(set.get("", "eth1").is_some());
     }
 
     /// Scenario: Skip hidden files in directory — .backup.yaml is not loaded
     #[test]
     fn test_load_dir_skips_hidden_files() {
         let dir = temp_dir("hidden");
-        fs::write(dir.join("eth0.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.join("eth0.yaml"), "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
         fs::write(
             dir.join(".backup.yaml"),
-            "type: ethernet\nname: backup\nmtu: 1500\n",
+            "selector:\n  name: backup\nmtu: 1500\n",
         )
         .unwrap();
 
@@ -162,9 +163,9 @@ mod tests {
 
         let set = result.expect("load_dir should succeed");
         assert_eq!(set.len(), 1, "only the non-hidden file should be loaded");
-        assert!(set.get("ethernet", "eth0").is_some());
+        assert!(set.get("", "eth0").is_some());
         assert!(
-            set.get("ethernet", "backup").is_none(),
+            set.get("", "backup").is_none(),
             ".backup.yaml should have been skipped"
         );
     }
@@ -234,14 +235,14 @@ mod tests {
     fn test_load_file_single_document_returns_one_state() {
         let dir = temp_dir("load_file_single");
         let path = dir.join("eth0.yaml");
-        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(&path, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
 
         let result = load_file(&path);
         let _ = fs::remove_dir_all(&dir);
 
         let states = result.expect("load_file should succeed");
         assert_eq!(states.len(), 1);
-        assert_eq!(states[0].entity_type, "ethernet");
+        assert_eq!(states[0].entity_type, "");
         assert_eq!(states[0].selector.name, Some("eth0".to_string()));
     }
 
@@ -252,7 +253,7 @@ mod tests {
         let path = dir.join("interfaces.yaml");
         fs::write(
             &path,
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
         )
         .unwrap();
 
@@ -275,5 +276,187 @@ mod tests {
             matches!(result.unwrap_err(), YamlError::Io { .. }),
             "expected Io error for missing file"
         );
+    }
+
+    // ── SPEC-005: selector sub-mapping format tests ───────────────────────────
+    //
+    // The policy input YAML format uses a "selector:" sub-mapping rather than
+    // top-level selector keys. entity_type is always empty after parsing
+    // (determined later by the backend). The StateSet key is ("", selector_key).
+
+    /// Scenario: Load all YAML files from a directory (selector sub-mapping format)
+    /// Three files (.yaml and .yml) → StateSet contains 3 entities
+    #[test]
+    fn test_load_dir_selector_submapping_three_entities() {
+        let dir = temp_dir("submap_load_all");
+        fs::write(
+            dir.join("eth0.yaml"),
+            "selector:\n  name: eth0\nmtu: 1500\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("dns.yaml"),
+            "selector:\n  name: primary\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("bond.yml"),
+            "selector:\n  name: bond0\n",
+        )
+        .unwrap();
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        let set = result.expect("load_dir should succeed");
+        assert_eq!(set.len(), 3, "expected 3 entities");
+        // entity_type is empty in selector sub-mapping format
+        assert!(set.get("", "eth0").is_some(), "eth0 entity should be present");
+        assert!(set.get("", "primary").is_some(), "primary entity should be present");
+        assert!(set.get("", "bond0").is_some(), "bond0 entity should be present");
+    }
+
+    /// Scenario: Load multi-document file from directory (selector sub-mapping format)
+    /// One file with two documents → StateSet contains 2 entities
+    #[test]
+    fn test_load_dir_selector_submapping_multi_document_two_entities() {
+        let dir = temp_dir("submap_multi_doc");
+        fs::write(
+            dir.join("interfaces.yaml"),
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
+        )
+        .unwrap();
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        let set = result.expect("load_dir should succeed");
+        assert_eq!(set.len(), 2, "expected 2 entities from a two-document file");
+        assert!(set.get("", "eth0").is_some());
+        assert!(set.get("", "eth1").is_some());
+    }
+
+    /// Scenario: Skip hidden files in directory (selector sub-mapping format)
+    /// Hidden file .backup.yaml is not loaded; only the visible file is
+    #[test]
+    fn test_load_dir_selector_submapping_skips_hidden_files() {
+        let dir = temp_dir("submap_hidden");
+        fs::write(
+            dir.join("eth0.yaml"),
+            "selector:\n  name: eth0\nmtu: 1500\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".backup.yaml"),
+            "selector:\n  name: backup\nmtu: 1500\n",
+        )
+        .unwrap();
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        let set = result.expect("load_dir should succeed");
+        assert_eq!(set.len(), 1, "only the non-hidden file should be loaded");
+        assert!(set.get("", "eth0").is_some());
+        assert!(
+            set.get("", "backup").is_none(),
+            ".backup.yaml should have been skipped"
+        );
+    }
+
+    /// Scenario: Error on duplicate entity keys within a directory
+    /// Two files with the same selector name → DuplicateKey error
+    #[test]
+    fn test_load_dir_selector_submapping_duplicate_entity_key_is_error() {
+        let dir = temp_dir("submap_dup_key");
+        fs::write(
+            dir.join("file1.yaml"),
+            "selector:\n  name: eth0\nmtu: 1500\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("file2.yaml"),
+            "selector:\n  name: eth0\nmtu: 9000\n",
+        )
+        .unwrap();
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(result.is_err(), "duplicate entity key should return an error");
+        assert!(
+            matches!(result.unwrap_err(), YamlError::DuplicateKey { .. }),
+            "error should be DuplicateKey variant"
+        );
+    }
+
+    /// Scenario: Error on invalid YAML syntax (selector sub-mapping format)
+    /// A file with a parse error causes load_dir to fail
+    #[test]
+    fn test_load_dir_selector_submapping_invalid_yaml_is_error() {
+        let dir = temp_dir("submap_invalid_yaml");
+        fs::write(dir.join("bad.yaml"), "[unclosed bracket\n").unwrap();
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(result.is_err(), "invalid YAML should return an error");
+    }
+
+    /// Scenario: Empty directory returns empty StateSet
+    #[test]
+    fn test_load_dir_selector_submapping_empty_directory_returns_empty_stateset() {
+        let dir = temp_dir("submap_empty");
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        let set = result.expect("load_dir on empty directory should succeed");
+        assert!(set.is_empty(), "StateSet should be empty for an empty directory");
+        assert_eq!(set.len(), 0);
+    }
+
+    /// Scenario: load_file with selector sub-mapping format returns correct State fields
+    #[test]
+    fn test_load_file_selector_submapping_entity_type_empty_and_selector_name_set() {
+        let dir = temp_dir("submap_load_file");
+        let path = dir.join("eth0.yaml");
+        fs::write(&path, "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+
+        let result = load_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+
+        let states = result.expect("load_file should succeed");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].entity_type, "", "entity_type must be empty");
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[0].fields["mtu"].value, crate::Value::U64(1500));
+    }
+
+    /// Scenario: Skip hidden subdirectory in load_dir
+    /// A hidden subdirectory and all its contents are excluded
+    #[test]
+    fn test_load_dir_selector_submapping_skips_hidden_subdirectory() {
+        let dir = temp_dir("submap_hidden_dir");
+        fs::write(
+            dir.join("eth0.yaml"),
+            "selector:\n  name: eth0\nmtu: 1500\n",
+        )
+        .unwrap();
+        let hidden_sub = dir.join(".hidden");
+        fs::create_dir_all(&hidden_sub).unwrap();
+        fs::write(
+            hidden_sub.join("eth1.yaml"),
+            "selector:\n  name: eth1\nmtu: 9000\n",
+        )
+        .unwrap();
+
+        let result = load_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+
+        let set = result.expect("load_dir should succeed");
+        assert_eq!(set.len(), 1, "hidden subdirectory contents should be excluded");
+        assert!(set.get("", "eth0").is_some());
+        assert!(set.get("", "eth1").is_none(), "eth1 inside .hidden/ should be skipped");
     }
 }
