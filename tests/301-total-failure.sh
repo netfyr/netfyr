@@ -27,8 +27,8 @@ netns_setup "$@"
 
 POLICY_FILE=$(mktemp --suffix=.yaml)
 cat > "$POLICY_FILE" <<'EOF'
-type: ethernet
-name: veth-nonexistent99
+selector:
+  name: veth-nonexistent99
 mtu: 1400
 EOF
 

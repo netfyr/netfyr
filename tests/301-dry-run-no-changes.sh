@@ -28,8 +28,8 @@ create_veth veth-test0 veth-test1
 POLICY_FILE=$(mktemp --suffix=.yaml)
 # mtu=1500 matches the default veth MTU — no change should be needed.
 cat > "$POLICY_FILE" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 mtu: 1500
 EOF
 

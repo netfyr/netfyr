@@ -28,8 +28,8 @@ create_veth veth-test0 veth-test1
 
 POLICY_DIR=$(mktemp -d)
 cat > "$POLICY_DIR/eth0.yaml" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 mtu: 1400
 EOF
 
@@ -47,8 +47,8 @@ assert_mtu veth-test0 1400
 
 EXPLICIT_FILE=$(mktemp --suffix=.yaml)
 cat > "$EXPLICIT_FILE" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 mtu: 1300
 EOF
 

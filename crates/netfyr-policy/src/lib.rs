@@ -471,6 +471,12 @@ pub enum LoaderError {
     #[error("unknown kind '{kind}' in {path}; expected 'policy' or 'state'")]
     UnknownKind { kind: String, path: PathBuf },
 
+    /// A bare state document is missing the required `selector:` sub-mapping.
+    #[error(
+        "bare state document in {path} is missing a required 'selector:' sub-mapping"
+    )]
+    MissingSelector { path: PathBuf },
+
     /// Two files in a directory produced a policy with the same name.
     #[error("duplicate policy name '{name}' (from {path})")]
     DuplicatePolicyName { name: String, path: PathBuf },
@@ -561,11 +567,26 @@ pub fn load_policy_file(path: &Path) -> Result<Vec<Policy>, LoaderError> {
         match kind.as_deref() {
             // ── Bare state: auto-wrap into a static policy ────────────────────
             None | Some("state") => {
+                // Require a "selector:" sub-mapping in bare state documents.
+                let has_selector = raw
+                    .as_mapping()
+                    .map(|m| {
+                        m.contains_key(serde_yaml::Value::String("selector".to_string()))
+                    })
+                    .unwrap_or(false);
+                if !has_selector {
+                    return Err(LoaderError::MissingSelector {
+                        path: path.to_path_buf(),
+                    });
+                }
+
                 let state =
                     parse_state_value(raw).map_err(|e| LoaderError::State {
                         path: path.to_path_buf(),
                         source: e,
                     })?;
+
+                let policy_selector = Some(state.selector.clone());
 
                 let name = if is_multi {
                     format!("{base_name}-{doc_num}")
@@ -585,7 +606,7 @@ pub fn load_policy_file(path: &Path) -> Result<Vec<Policy>, LoaderError> {
                     priority: 100,
                     state: Some(state),
                     states: None,
-                    selector: None,
+                    selector: policy_selector,
                 });
             }
 
@@ -1546,7 +1567,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_returns_one_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies.len(), 1);
     }
@@ -1554,7 +1575,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_policy_name_from_filename() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "eth0");
     }
@@ -1562,7 +1583,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_factory_type_is_static() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].factory_type, FactoryType::Static);
     }
@@ -1570,7 +1591,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_priority_is_100() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].priority, 100);
     }
@@ -1578,7 +1599,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_state_entity_type_is_ethernet() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
         // entity_type is determined by the backend, not the inline state YAML
@@ -1588,7 +1609,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_state_has_mtu_1500() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
         assert_eq!(state.fields["mtu"].value, Value::U64(1500));
@@ -1598,7 +1619,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_single_doc_name_has_no_numeric_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "eth0");
         assert!(
@@ -1615,7 +1636,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+            "kind: state\nselector:\n  name: eth0\nmtu: 1500\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies.len(), 1);
@@ -1627,7 +1648,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+            "kind: state\nselector:\n  name: eth0\nmtu: 1500\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "eth0");
@@ -1639,7 +1660,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+            "kind: state\nselector:\n  name: eth0\nmtu: 1500\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].factory_type, FactoryType::Static);
@@ -1651,7 +1672,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+            "kind: state\nselector:\n  name: eth0\nmtu: 1500\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].priority, 100);
@@ -1663,7 +1684,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+            "kind: state\nselector:\n  name: eth0\nmtu: 1500\n",
         );
         let policies = load_policy_file(&path).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
@@ -1677,7 +1698,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+            "kind: state\nselector:\n  name: eth0\nmtu: 1500\n",
         );
         let policies = load_policy_file(&path).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
@@ -1692,7 +1713,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "interfaces.yaml",
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies.len(), 2);
@@ -1704,7 +1725,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "interfaces.yaml",
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "interfaces-1");
@@ -1716,7 +1737,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "interfaces.yaml",
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[1].name, "interfaces-2");
@@ -1728,7 +1749,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "interfaces.yaml",
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n",
         );
         let policies = load_policy_file(&path).unwrap();
         for p in &policies {
@@ -1743,7 +1764,7 @@ mod loader_tests {
     fn test_explicit_kind_policy_returns_one_policy_with_declared_name() {
         let dir = tempfile::tempdir().unwrap();
         let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
-                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
         let path = write_file(&dir, "custom.yaml", content);
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies.len(), 1);
@@ -1755,7 +1776,7 @@ mod loader_tests {
     fn test_explicit_kind_policy_priority_is_declared_value_not_default() {
         let dir = tempfile::tempdir().unwrap();
         let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
-                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
         let path = write_file(&dir, "custom.yaml", content);
         let policies = load_policy_file(&path).unwrap();
         // Priority 200, not the bare-state default of 100.
@@ -1766,7 +1787,7 @@ mod loader_tests {
     fn test_explicit_kind_policy_factory_type_is_static() {
         let dir = tempfile::tempdir().unwrap();
         let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
-                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
         let path = write_file(&dir, "custom.yaml", content);
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].factory_type, FactoryType::Static);
@@ -1777,9 +1798,9 @@ mod loader_tests {
     #[test]
     fn test_mixed_file_returns_two_policies() {
         let dir = tempfile::tempdir().unwrap();
-        let content = "type: ethernet\nname: eth0\nmtu: 1500\n---\n\
+        let content = "selector:\n  name: eth0\nmtu: 1500\n---\n\
                        kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
-                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
         let path = write_file(&dir, "mixed.yaml", content);
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies.len(), 2);
@@ -1788,9 +1809,9 @@ mod loader_tests {
     #[test]
     fn test_mixed_file_first_is_wrapped_bare_state_named_with_suffix_1_and_priority_100() {
         let dir = tempfile::tempdir().unwrap();
-        let content = "type: ethernet\nname: eth0\nmtu: 1500\n---\n\
+        let content = "selector:\n  name: eth0\nmtu: 1500\n---\n\
                        kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
-                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
         let path = write_file(&dir, "mixed.yaml", content);
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "mixed-1");
@@ -1801,9 +1822,9 @@ mod loader_tests {
     #[test]
     fn test_mixed_file_second_is_explicit_policy_with_declared_name_and_priority_200() {
         let dir = tempfile::tempdir().unwrap();
-        let content = "type: ethernet\nname: eth0\nmtu: 1500\n---\n\
+        let content = "selector:\n  name: eth0\nmtu: 1500\n---\n\
                        kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
-                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
         let path = write_file(&dir, "mixed.yaml", content);
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[1].name, "eth0-override");
@@ -1815,7 +1836,7 @@ mod loader_tests {
     #[test]
     fn test_bare_state_load_succeeds_implying_info_log_path_was_reached() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let result = load_policy_file(&path);
         assert!(result.is_ok(), "loading a bare state file should succeed");
     }
@@ -1825,7 +1846,7 @@ mod loader_tests {
     #[test]
     fn test_policy_name_derived_from_yaml_extension_filename() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "eth0");
     }
@@ -1833,7 +1854,7 @@ mod loader_tests {
     #[test]
     fn test_policy_name_derived_from_yml_extension_filename() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_file(&dir, "bond0-vlan100.yml", "type: ethernet\nname: bond0.100\nmtu: 9000\n");
+        let path = write_file(&dir, "bond0-vlan100.yml", "selector:\n  name: bond0.100\nmtu: 9000\n");
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies[0].name, "bond0-vlan100");
     }
@@ -1843,13 +1864,13 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_three_files_returns_policy_set_with_three_entries() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
-        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: main\nservers:\n  - 10.0.1.2\n");
         write_file(
             &dir,
             "custom.yaml",
             "kind: policy\nname: custom\nfactory: static\n\
-             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
         );
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert_eq!(policy_set.len(), 3);
@@ -1858,13 +1879,13 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_contains_eth0_policy() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
-        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: main\nservers:\n  - 10.0.1.2\n");
         write_file(
             &dir,
             "custom.yaml",
             "kind: policy\nname: custom\nfactory: static\n\
-             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
         );
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert!(policy_set.get("eth0").is_some(), "policy set should contain 'eth0'");
@@ -1873,13 +1894,13 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_contains_dns_policy() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
-        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: main\nservers:\n  - 10.0.1.2\n");
         write_file(
             &dir,
             "custom.yaml",
             "kind: policy\nname: custom\nfactory: static\n\
-             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
         );
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert!(policy_set.get("dns").is_some(), "policy set should contain 'dns'");
@@ -1888,13 +1909,13 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_contains_custom_explicit_policy() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
-        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: main\nservers:\n  - 10.0.1.2\n");
         write_file(
             &dir,
             "custom.yaml",
             "kind: policy\nname: custom\nfactory: static\n\
-             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
         );
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert!(policy_set.get("custom").is_some(), "policy set should contain 'custom'");
@@ -1906,13 +1927,13 @@ mod loader_tests {
     fn test_load_policy_dir_duplicate_name_returns_duplicate_error() {
         let dir = tempfile::tempdir().unwrap();
         // eth0.yaml derives name "eth0" from filename.
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         // also-eth0.yaml uses an explicit kind: policy with name "eth0".
         write_file(
             &dir,
             "also-eth0.yaml",
             "kind: policy\nname: eth0\nfactory: static\n\
-             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
         );
         let result = load_policy_dir(dir.path());
         assert!(result.is_err());
@@ -1925,12 +1946,12 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_duplicate_name_error_identifies_conflicting_policy_name() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         write_file(
             &dir,
             "also-eth0.yaml",
             "kind: policy\nname: eth0\nfactory: static\n\
-             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
         );
         match load_policy_dir(dir.path()).unwrap_err() {
             LoaderError::DuplicatePolicyName { name, .. } => {
@@ -1945,9 +1966,9 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_skips_hidden_yaml_files() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         // .backup.yaml is hidden; same entity as eth0 — would conflict if loaded.
-        write_file(&dir, ".backup.yaml", "type: ethernet\nname: eth0\nmtu: 9000\n");
+        write_file(&dir, ".backup.yaml", "selector:\n  name: eth0\nmtu: 9000\n");
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert_eq!(policy_set.len(), 1);
         assert!(policy_set.get("eth0").is_some());
@@ -1956,8 +1977,8 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_hidden_file_does_not_cause_duplicate_error() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
-        write_file(&dir, ".backup.yaml", "type: ethernet\nname: eth0\nmtu: 9000\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, ".backup.yaml", "selector:\n  name: eth0\nmtu: 9000\n");
         // If the hidden file were loaded it would trigger a DuplicatePolicyName error.
         let result = load_policy_dir(dir.path());
         assert!(result.is_ok(), "hidden files must be skipped, not cause errors");
@@ -1995,7 +2016,7 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_skips_non_yaml_files() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
         write_file(&dir, "README.txt", "this is not a YAML policy file");
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert_eq!(policy_set.len(), 1);
@@ -2009,7 +2030,7 @@ mod loader_tests {
         let path = write_file(
             &dir,
             "eth0.yaml",
-            "type: ethernet\nname: eth0\nmtu: 1500\n---\n",
+            "selector:\n  name: eth0\nmtu: 1500\n---\n",
         );
         let policies = load_policy_file(&path).unwrap();
         assert_eq!(policies.len(), 1);
@@ -2020,7 +2041,7 @@ mod loader_tests {
     #[test]
     fn test_load_policy_dir_processes_yml_extension() {
         let dir = tempfile::tempdir().unwrap();
-        write_file(&dir, "eth0.yml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "eth0.yml", "selector:\n  name: eth0\nmtu: 1500\n");
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert_eq!(policy_set.len(), 1);
         assert!(policy_set.get("eth0").is_some());
@@ -2032,5 +2053,538 @@ mod loader_tests {
         let dir = tempfile::tempdir().unwrap();
         let policy_set = load_policy_dir(dir.path()).unwrap();
         assert!(policy_set.is_empty());
+    }
+
+    // ── SPEC-008: Bare state shorthand — selector sub-mapping format ───────────
+    //
+    // These tests exercise the SPEC-008 acceptance criteria using the NEW bare
+    // state format where `selector:` is a sub-mapping at the top level, and all
+    // other top-level keys (except `kind`) are state fields.
+    //
+    // The existing tests above this section use the OLD flat format (top-level
+    // `type:` and `name:` keys) which the current implementation rejects with
+    // LoaderError::MissingSelector. Those tests are left in place for the verify
+    // phase to reconcile.
+
+    // ── Scenario: Single bare state file is wrapped into a policy ─────────────
+
+    #[test]
+    fn test_bare_state_selector_submapping_returns_one_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_policy_name_is_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_factory_type_is_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_priority_is_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].priority, 100);
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_policy_selector_has_name_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let sel = policies[0].selector.as_ref().expect("policy.selector should be Some");
+        assert_eq!(sel.name, Some("eth0".to_string()));
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_state_has_mtu_1500() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("policy.state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_state_does_not_contain_selector_as_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("policy.state should be Some");
+        assert!(
+            !state.fields.contains_key("selector"),
+            "selector sub-mapping must not appear as a state field"
+        );
+    }
+
+    #[test]
+    fn test_bare_state_selector_submapping_single_doc_no_numeric_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+        assert!(
+            !policies[0].name.ends_with("-1"),
+            "single-document file must not produce a '-1' suffix"
+        );
+    }
+
+    // ── Scenario: Explicit kind: state is treated same as bare state ───────────
+
+    #[test]
+    fn test_kind_state_selector_submapping_returns_one_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "eth0.yaml", "kind: state\nselector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+    }
+
+    #[test]
+    fn test_kind_state_selector_submapping_policy_name_from_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "eth0.yaml", "kind: state\nselector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    #[test]
+    fn test_kind_state_selector_submapping_factory_is_static_priority_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "eth0.yaml", "kind: state\nselector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+        assert_eq!(policies[0].priority, 100);
+    }
+
+    #[test]
+    fn test_kind_state_selector_submapping_policy_selector_name_is_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "eth0.yaml", "kind: state\nselector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let sel = policies[0].selector.as_ref().expect("policy.selector should be Some");
+        assert_eq!(sel.name, Some("eth0".to_string()));
+    }
+
+    #[test]
+    fn test_kind_state_selector_submapping_state_has_mtu_1500() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "eth0.yaml", "kind: state\nselector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("policy.state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    // ── Scenario: Multi-document bare state file produces numbered policies ────
+
+    #[test]
+    fn test_multi_doc_selector_submapping_returns_two_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_first_policy_named_interfaces_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "interfaces-1");
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_second_policy_named_interfaces_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[1].name, "interfaces-2");
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_first_selector_name_is_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        let sel = policies[0].selector.as_ref().expect("selector should be Some");
+        assert_eq!(sel.name, Some("eth0".to_string()));
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_second_selector_name_is_eth1() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        let sel = policies[1].selector.as_ref().expect("selector should be Some");
+        assert_eq!(sel.name, Some("eth1".to_string()));
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_both_have_static_factory_and_priority_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        for p in &policies {
+            assert_eq!(p.factory_type, FactoryType::Static);
+            assert_eq!(p.priority, 100);
+        }
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_first_state_has_mtu_1500() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    #[test]
+    fn test_multi_doc_selector_submapping_second_state_has_mtu_9000() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let path = write_file(&dir, "interfaces.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[1].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(9000));
+    }
+
+    // ── Scenario: kind: policy documents are not wrapped ──────────────────────
+
+    #[test]
+    fn test_kind_policy_uses_declared_name_not_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
+        let path = write_file(&dir, "custom.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].name, "custom-policy");
+    }
+
+    #[test]
+    fn test_kind_policy_priority_is_declared_value_200_not_default_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
+        let path = write_file(&dir, "custom.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].priority, 200);
+    }
+
+    #[test]
+    fn test_kind_policy_selector_name_is_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
+        let path = write_file(&dir, "custom.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        let sel = policies[0].selector.as_ref().expect("selector should be Some");
+        assert_eq!(sel.name, Some("eth0".to_string()));
+    }
+
+    // ── Scenario: Mixed file with bare state and explicit policy ──────────────
+
+    #[test]
+    fn test_mixed_file_selector_submapping_returns_two_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n---\n\
+                       kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
+        let path = write_file(&dir, "mixed.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 2);
+    }
+
+    #[test]
+    fn test_mixed_file_first_is_wrapped_bare_state_named_mixed_1_priority_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n---\n\
+                       kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
+        let path = write_file(&dir, "mixed.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "mixed-1");
+        assert_eq!(policies[0].priority, 100);
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+    }
+
+    #[test]
+    fn test_mixed_file_second_is_explicit_policy_named_eth0_override_priority_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n---\n\
+                       kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
+                       selector:\n  name: eth0\nstate:\n  mtu: 9000\n";
+        let path = write_file(&dir, "mixed.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[1].name, "eth0-override");
+        assert_eq!(policies[1].priority, 200);
+    }
+
+    // ── Scenario: Info log is emitted for wrapped bare states ─────────────────
+    // Direct log assertion is impractical in unit tests; we verify the function
+    // succeeds, which requires the tracing::info! code path to be reached.
+
+    #[test]
+    fn test_bare_state_selector_submapping_load_succeeds_implying_log_path_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let result = load_policy_file(&path);
+        assert!(result.is_ok(), "loading a bare state with selector sub-mapping must succeed");
+    }
+
+    // ── Scenario: Policy name derived from filename without extension ──────────
+
+    #[test]
+    fn test_policy_name_derived_from_yml_filename_bond0_vlan100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "bond0-vlan100.yml", "selector:\n  name: bond0.100\nmtu: 9000\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "bond0-vlan100");
+    }
+
+    #[test]
+    fn test_policy_name_derived_from_yaml_filename_selector_submapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    // ── Scenario: Load all policies from a directory ──────────────────────────
+
+    #[test]
+    fn test_load_policy_dir_selector_submapping_three_files_returns_three_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert_eq!(policy_set.len(), 3);
+    }
+
+    #[test]
+    fn test_load_policy_dir_selector_submapping_contains_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.get("eth0").is_some(), "policy set should contain 'eth0'");
+    }
+
+    #[test]
+    fn test_load_policy_dir_selector_submapping_contains_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.get("dns").is_some(), "policy set should contain 'dns'");
+    }
+
+    #[test]
+    fn test_load_policy_dir_selector_submapping_contains_custom() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "selector:\n  name: dns-main\ndns_servers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.get("custom").is_some(), "policy set should contain 'custom'");
+    }
+
+    // ── Scenario: Duplicate policy names across files are rejected ─────────────
+
+    #[test]
+    fn test_load_policy_dir_duplicate_name_selector_submapping_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // eth0.yaml derives name "eth0" from filename
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        // also-eth0.yaml explicitly declares name "eth0"
+        write_file(
+            &dir,
+            "also-eth0.yaml",
+            "kind: policy\nname: eth0\nfactory: static\n\
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
+        );
+        let result = load_policy_dir(dir.path());
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), LoaderError::DuplicatePolicyName { .. }),
+            "expected DuplicatePolicyName error"
+        );
+    }
+
+    #[test]
+    fn test_load_policy_dir_duplicate_name_selector_submapping_error_identifies_eth0() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(
+            &dir,
+            "also-eth0.yaml",
+            "kind: policy\nname: eth0\nfactory: static\n\
+             selector:\n  name: eth1\nstate:\n  mtu: 9000\n",
+        );
+        match load_policy_dir(dir.path()).unwrap_err() {
+            LoaderError::DuplicatePolicyName { name, .. } => {
+                assert_eq!(name, "eth0");
+            }
+            other => panic!("expected DuplicatePolicyName, got {:?}", other),
+        }
+    }
+
+    // ── Scenario: Hidden files are skipped during directory loading ────────────
+
+    #[test]
+    fn test_load_policy_dir_skips_hidden_selector_submapping_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        // .backup.yaml is hidden; would conflict if loaded (same derived name "eth0")
+        write_file(&dir, ".backup.yaml", "selector:\n  name: eth0\nmtu: 9000\n");
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert_eq!(policy_set.len(), 1);
+        assert!(policy_set.get("eth0").is_some());
+    }
+
+    #[test]
+    fn test_load_policy_dir_hidden_selector_file_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n");
+        write_file(&dir, ".backup.yaml", "selector:\n  name: eth0\nmtu: 9000\n");
+        // If .backup.yaml were loaded it would trigger DuplicatePolicyName
+        let result = load_policy_dir(dir.path());
+        assert!(result.is_ok(), "hidden files must be skipped, not cause errors");
+    }
+
+    // ── Scenario: Unknown kind value produces an error ─────────────────────────
+
+    #[test]
+    fn test_unknown_kind_with_selector_submapping_returns_unknown_kind_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "bad.yaml", "kind: unknown\nselector:\n  name: eth0\nmtu: 1500\n");
+        let result = load_policy_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), LoaderError::UnknownKind { .. }),
+            "expected UnknownKind error"
+        );
+    }
+
+    #[test]
+    fn test_unknown_kind_error_message_contains_unknown_kind_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "bad.yaml", "kind: unknown\nselector:\n  name: eth0\n");
+        match load_policy_file(&path).unwrap_err() {
+            LoaderError::UnknownKind { kind, .. } => {
+                assert_eq!(kind, "unknown");
+            }
+            other => panic!("expected UnknownKind, got {:?}", other),
+        }
+    }
+
+    // ── Additional criterion: selector sub-mapping is required ─────────────────
+
+    #[test]
+    fn test_bare_state_without_selector_submapping_returns_missing_selector_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "mtu: 1500\n");
+        let result = load_policy_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), LoaderError::MissingSelector { .. }),
+            "bare state without selector: sub-mapping must return MissingSelector error"
+        );
+    }
+
+    #[test]
+    fn test_kind_state_without_selector_submapping_returns_missing_selector_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "kind: state\nmtu: 1500\n");
+        let result = load_policy_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), LoaderError::MissingSelector { .. }),
+            "kind: state without selector: sub-mapping must return MissingSelector error"
+        );
+    }
+
+    // ── Trailing separator skipped (selector sub-mapping format) ──────────────
+
+    #[test]
+    fn test_trailing_separator_selector_submapping_single_doc_no_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_file(&dir, "eth0.yaml", "selector:\n  name: eth0\nmtu: 1500\n---\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    // ── Addresses list parsed correctly in selector sub-mapping format ─────────
+
+    #[test]
+    fn test_bare_state_selector_submapping_addresses_list_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "selector:\n  name: eth0\nmtu: 1500\naddresses:\n  - 10.0.1.50/24\n";
+        let path = write_file(&dir, "eth0.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        let addrs = state.fields["addresses"].value.as_list().expect("addresses should be a list");
+        assert_eq!(addrs.len(), 1);
     }
 }

@@ -43,8 +43,8 @@ fi
 # Apply a policy with a new address and new default gateway.
 POLICY_FILE=$(mktemp --suffix=.yaml)
 cat > "$POLICY_FILE" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 addresses:
   - "10.99.71.1/24"
 routes:

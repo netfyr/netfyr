@@ -49,8 +49,8 @@ create_veth veth-test0 veth-test1
 # Phase 1: Apply a policy that adds an address.
 POLICY_ADD=$(mktemp --suffix=.yaml)
 cat > "$POLICY_ADD" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 addresses:
   - "10.99.0.1/24"
 EOF
@@ -68,8 +68,8 @@ assert_has_address veth-test0 "10.99.0.1/24"
 # Phase 2: Apply policy with no addresses — triggers removal of the address field.
 POLICY_EMPTY=$(mktemp --suffix=.yaml)
 cat > "$POLICY_EMPTY" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 EOF
 
 "$NETFYR_BIN" apply "$POLICY_EMPTY"

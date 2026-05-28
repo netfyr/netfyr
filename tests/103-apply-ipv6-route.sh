@@ -28,8 +28,8 @@ add_address veth-test0 fd00:aa::1/64
 
 POLICY_FILE=$(mktemp --suffix=.yaml)
 cat > "$POLICY_FILE" <<'EOF'
-type: ethernet
-name: veth-test0
+selector:
+  name: veth-test0
 addresses:
   - "fd00:aa::1/64"
 routes:
