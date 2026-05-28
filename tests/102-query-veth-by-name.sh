@@ -55,4 +55,11 @@ if ! echo "$output" | grep -q '10.99.0.1/24'; then
     exit 1
 fi
 
+# Assert: "type" field is "ethernet" (veth has ARPHRD_ETHER and no phy80211).
+if ! echo "$output" | grep -q '"type": "ethernet"'; then
+    echo "FAIL: 102-query-veth-by-name: 'type' field missing or not 'ethernet'" >&2
+    echo "Output: $output" >&2
+    exit 1
+fi
+
 echo "PASS: 102-query-veth-by-name"

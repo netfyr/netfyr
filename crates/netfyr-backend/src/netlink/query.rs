@@ -89,6 +89,29 @@ pub fn read_sysfs_pci_path(name: &str) -> Option<String> {
     target.file_name().map(|s| s.to_string_lossy().into_owned())
 }
 
+/// Check if an interface is WiFi by detecting the `/sys/class/net/<name>/phy80211` symlink.
+///
+/// This symlink is created by the kernel's cfg80211 subsystem for all 802.11 interfaces.
+/// Not namespace-aware (sysfs is global), same caveat as speed/driver lookups.
+pub fn read_sysfs_is_wifi(name: &str) -> bool {
+    std::fs::symlink_metadata(format!("/sys/class/net/{name}/phy80211")).is_ok()
+}
+
+/// Read the WiFi operating mode. Returns `None` — full implementation requires nl80211.
+pub fn read_sysfs_wifi_mode(_name: &str) -> Option<String> {
+    None
+}
+
+/// Read the WiFi SSID. Returns `None` — SSID requires nl80211.
+pub fn read_sysfs_wifi_ssid(_name: &str) -> Option<String> {
+    None
+}
+
+/// Read the WiFi frequency in MHz. Returns `None` — frequency requires nl80211.
+pub fn read_sysfs_wifi_frequency(_name: &str) -> Option<u64> {
+    None
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -365,5 +388,79 @@ mod tests {
     fn test_read_sysfs_pci_path_nonexistent_interface_returns_none() {
         let result = read_sysfs_pci_path("interface_that_does_not_exist_xyzzy_99");
         assert!(result.is_none(), "non-existent interface should return None for pci_path");
+    }
+
+    // ── read_sysfs_is_wifi ────────────────────────────────────────────────────────
+
+    /// Scenario: Technology detection — a nonexistent interface has no
+    /// /sys/class/net/<name>/phy80211 symlink so read_sysfs_is_wifi must return false.
+    ///
+    /// This is the foundational predicate for WiFi detection: when the phy80211
+    /// symlink is absent, the interface is not WiFi (and will be classified as
+    /// ethernet by detect_technology).
+    #[test]
+    fn test_read_sysfs_is_wifi_returns_false_for_nonexistent_interface() {
+        let result = read_sysfs_is_wifi("interface_that_does_not_exist_xyzzy_99");
+        assert!(
+            !result,
+            "read_sysfs_is_wifi must return false when phy80211 symlink is absent"
+        );
+    }
+
+    /// read_sysfs_is_wifi returns false for multiple different nonexistent names.
+    #[test]
+    fn test_read_sysfs_is_wifi_returns_false_for_various_fake_names() {
+        for name in &["eth0_fake_99", "enp0s3_fake", "wlan0_fake_no_phy"] {
+            assert!(
+                !read_sysfs_is_wifi(name),
+                "read_sysfs_is_wifi({name}) must return false when phy80211 path absent"
+            );
+        }
+    }
+
+    // ── WiFi sysfs stubs ──────────────────────────────────────────────────────────
+
+    /// Scenario: WiFi interface sub-object with mode/ssid/frequency.
+    /// read_sysfs_wifi_mode is a stub that always returns None (full nl80211
+    /// implementation is future work). Returning None means the "mode" field is
+    /// omitted from the wifi sub-object and the sub-object itself may be absent.
+    #[test]
+    fn test_read_sysfs_wifi_mode_stub_always_returns_none() {
+        // Stub ignores name; verify with several names including a real-looking one.
+        for name in &["wlan0", "wlp3s0", "interface_that_does_not_exist_xyzzy_99"] {
+            let result = read_sysfs_wifi_mode(name);
+            assert!(
+                result.is_none(),
+                "read_sysfs_wifi_mode({name}) stub must return None until nl80211 is implemented"
+            );
+        }
+    }
+
+    /// read_sysfs_wifi_ssid is a stub that always returns None.
+    /// A None SSID means the WiFi interface has no associated network or the
+    /// nl80211 query has not been implemented yet.
+    #[test]
+    fn test_read_sysfs_wifi_ssid_stub_always_returns_none() {
+        for name in &["wlan0", "wlp3s0", "interface_that_does_not_exist_xyzzy_99"] {
+            let result = read_sysfs_wifi_ssid(name);
+            assert!(
+                result.is_none(),
+                "read_sysfs_wifi_ssid({name}) stub must return None until nl80211 is implemented"
+            );
+        }
+    }
+
+    /// read_sysfs_wifi_frequency is a stub that always returns None.
+    /// A None frequency means the WiFi interface is not associated or the
+    /// nl80211 query has not been implemented yet.
+    #[test]
+    fn test_read_sysfs_wifi_frequency_stub_always_returns_none() {
+        for name in &["wlan0", "wlp3s0", "interface_that_does_not_exist_xyzzy_99"] {
+            let result = read_sysfs_wifi_frequency(name);
+            assert!(
+                result.is_none(),
+                "read_sysfs_wifi_frequency({name}) stub must return None until nl80211 is implemented"
+            );
+        }
     }
 }

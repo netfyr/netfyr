@@ -78,6 +78,13 @@ if ! echo "$output" | grep -q '"mac"'; then
     exit 1
 fi
 
+# Assert: "type" field is "ethernet" (veth has ARPHRD_ETHER and no phy80211).
+if ! echo "$output" | grep -q '"type": "ethernet"'; then
+    echo "FAIL: 102-query-link-down: 'type' field missing or not 'ethernet'" >&2
+    echo "Output: $output" >&2
+    exit 1
+fi
+
 # Assert: "speed" field is absent — veth interfaces have no speed file in sysfs,
 # and the spec says the speed field should be omitted (None) when unavailable.
 if echo "$output" | grep -q '"speed"'; then
