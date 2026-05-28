@@ -7,6 +7,7 @@
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use netfyr_backend::{AppliedOperation, ApplyReport, FailedOperation, SkippedOperation};
 use netfyr_policy::{FactoryType, Policy};
@@ -20,11 +21,11 @@ use netfyr_state::{FieldValue, MacAddr, Provenance, Selector, State, StateMetada
 
 // ── VarlinkSelector ───────────────────────────────────────────────────────────
 
-/// Wire-format selector. The `type` field corresponds to `Selector.entity_type`.
+/// Wire-format selector. The `type` field corresponds to `Selector.type_`.
 /// Field is renamed because `type` is a reserved keyword in Rust.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VarlinkSelector {
-    /// Entity type filter (e.g., `"ethernet"`). Renamed from Rust keyword `type`.
+    /// Technology type filter (e.g., `"ethernet"`). Renamed from Rust keyword `type`.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub entity_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,17 +37,20 @@ pub struct VarlinkSelector {
     pub mac: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pci_path: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
 }
 
 impl From<&Selector> for VarlinkSelector {
     fn from(sel: &Selector) -> Self {
         VarlinkSelector {
-            entity_type: sel.entity_type.clone(),
+            entity_type: sel.type_.clone(),
             name: sel.name.clone(),
             driver: sel.driver.clone(),
             // Serialize MacAddr to lowercase colon-separated string.
             mac: sel.mac.as_ref().map(|m| m.to_string()),
             pci_path: sel.pci_path.clone(),
+            labels: sel.labels.clone(),
         }
     }
 }
@@ -54,14 +58,13 @@ impl From<&Selector> for VarlinkSelector {
 impl From<VarlinkSelector> for Selector {
     fn from(vs: VarlinkSelector) -> Self {
         Selector {
-            entity_type: vs.entity_type,
+            type_: vs.entity_type,
             name: vs.name,
             driver: vs.driver,
             // Parse MAC string; if parsing fails, treat as absent.
             mac: vs.mac.as_deref().and_then(|s| s.parse::<MacAddr>().ok()),
             pci_path: vs.pci_path,
-            // Labels are not represented in the Varlink wire format (internal detail).
-            labels: Default::default(),
+            labels: vs.labels,
         }
     }
 }
@@ -679,7 +682,7 @@ mod tests {
     fn test_varlink_selector_from_selector_with_all_fields() {
         let sel = Selector {
             name: Some("eth0".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             driver: Some("ixgbe".to_string()),
             pci_path: Some("0000:03:00.0".to_string()),
             mac: Some("aa:bb:cc:dd:ee:ff".parse().unwrap()),
@@ -713,10 +716,11 @@ mod tests {
             driver: Some("ixgbe".to_string()),
             mac: None,
             pci_path: Some("0000:03:00.0".to_string()),
+            ..Default::default()
         };
         let sel = Selector::from(vs);
         assert_eq!(sel.name, Some("eth0".to_string()));
-        assert_eq!(sel.entity_type, Some("ethernet".to_string()));
+        assert_eq!(sel.type_, Some("ethernet".to_string()));
         assert_eq!(sel.driver, Some("ixgbe".to_string()));
         assert_eq!(sel.pci_path, Some("0000:03:00.0".to_string()));
     }
@@ -755,7 +759,7 @@ mod tests {
         let vs = VarlinkSelector::from(&sel);
         let restored = Selector::from(vs);
         assert_eq!(restored.name, sel.name);
-        assert_eq!(restored.entity_type, sel.entity_type);
+        assert_eq!(restored.type_, sel.type_);
         assert_eq!(restored.driver, sel.driver);
         assert_eq!(restored.mac, sel.mac);
         assert_eq!(restored.pci_path, sel.pci_path);
@@ -1472,12 +1476,12 @@ mod tests {
     // silent field loss when core types gain new fields or new Value variants.
 
     /// Selector → VarlinkSelector → JSON → VarlinkSelector → Selector preserves
-    /// all wire-visible fields (labels are intentionally excluded from wire format).
+    /// all wire-visible fields including labels.
     #[test]
     fn test_selector_full_roundtrip_through_json_preserves_all_wire_fields() {
         let original = Selector {
             name: Some("eth0".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             driver: Some("ixgbe".to_string()),
             pci_path: Some("0000:03:00.0".to_string()),
             mac: Some("aa:bb:cc:dd:ee:ff".parse().unwrap()),
@@ -1490,11 +1494,11 @@ mod tests {
         let restored = Selector::from(wire2);
 
         assert_eq!(restored.name, original.name);
-        assert_eq!(restored.entity_type, original.entity_type);
+        assert_eq!(restored.type_, original.type_);
         assert_eq!(restored.driver, original.driver);
         assert_eq!(restored.pci_path, original.pci_path);
         assert_eq!(restored.mac, original.mac);
-        assert!(restored.labels.is_empty(), "labels are not part of wire format");
+        assert_eq!(restored.labels, original.labels, "labels must survive wire roundtrip");
     }
 
     /// State → VarlinkStateDef → JSON → VarlinkStateDef → State roundtrip

@@ -17,7 +17,7 @@ use std::str::FromStr;
 // ── Property classification constants ─────────────────────────────────────────
 
 /// Properties that map to the Selector (matching properties).
-const SELECTOR_KEYS: &[&str] = &["name", "driver", "mac", "pci_path"];
+const SELECTOR_KEYS: &[&str] = &["name", "driver", "mac", "pci_path", "labels"];
 
 /// Properties with special meaning (not stored in State).
 const META_KEYS: &[&str] = &["kind", "type"];
@@ -241,6 +241,37 @@ fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError> {
         selector.mac = Some(mac);
     }
 
+    // Parse optional labels mapping.
+    let labels_key = serde_yaml::Value::String("labels".to_string());
+    if let Some(labels_val) = map.get(&labels_key) {
+        match labels_val {
+            serde_yaml::Value::Mapping(labels_map) => {
+                for (lk, lv) in labels_map {
+                    let label_key = match lk {
+                        serde_yaml::Value::String(s) => s.clone(),
+                        _ => {
+                            return Err(YamlError::ExpectedString {
+                                key: "labels.<key>".to_string(),
+                            })
+                        }
+                    };
+                    let label_val = match lv {
+                        serde_yaml::Value::String(s) => s.clone(),
+                        _ => {
+                            return Err(YamlError::ExpectedString {
+                                key: format!("labels.{label_key}"),
+                            })
+                        }
+                    };
+                    selector.labels.insert(label_key, label_val);
+                }
+            }
+            _ => {
+                return Err(YamlError::ExpectedMapping);
+            }
+        }
+    }
+
     // All remaining keys (not in META_KEYS or SELECTOR_KEYS) become fields.
     let mut fields = IndexMap::new();
     for (k, v) in &map {
@@ -339,6 +370,22 @@ pub fn serialize_state_to_value(state: &State) -> serde_yaml::Value {
         map.insert(
             serde_yaml::Value::String("pci_path".to_string()),
             serde_yaml::Value::String(pci_path.clone()),
+        );
+    }
+
+    if !state.selector.labels.is_empty() {
+        let mut labels_map = serde_yaml::Mapping::new();
+        let mut sorted_labels: Vec<(&String, &String)> = state.selector.labels.iter().collect();
+        sorted_labels.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in sorted_labels {
+            labels_map.insert(
+                serde_yaml::Value::String(k.clone()),
+                serde_yaml::Value::String(v.clone()),
+            );
+        }
+        map.insert(
+            serde_yaml::Value::String("labels".to_string()),
+            serde_yaml::Value::Mapping(labels_map),
         );
     }
 
