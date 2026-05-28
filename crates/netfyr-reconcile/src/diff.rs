@@ -391,6 +391,15 @@ mod tests {
         Value::List(addrs.iter().map(|s| Value::String(s.to_string())).collect())
     }
 
+    /// Build the `ethernet` sub-object value (`{"speed": <speed>}`) the way the
+    /// backend would report it — nested inside the top-level `ethernet` field.
+    fn make_ethernet_sub_object(speed: u64) -> Value {
+        use netfyr_state::yaml::deserialize_value;
+        let yaml_str = format!("speed: {speed}");
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&yaml_str).expect("valid yaml");
+        deserialize_value(&yaml_val).expect("valid Value")
+    }
+
     // ── Scenario: Entity in desired but not actual → Add ─────────────────────
 
     #[test]
@@ -817,8 +826,9 @@ mod tests {
     #[test]
     fn test_read_only_carrier_and_speed_excluded_from_diff() {
         // desired: eth0 with only mtu=1500
-        // actual:  eth0 with mtu=1500, carrier=true, speed=1000
-        // carrier and speed are x-netfyr-writable: false in the ethernet schema
+        // actual:  eth0 with mtu=1500, carrier=true, ethernet={speed:1000}
+        // carrier is x-netfyr-writable: false (top-level, link.json).
+        // speed is nested inside the ethernet sub-object, which is also read-only.
         let mut desired = StateSet::new();
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
 
@@ -829,7 +839,7 @@ mod tests {
             vec![
                 ("mtu", Value::U64(1500)),
                 ("carrier", Value::Bool(true)),
-                ("speed", Value::U64(1000)),
+                ("ethernet", make_ethernet_sub_object(1000)),
             ],
         ));
         let schema = SchemaRegistry::new();
@@ -837,10 +847,10 @@ mod tests {
 
         let diff = generate_diff(&desired, &actual, &managed, &schema);
 
-        // carrier and speed are read-only → they should not generate a Modify operation
+        // carrier and ethernet sub-object are read-only → they must not generate a Modify
         assert!(
             diff.is_empty(),
-            "carrier and speed are read-only and must not generate a Modify operation"
+            "carrier and ethernet sub-object are read-only and must not generate a Modify operation"
         );
     }
 
@@ -1106,8 +1116,9 @@ mod tests {
     #[test]
     fn test_all_read_only_fields_excluded_from_diff_criterion_16() {
         // Criterion 16: desired=eth0(mtu=1500), actual=eth0(mtu=1500, carrier=true,
-        // speed=1000, mac="aa:bb:cc:dd:ee:ff", driver="virtio_net", name="eth0").
+        // ethernet={speed:1000}, mac="aa:bb:cc:dd:ee:ff", driver="virtio_net", name="eth0").
         // All five read-only fields must be excluded — StateDiff must be empty.
+        // Note: speed is nested inside the ethernet sub-object (not a top-level field).
         let mut desired = StateSet::new();
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
 
@@ -1118,7 +1129,7 @@ mod tests {
             vec![
                 ("mtu", Value::U64(1500)),
                 ("carrier", Value::Bool(true)),
-                ("speed", Value::U64(1000)),
+                ("ethernet", make_ethernet_sub_object(1000)),
                 ("mac", Value::String("aa:bb:cc:dd:ee:ff".to_string())),
                 ("driver", Value::String("virtio_net".to_string())),
                 ("name", Value::String("eth0".to_string())),
@@ -1131,8 +1142,8 @@ mod tests {
 
         assert!(
             diff.is_empty(),
-            "carrier, speed, mac, driver, and name are all read-only — StateDiff must be \
-             empty; diff had {} operation(s)",
+            "carrier, ethernet sub-object, mac, driver, and name are all read-only — \
+             StateDiff must be empty; diff had {} operation(s)",
             diff.len()
         );
     }

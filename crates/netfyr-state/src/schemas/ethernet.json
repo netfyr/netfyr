@@ -6,16 +6,19 @@
   "additionalProperties": false,
   "x-netfyr-inherit": ["ip", "link"],
   "properties": {
-    "speed": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Link speed in Mbps",
-      "x-netfyr-writable": false
-    },
-    "driver": {
-      "type": "string",
-      "description": "Kernel driver name",
-      "x-netfyr-writable": false
+    "ethernet": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ethernet-specific properties",
+      "x-netfyr-writable": false,
+      "properties": {
+        "speed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Negotiated link speed in Mbps",
+          "x-netfyr-writable": false
+        }
+      }
     }
   }
 }

@@ -4,6 +4,11 @@
   "description": "Link-level properties shared across interface types",
   "type": "object",
   "properties": {
+    "type": {
+      "type": "string",
+      "description": "Technology type (e.g., \"ethernet\")",
+      "x-netfyr-writable": false
+    },
     "name": {
       "type": "string",
       "description": "Interface name (kernel-assigned, not settable via policy)",
@@ -33,6 +38,11 @@
       "description": "Maximum transmission unit",
       "x-netfyr-writable": true,
       "x-netfyr-keep-when-absent": true
+    },
+    "driver": {
+      "type": "string",
+      "description": "Kernel driver name",
+      "x-netfyr-writable": false
     }
   }
 }
