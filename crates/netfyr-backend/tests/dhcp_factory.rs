@@ -145,7 +145,11 @@ async fn test_acquire_dhcp_lease_in_unprivileged_namespace() {
         .expect("addresses must be a list");
     assert!(!addresses.is_empty(), "addresses must be non-empty");
 
-    let cidr = addresses[0].as_str().expect("address must be a string");
+    let cidr = addresses[0]
+        .as_map()
+        .and_then(|m| m.get("address"))
+        .and_then(|v| v.as_str())
+        .expect("address entry must be a map with 'address' key containing a CIDR string");
     let ip_str = cidr.split('/').next().expect("CIDR must contain /");
     let ip: Ipv4Addr = ip_str.parse().expect("address must be a valid IPv4");
 
@@ -374,8 +378,12 @@ async fn test_current_state_full_fields_after_lease_acquired() {
         !addresses.is_empty(),
         "addresses list must be non-empty after lease acquisition"
     );
-    // Each entry must be a CIDR string (e.g. "10.99.0.x/24").
-    let cidr = addresses[0].as_str().expect("first address must be a string");
+    // Each entry must be a map with an "address" key containing a CIDR string.
+    let cidr = addresses[0]
+        .as_map()
+        .and_then(|m| m.get("address"))
+        .and_then(|v| v.as_str())
+        .expect("address entry must be a map with 'address' key containing a CIDR string");
     assert!(
         cidr.contains('/'),
         "address must be in CIDR notation (contains '/'), got: {cidr}"
@@ -463,8 +471,12 @@ async fn test_lease_renewal_in_namespace() {
                 .and_then(|fv| fv.value.as_list())
                 .and_then(|list| list.first().cloned())
         })
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .expect("must have an IP address after initial lease");
+        .as_ref()
+        .and_then(|v| v.as_map())
+        .and_then(|m| m.get("address"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .expect("must have an IP address (as map with 'address' key) after initial lease");
 
     // Wait up to 30 seconds for a LeaseRenewed event.
     let renewed = tokio::time::timeout(Duration::from_secs(30), async {
@@ -502,8 +514,10 @@ async fn test_lease_renewal_in_namespace() {
                 .get("addresses")
                 .and_then(|fv| fv.value.as_list())
                 .and_then(|l| l.first())
+                .and_then(|v| v.as_map())
+                .and_then(|m| m.get("address"))
                 .and_then(|v| v.as_str())
-                .expect("renewed state must have an address");
+                .expect("renewed state must have an address map with 'address' key");
 
             // Log whether the IP changed — both outcomes are valid per spec.
             if ip_before != ip_after {

@@ -1576,7 +1576,7 @@ mod tests {
         let mut writable: Vec<&str> = schema
             .field_names()
             .into_iter()
-            .filter(|f| schema.field_info(f).map_or(false, |i| i.writable))
+            .filter(|f| schema.field_info(f).is_some_and(|i| i.writable))
             .collect();
         writable.sort();
 
@@ -1597,7 +1597,7 @@ mod tests {
         let mut readonly: Vec<&str> = schema
             .field_names()
             .into_iter()
-            .filter(|f| schema.field_info(f).map_or(false, |i| !i.writable))
+            .filter(|f| schema.field_info(f).is_some_and(|i| !i.writable))
             .collect();
         readonly.sort();
 
@@ -2092,7 +2092,7 @@ mod tests {
         let mut writable: Vec<&str> = schema
             .field_names()
             .into_iter()
-            .filter(|f| schema.field_info(f).map_or(false, |i| i.writable))
+            .filter(|f| schema.field_info(f).is_some_and(|i| i.writable))
             .collect();
         writable.sort();
 
@@ -2114,7 +2114,7 @@ mod tests {
         let mut readonly: Vec<&str> = schema
             .field_names()
             .into_iter()
-            .filter(|f| schema.field_info(f).map_or(false, |i| !i.writable))
+            .filter(|f| schema.field_info(f).is_some_and(|i| !i.writable))
             .collect();
         readonly.sort();
 
@@ -2174,7 +2174,7 @@ mod tests {
         let mut writable: Vec<&str> = schema
             .field_names()
             .into_iter()
-            .filter(|f| schema.field_info(f).map_or(false, |i| i.writable))
+            .filter(|f| schema.field_info(f).is_some_and(|i| i.writable))
             .collect();
         writable.sort();
 
@@ -2196,7 +2196,7 @@ mod tests {
         let mut readonly: Vec<&str> = schema
             .field_names()
             .into_iter()
-            .filter(|f| schema.field_info(f).map_or(false, |i| !i.writable))
+            .filter(|f| schema.field_info(f).is_some_and(|i| !i.writable))
             .collect();
         readonly.sort();
 

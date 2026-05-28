@@ -1337,6 +1337,44 @@ fn build_planned_changes(op: &DiffOp, current_state: &State) -> Vec<FieldChange>
     field_changes
 }
 
+// ── Construction helpers ──────────────────────────────────────────────────────
+
+/// Construct a `([], [failure], [])` triple for a top-level operation failure.
+fn fail_op(
+    op: DiffOpKind,
+    entity_type: &str,
+    selector: &Selector,
+    error: BackendError,
+    fields: Vec<String>,
+) -> (
+    Vec<AppliedOperation>,
+    Vec<FailedOperation>,
+    Vec<SkippedOperation>,
+) {
+    (
+        vec![],
+        vec![FailedOperation {
+            operation: op,
+            entity_type: entity_type.to_string(),
+            selector: selector.clone(),
+            error,
+            fields,
+        }],
+        vec![],
+    )
+}
+
+/// Construct a `FailedOperation` for a single-field error during modify.
+fn make_field_failure(name: &str, error: BackendError, field: &str) -> FailedOperation {
+    FailedOperation {
+        operation: DiffOpKind::Modify,
+        entity_type: "ethernet".to_string(),
+        selector: Selector::with_name(name),
+        error,
+        fields: vec![field.to_string()],
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2043,43 +2081,5 @@ mod tests {
                 read_only, writable
             );
         }
-    }
-}
-
-// ── Construction helpers ──────────────────────────────────────────────────────
-
-/// Construct a `([], [failure], [])` triple for a top-level operation failure.
-fn fail_op(
-    op: DiffOpKind,
-    entity_type: &str,
-    selector: &Selector,
-    error: BackendError,
-    fields: Vec<String>,
-) -> (
-    Vec<AppliedOperation>,
-    Vec<FailedOperation>,
-    Vec<SkippedOperation>,
-) {
-    (
-        vec![],
-        vec![FailedOperation {
-            operation: op,
-            entity_type: entity_type.to_string(),
-            selector: selector.clone(),
-            error,
-            fields,
-        }],
-        vec![],
-    )
-}
-
-/// Construct a `FailedOperation` for a single-field error during modify.
-fn make_field_failure(name: &str, error: BackendError, field: &str) -> FailedOperation {
-    FailedOperation {
-        operation: DiffOpKind::Modify,
-        entity_type: "ethernet".to_string(),
-        selector: Selector::with_name(name),
-        error,
-        fields: vec![field.to_string()],
     }
 }
