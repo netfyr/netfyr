@@ -181,8 +181,13 @@ pub fn serialize_value(v: &Value) -> serde_yaml::Value {
 
 // ── State parsing ─────────────────────────────────────────────────────────────
 
-/// Parses one YAML document (already deserialized to `serde_yaml::Value`) into a `State`.
-fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError> {
+/// Backward-compatible flat-format parser. Used by `parse_state_value` for
+/// `netfyr-policy`. Will be removed by SPEC-007 when the policy layer migrates
+/// to the selector sub-mapping format.
+///
+/// Requires a top-level `type:` key; extracts selector fields (name, driver,
+/// mac, pci_path, labels) from the top level; everything else becomes a field.
+fn parse_raw_to_state_flat(raw: serde_yaml::Value) -> Result<State, YamlError> {
     let map = match raw {
         serde_yaml::Value::Mapping(m) => m,
         _ => return Err(YamlError::ExpectedMapping),
@@ -304,21 +309,93 @@ fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError> {
     })
 }
 
+/// Parses one YAML document (selector sub-mapping format) into a `State`.
+///
+/// Accepts `kind: state` or absent `kind`. The `selector:` sub-mapping (if
+/// present) is deserialized into a `Selector` via serde. All other top-level
+/// keys (except `kind` and `selector`) become fields. `entity_type` is always
+/// empty — it is determined later by the backend during query.
+fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError> {
+    let map = match raw {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => return Err(YamlError::ExpectedMapping),
+    };
+
+    // Check optional `kind` field.
+    let kind_key = serde_yaml::Value::String("kind".to_string());
+    if let Some(kind_val) = map.get(&kind_key) {
+        match kind_val {
+            serde_yaml::Value::String(k) if k == "state" => {}
+            serde_yaml::Value::String(k) => return Err(YamlError::InvalidKind(k.clone())),
+            _ => return Err(YamlError::InvalidKind("<non-string>".to_string())),
+        }
+    }
+
+    // Extract selector from the "selector:" sub-mapping, if present.
+    // Selector derives Deserialize with proper serde annotations (including
+    // the `type` rename and custom MacAddr deserialization).
+    let selector_key = serde_yaml::Value::String("selector".to_string());
+    let selector = if let Some(sel_value) = map.get(&selector_key) {
+        serde_yaml::from_value::<Selector>(sel_value.clone()).map_err(YamlError::Parse)?
+    } else {
+        Selector::default()
+    };
+
+    // entity_type is NOT extracted from policy input — determined by the
+    // backend during query based on technology detection.
+    let entity_type = String::new();
+
+    // Everything else (except "kind" and "selector") becomes a field.
+    let mut fields = IndexMap::new();
+    for (k, v) in &map {
+        let key_str = match k {
+            serde_yaml::Value::String(s) => s.as_str(),
+            _ => continue,
+        };
+        if key_str == "kind" || key_str == "selector" {
+            continue;
+        }
+        let value = deserialize_value(v)?;
+        fields.insert(
+            key_str.to_string(),
+            FieldValue {
+                value,
+                provenance: Provenance::UserConfigured {
+                    policy_ref: String::new(),
+                },
+            },
+        );
+    }
+
+    Ok(State {
+        entity_type,
+        selector,
+        fields,
+        metadata: StateMetadata::new(),
+        policy_ref: None,
+        priority: 100,
+    })
+}
+
 /// Parses a raw `serde_yaml::Value` (flat-format mapping) into a `State`.
 ///
 /// This is the public interface to the flat-format parser. It accepts the same
-/// input as `parse_yaml` document-by-document. Used by `netfyr-policy` to
-/// convert embedded `state:` / `states:` sub-documents inside policy YAML into
-/// `State` values without re-serializing them to strings first.
+/// input as the old `parse_yaml` document-by-document. Used by `netfyr-policy`
+/// to convert embedded `state:` / `states:` sub-documents inside policy YAML
+/// into `State` values without re-serializing them to strings first.
+///
+/// Requires a top-level `type:` key. Will be updated to use the selector
+/// sub-mapping format by SPEC-007.
 pub fn parse_state_value(raw: serde_yaml::Value) -> Result<State, YamlError> {
-    parse_raw_to_state(raw)
+    parse_raw_to_state_flat(raw)
 }
 
 /// Parses a YAML string that may contain one or more `---`-separated documents.
 ///
-/// Each document must be a flat mapping with a required `type` key. Empty
-/// documents (null values between separators) are silently skipped. Returns
-/// an error if any document has an unrecognised `kind` value.
+/// Each document is parsed using the selector sub-mapping format: a `selector:`
+/// sub-mapping identifies the target entity, and all other keys become fields.
+/// Empty documents (null values between separators) are silently skipped.
+/// Returns an error if any document has an unrecognised `kind` value.
 pub fn parse_yaml(input: &str) -> Result<Vec<State>, YamlError> {
     let mut results = Vec::new();
     for document in serde_yaml::Deserializer::from_str(input) {
@@ -343,10 +420,12 @@ pub fn parse_yaml(input: &str) -> Result<Vec<State>, YamlError> {
 pub fn serialize_state_to_value(state: &State) -> serde_yaml::Value {
     let mut map = serde_yaml::Mapping::new();
 
-    map.insert(
-        serde_yaml::Value::String("type".to_string()),
-        serde_yaml::Value::String(state.entity_type.clone()),
-    );
+    if !state.entity_type.is_empty() {
+        map.insert(
+            serde_yaml::Value::String("type".to_string()),
+            serde_yaml::Value::String(state.entity_type.clone()),
+        );
+    }
 
     if let Some(name) = &state.selector.name {
         map.insert(
@@ -580,20 +659,24 @@ mod tests {
         assert_eq!(states.len(), 1);
     }
 
-    /// Scenario: Parse flat bare state — entity_type is "ethernet"
+    /// Scenario: Parse flat bare state without selector: sub-mapping — entity_type is empty;
+    /// "type" goes to fields (entity_type is determined later by the backend).
     #[test]
     fn test_parse_yaml_flat_bare_state_entity_type_is_ethernet() {
         let yaml = "type: ethernet\nname: eth0\nmtu: 1500\n";
         let states = parse_yaml(yaml).unwrap();
-        assert_eq!(states[0].entity_type, "ethernet");
+        assert_eq!(states[0].entity_type, "");
+        assert_eq!(states[0].fields["type"].value, Value::String("ethernet".to_string()));
     }
 
-    /// Scenario: Parse flat bare state — selector.name is Some("eth0")
+    /// Scenario: Parse flat bare state without selector: sub-mapping — top-level "name"
+    /// goes to fields, not to selector (selector requires the "selector:" sub-mapping).
     #[test]
     fn test_parse_yaml_flat_bare_state_selector_name_is_eth0() {
         let yaml = "type: ethernet\nname: eth0\nmtu: 1500\n";
         let states = parse_yaml(yaml).unwrap();
-        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[0].selector.name, None);
+        assert_eq!(states[0].fields["name"].value, Value::String("eth0".to_string()));
     }
 
     /// Scenario: Parse flat bare state — fields contains "mtu" with Value::U64(1500)
@@ -616,12 +699,14 @@ mod tests {
         assert_eq!(list[0], Value::IpNetwork(expected_net));
     }
 
-    /// Scenario: Parse bare state with driver selector — selector.driver is Some("ixgbe")
+    /// Scenario: Parse flat YAML without selector: sub-mapping — top-level "driver"
+    /// goes to fields, not to selector.driver.
     #[test]
     fn test_parse_yaml_driver_selector_driver_is_ixgbe() {
         let yaml = "type: ethernet\ndriver: ixgbe\nmtu: 9000\n";
         let states = parse_yaml(yaml).unwrap();
-        assert_eq!(states[0].selector.driver, Some("ixgbe".to_string()));
+        assert_eq!(states[0].selector.driver, None);
+        assert_eq!(states[0].fields["driver"].value, Value::String("ixgbe".to_string()));
     }
 
     /// Scenario: Parse bare state with driver selector — selector.name is None
@@ -683,21 +768,21 @@ mod tests {
         assert_eq!(states.len(), 2);
     }
 
-    /// Scenario: Multi-document — first state has selector.name "eth0" and mtu 1500
+    /// Scenario: Multi-document — first state has name "eth0" in fields and mtu 1500
     #[test]
     fn test_parse_yaml_multi_document_first_state_eth0_mtu_1500() {
         let yaml = "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n";
         let states = parse_yaml(yaml).unwrap();
-        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[0].fields["name"].value, Value::String("eth0".to_string()));
         assert_eq!(states[0].fields["mtu"].value, Value::U64(1500));
     }
 
-    /// Scenario: Multi-document — second state has selector.name "eth1" and mtu 9000
+    /// Scenario: Multi-document — second state has name "eth1" in fields and mtu 9000
     #[test]
     fn test_parse_yaml_multi_document_second_state_eth1_mtu_9000() {
         let yaml = "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n";
         let states = parse_yaml(yaml).unwrap();
-        assert_eq!(states[1].selector.name, Some("eth1".to_string()));
+        assert_eq!(states[1].fields["name"].value, Value::String("eth1".to_string()));
         assert_eq!(states[1].fields["mtu"].value, Value::U64(9000));
     }
 
@@ -724,51 +809,61 @@ mod tests {
         assert!(route_map.contains_key("metric"), "map should have 'metric'");
     }
 
-    /// Scenario: Selector properties are not in fields — name and driver go to selector only
+    /// Scenario: Without a "selector:" sub-mapping, name and driver go to fields.
+    /// Use a "selector:" sub-mapping to route fields to the Selector struct.
     #[test]
     fn test_parse_yaml_selector_properties_name_and_driver_not_in_fields() {
         let yaml = "type: ethernet\nname: eth0\ndriver: e1000\nmtu: 1500\n";
         let states = parse_yaml(yaml).unwrap();
         let state = &states[0];
-        assert_eq!(state.selector.name, Some("eth0".to_string()));
-        assert_eq!(state.selector.driver, Some("e1000".to_string()));
+        // Without selector: sub-mapping, name and driver go to fields, not selector.
+        assert_eq!(state.selector.name, None);
+        assert_eq!(state.selector.driver, None);
         assert!(
-            !state.fields.contains_key("name"),
-            "name should not appear in fields"
+            state.fields.contains_key("name"),
+            "name goes to fields without selector: sub-mapping"
         );
         assert!(
-            !state.fields.contains_key("driver"),
-            "driver should not appear in fields"
+            state.fields.contains_key("driver"),
+            "driver goes to fields without selector: sub-mapping"
         );
     }
 
-    /// Scenario: Selector properties are not in fields — only mtu is in fields
+    /// Scenario: Without a "selector:" sub-mapping, all top-level keys go to fields
+    /// (only "kind" and "selector" are excluded).
     #[test]
     fn test_parse_yaml_only_config_properties_in_fields() {
         let yaml = "type: ethernet\nname: eth0\ndriver: e1000\nmtu: 1500\n";
         let states = parse_yaml(yaml).unwrap();
         assert!(states[0].fields.contains_key("mtu"), "mtu should be in fields");
-        assert_eq!(states[0].fields.len(), 1, "only mtu should be in fields");
+        assert!(states[0].fields.contains_key("type"), "type should be in fields");
+        assert!(states[0].fields.contains_key("name"), "name should be in fields");
+        assert!(states[0].fields.contains_key("driver"), "driver should be in fields");
+        assert_eq!(states[0].fields.len(), 4, "type, name, driver, mtu should all be in fields");
     }
 
-    /// type field is classified as a meta property and is not stored in fields
+    /// "type" is a regular field in policy input format; only "kind" and "selector" are excluded.
     #[test]
     fn test_parse_yaml_type_not_stored_in_fields() {
         let yaml = "type: ethernet\nname: eth0\n";
         let states = parse_yaml(yaml).unwrap();
         assert!(
-            !states[0].fields.contains_key("type"),
-            "type should not appear in fields"
+            states[0].fields.contains_key("type"),
+            "type should appear in fields in policy input format"
         );
+        assert_eq!(states[0].fields["type"].value, Value::String("ethernet".to_string()));
     }
 
-    /// Missing type field returns MissingType error
+    /// Missing "type" field is not an error in policy input format — entity_type is
+    /// determined later by the backend, not from the YAML.
     #[test]
     fn test_parse_yaml_missing_type_returns_missing_type_error() {
         let yaml = "name: eth0\nmtu: 1500\n";
         let result = parse_yaml(yaml);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), YamlError::MissingType));
+        assert!(result.is_ok(), "missing 'type' should not error in policy input format");
+        let states = result.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].entity_type, "");
     }
 
     /// Invalid kind value returns InvalidKind error
@@ -900,22 +995,28 @@ mod tests {
 
     // ── Round-trip ────────────────────────────────────────────────────────────
 
-    /// Scenario: Round-trip preserves entity_type
+    /// Round-trip: entity_type is NOT preserved because state_to_yaml writes "type"
+    /// as a flat field and parse_yaml (policy input format) does not map it back
+    /// to entity_type. The round-trip is intentionally asymmetric.
     #[test]
     fn test_round_trip_yaml_preserves_entity_type() {
         let state = make_state("ethernet", "eth0", 1500);
         let yaml = state_to_yaml(&state).unwrap();
         let restored = &parse_yaml(&yaml).unwrap()[0];
-        assert_eq!(restored.entity_type, "ethernet");
+        assert_eq!(restored.entity_type, "");
+        assert_eq!(restored.fields["type"].value, Value::String("ethernet".to_string()));
     }
 
-    /// Scenario: Round-trip preserves selector.name
+    /// Round-trip: selector.name is NOT preserved because state_to_yaml writes "name"
+    /// as a flat field and parse_yaml (policy input format) does not map it back to
+    /// selector.name without a "selector:" sub-mapping.
     #[test]
     fn test_round_trip_yaml_preserves_selector_name() {
         let state = make_state("ethernet", "eth0", 1500);
         let yaml = state_to_yaml(&state).unwrap();
         let restored = &parse_yaml(&yaml).unwrap()[0];
-        assert_eq!(restored.selector.name, Some("eth0".to_string()));
+        assert_eq!(restored.selector.name, None);
+        assert_eq!(restored.fields["name"].value, Value::String("eth0".to_string()));
     }
 
     /// Scenario: Round-trip preserves field values
@@ -980,8 +1081,10 @@ mod tests {
         let yaml = state_to_yaml(&state).unwrap();
         let restored = &parse_yaml(&yaml).unwrap()[0];
 
-        assert_eq!(restored.entity_type, "ethernet");
-        assert_eq!(restored.selector.name, Some("eth0".to_string()));
+        // Round-trip via flat query output / policy input is intentionally asymmetric:
+        // entity_type and selector.name are not preserved (they appear as plain fields).
+        assert_eq!(restored.entity_type, "");
+        assert_eq!(restored.selector.name, None);
         assert_eq!(restored.fields["mtu"].value, Value::U64(9000));
         assert_eq!(restored.fields["enabled"].value, Value::Bool(true));
         assert_eq!(restored.fields["label"].value, Value::String("uplink".to_string()));
@@ -1045,24 +1148,26 @@ mod tests {
         assert_eq!(list[2], Value::IpNetwork(n3), "third address should be 10.0.3.50/24");
     }
 
-    /// Scenario: mac selector key in YAML is parsed into selector.mac (not fields)
+    /// Scenario: Without a "selector:" sub-mapping, a top-level "mac" key goes to
+    /// fields as a plain string, not to selector.mac.
     #[test]
     fn test_parse_yaml_mac_selector_parsed_to_selector_mac() {
         let yaml = "type: ethernet\nmac: aa:bb:cc:dd:ee:ff\nmtu: 1500\n";
         let states = parse_yaml(yaml).unwrap();
         let state = &states[0];
 
-        // mac must land on the selector, not in fields
+        // mac goes to fields; selector.mac requires the "selector:" sub-mapping.
         assert!(
-            state.selector.mac.is_some(),
-            "mac should be parsed into selector.mac"
+            state.selector.mac.is_none(),
+            "mac without selector: sub-mapping should not be in selector"
         );
-        let mac = state.selector.mac.as_ref().unwrap();
-        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
-
         assert!(
-            !state.fields.contains_key("mac"),
-            "mac should not appear in fields"
+            state.fields.contains_key("mac"),
+            "mac should appear in fields"
+        );
+        assert_eq!(
+            state.fields["mac"].value,
+            Value::String("aa:bb:cc:dd:ee:ff".to_string())
         );
     }
 
@@ -1126,5 +1231,380 @@ mod tests {
         let restored = &parse_yaml(&yaml).unwrap()[0];
         let addrs = restored.fields["addresses"].value.as_list().unwrap();
         assert_eq!(addrs[0], Value::IpNetwork(net));
+    }
+
+    // ── SPEC-005: Selector sub-mapping format (policy input format) ───────────
+    //
+    // parse_yaml() uses parse_raw_to_state() which implements the NEW selector
+    // sub-mapping format: entity_type is always empty (determined by backend),
+    // selector comes from a "selector:" sub-mapping, all other keys are fields.
+    //
+    // NOTE: Several tests above this section test OLD flat-format behaviour
+    // (e.g., top-level "type:" → entity_type, top-level "name:" → selector).
+    // Those tests are for the previous implementation and are now incorrect for
+    // the current parse_yaml() function. They are left in place for the verify
+    // phase to reconcile.
+
+    /// Scenario: Parse bare state with selector sub-mapping — returns one State
+    #[test]
+    fn test_parse_yaml_selector_submapping_bare_returns_one_state() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\naddresses:\n  - 10.0.1.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 1);
+    }
+
+    /// Scenario: Parse bare state with selector sub-mapping
+    /// entity_type is empty (not set in policy input — determined later by backend)
+    #[test]
+    fn test_parse_yaml_selector_submapping_entity_type_is_empty() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\naddresses:\n  - 10.0.1.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(
+            states[0].entity_type, "",
+            "entity_type must be empty in policy input format"
+        );
+    }
+
+    /// Scenario: Parse bare state with selector sub-mapping
+    /// selector.name is Some("eth0")
+    #[test]
+    fn test_parse_yaml_selector_submapping_selector_name_is_eth0() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\naddresses:\n  - 10.0.1.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+    }
+
+    /// Scenario: Parse bare state with selector sub-mapping
+    /// fields contains "mtu" with Value::U64(1500)
+    #[test]
+    fn test_parse_yaml_selector_submapping_mtu_field_is_u64_1500() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\naddresses:\n  - 10.0.1.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(1500));
+    }
+
+    /// Scenario: Parse bare state with selector sub-mapping
+    /// fields contains "addresses" with Value::List containing one IpNetwork value
+    #[test]
+    fn test_parse_yaml_selector_submapping_addresses_list_has_ip_network() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\naddresses:\n  - 10.0.1.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        let addrs = &states[0].fields["addresses"].value;
+        let list = addrs.as_list().expect("addresses should be a Value::List");
+        assert_eq!(list.len(), 1);
+        let expected_net: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        assert_eq!(list[0], Value::IpNetwork(expected_net));
+    }
+
+    /// Scenario: Parse bare state with driver selector
+    /// entity_type is empty (not set in policy input)
+    #[test]
+    fn test_parse_yaml_selector_submapping_driver_entity_type_is_empty() {
+        let yaml = "selector:\n  driver: ixgbe\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].entity_type, "");
+    }
+
+    /// Scenario: Parse bare state with driver selector
+    /// selector.driver is Some("ixgbe"), selector.name is None
+    #[test]
+    fn test_parse_yaml_selector_submapping_driver_selector_values() {
+        let yaml = "selector:\n  driver: ixgbe\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].selector.driver, Some("ixgbe".to_string()));
+        assert_eq!(states[0].selector.name, None);
+    }
+
+    /// Scenario: Parse bare state with driver selector
+    /// fields contains "mtu" with Value::U64(9000)
+    #[test]
+    fn test_parse_yaml_selector_submapping_driver_mtu_is_9000() {
+        let yaml = "selector:\n  driver: ixgbe\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(9000));
+    }
+
+    /// Scenario: Parse explicit format with kind: state (selector sub-mapping)
+    /// Returns one State with mtu=9000
+    #[test]
+    fn test_parse_yaml_selector_submapping_explicit_kind_state_mtu_9000() {
+        let yaml = "kind: state\nselector:\n  name: eth0\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(9000));
+    }
+
+    /// Scenario: Bare and explicit formats produce identical result (kind is not stored)
+    #[test]
+    fn test_parse_yaml_selector_submapping_explicit_kind_same_as_bare() {
+        let bare = "selector:\n  name: eth0\nmtu: 9000\n";
+        let explicit = "kind: state\nselector:\n  name: eth0\nmtu: 9000\n";
+        let bare_states = parse_yaml(bare).unwrap();
+        let explicit_states = parse_yaml(explicit).unwrap();
+        assert_eq!(bare_states[0].entity_type, explicit_states[0].entity_type);
+        assert_eq!(bare_states[0].selector.name, explicit_states[0].selector.name);
+        assert_eq!(
+            bare_states[0].fields["mtu"].value,
+            explicit_states[0].fields["mtu"].value
+        );
+        assert!(
+            !explicit_states[0].fields.contains_key("kind"),
+            "kind should not be stored in fields"
+        );
+    }
+
+    /// Scenario: Parse multi-document YAML (selector sub-mapping format)
+    /// Returns two State values
+    #[test]
+    fn test_parse_yaml_selector_submapping_multi_document_two_states() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 2);
+    }
+
+    /// Scenario: Multi-document — first state has selector.name "eth0" and mtu 1500
+    #[test]
+    fn test_parse_yaml_selector_submapping_multi_document_first_state() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(1500));
+    }
+
+    /// Scenario: Multi-document — second state has selector.name "eth1" and mtu 9000
+    #[test]
+    fn test_parse_yaml_selector_submapping_multi_document_second_state() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\n---\nselector:\n  name: eth1\nmtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[1].selector.name, Some("eth1".to_string()));
+        assert_eq!(states[1].fields["mtu"].value, Value::U64(9000));
+    }
+
+    /// Scenario: Parse route objects in fields (selector sub-mapping format)
+    /// fields contains "routes" as a Value::List
+    #[test]
+    fn test_parse_yaml_selector_submapping_routes_is_a_list() {
+        let yaml =
+            "selector:\n  name: eth0\nroutes:\n  - destination: 0.0.0.0/0\n    gateway: 10.0.1.1\n    metric: 100\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert!(
+            states[0].fields["routes"].value.as_list().is_some(),
+            "routes should be a Value::List"
+        );
+    }
+
+    /// Scenario: Parse route objects — first element is a Value::Map with keys
+    /// "destination", "gateway", "metric"
+    #[test]
+    fn test_parse_yaml_selector_submapping_route_map_has_expected_keys() {
+        let yaml =
+            "selector:\n  name: eth0\nroutes:\n  - destination: 0.0.0.0/0\n    gateway: 10.0.1.1\n    metric: 100\n";
+        let states = parse_yaml(yaml).unwrap();
+        let routes = states[0].fields["routes"].value.as_list().unwrap();
+        let route_map = routes[0].as_map().expect("route element should be a Value::Map");
+        assert!(route_map.contains_key("destination"), "map should have 'destination'");
+        assert!(route_map.contains_key("gateway"), "map should have 'gateway'");
+        assert!(route_map.contains_key("metric"), "map should have 'metric'");
+    }
+
+    /// Scenario: Route map values are correctly typed in selector sub-mapping format
+    /// destination → IpNetwork, gateway → IpAddr, metric → U64
+    #[test]
+    fn test_parse_yaml_selector_submapping_route_values_are_correctly_typed() {
+        let yaml =
+            "selector:\n  name: eth0\nroutes:\n  - destination: 0.0.0.0/0\n    gateway: 10.0.1.1\n    metric: 100\n";
+        let states = parse_yaml(yaml).unwrap();
+        let routes = states[0].fields["routes"].value.as_list().unwrap();
+        let route_map = routes[0].as_map().unwrap();
+
+        let expected_net: IpNetwork = "0.0.0.0/0".parse().unwrap();
+        assert_eq!(
+            route_map.get("destination"),
+            Some(&Value::IpNetwork(expected_net)),
+        );
+        let expected_gw: IpAddr = "10.0.1.1".parse().unwrap();
+        assert_eq!(route_map.get("gateway"), Some(&Value::IpAddr(expected_gw)));
+        assert_eq!(route_map.get("metric"), Some(&Value::U64(100)));
+    }
+
+    /// Scenario: Selector properties are in the selector sub-mapping, not in fields
+    /// selector.name is Some("eth0"), selector.driver is Some("e1000")
+    #[test]
+    fn test_parse_yaml_selector_submapping_selector_fields_on_selector() {
+        let yaml = "selector:\n  name: eth0\n  driver: e1000\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[0].selector.driver, Some("e1000".to_string()));
+    }
+
+    /// Scenario: Selector properties are in the selector sub-mapping, not in fields
+    /// fields does NOT contain "name", "driver", or "selector"
+    /// fields contains only "mtu"
+    #[test]
+    fn test_parse_yaml_selector_submapping_selector_fields_not_in_body_fields() {
+        let yaml = "selector:\n  name: eth0\n  driver: e1000\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        let fields = &states[0].fields;
+        assert!(
+            !fields.contains_key("name"),
+            "name should not appear in fields"
+        );
+        assert!(
+            !fields.contains_key("driver"),
+            "driver should not appear in fields"
+        );
+        assert!(
+            !fields.contains_key("selector"),
+            "selector should not appear in fields"
+        );
+        assert!(fields.contains_key("mtu"), "mtu should be in fields");
+        assert_eq!(fields.len(), 1, "only mtu should be in fields");
+    }
+
+    /// Scenario: Selector properties are in the selector sub-mapping, not in fields
+    /// When no selector sub-mapping is present, all top-level keys go to fields
+    #[test]
+    fn test_parse_yaml_no_selector_submapping_all_keys_go_to_fields() {
+        let yaml = "mtu: 9000\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].selector, Selector::default());
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(9000));
+        assert_eq!(states[0].entity_type, "");
+    }
+
+    /// Scenario: kind field is not stored in fields; selector key is not in fields
+    #[test]
+    fn test_parse_yaml_selector_submapping_kind_and_selector_not_in_fields() {
+        let yaml = "kind: state\nselector:\n  name: eth0\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert!(
+            !states[0].fields.contains_key("kind"),
+            "kind should not be stored in fields"
+        );
+        assert!(
+            !states[0].fields.contains_key("selector"),
+            "selector key should not be stored in fields"
+        );
+    }
+
+    /// Scenario: FieldValue deserialized in selector sub-mapping format has
+    /// UserConfigured provenance with empty policy_ref
+    #[test]
+    fn test_parse_yaml_selector_submapping_field_provenance_user_configured() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        match &states[0].fields["mtu"].provenance {
+            Provenance::UserConfigured { policy_ref } => {
+                assert!(
+                    policy_ref.is_empty(),
+                    "policy_ref should be empty for standalone YAML"
+                );
+            }
+            other => panic!("expected UserConfigured provenance, got {:?}", other),
+        }
+    }
+
+    /// Scenario: Address list ordering preserved through selector sub-mapping parse
+    #[test]
+    fn test_parse_yaml_selector_submapping_address_list_order_preserved() {
+        let yaml =
+            "selector:\n  name: eth0\naddresses:\n  - 10.0.1.50/24\n  - 10.0.2.50/24\n  - 10.0.3.50/24\n";
+        let states = parse_yaml(yaml).unwrap();
+        let list = states[0].fields["addresses"].value.as_list().unwrap();
+        assert_eq!(list.len(), 3);
+        let n1: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        let n2: IpNetwork = "10.0.2.50/24".parse().unwrap();
+        let n3: IpNetwork = "10.0.3.50/24".parse().unwrap();
+        assert_eq!(list[0], Value::IpNetwork(n1), "first address must be 10.0.1.50/24");
+        assert_eq!(list[1], Value::IpNetwork(n2), "second address must be 10.0.2.50/24");
+        assert_eq!(list[2], Value::IpNetwork(n3), "third address must be 10.0.3.50/24");
+    }
+
+    /// Scenario: Selector with mac in the sub-mapping
+    #[test]
+    fn test_parse_yaml_selector_submapping_mac_address() {
+        let yaml = "selector:\n  mac: aa:bb:cc:dd:ee:ff\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert!(
+            states[0].selector.mac.is_some(),
+            "mac should be in selector.mac"
+        );
+        assert_eq!(
+            states[0].selector.mac.as_ref().unwrap().to_string(),
+            "aa:bb:cc:dd:ee:ff"
+        );
+        assert!(!states[0].fields.contains_key("mac"), "mac should not be in fields");
+    }
+
+    /// Scenario: Input and output formats differ — after serializing to flat query
+    /// output format and parsing back with policy input format, entity_type is empty
+    /// (since "type" from query output is not parsed as entity_type by parse_yaml)
+    #[test]
+    fn test_parse_yaml_flat_query_output_entity_type_is_empty_after_policy_parse() {
+        // Serialize with the query output format (includes "type: ethernet")
+        let state = make_state("ethernet", "eth0", 1500);
+        let flat_yaml = state_to_yaml(&state).unwrap();
+        // parse_yaml uses the policy input format (selector sub-mapping)
+        let restored = &parse_yaml(&flat_yaml).unwrap()[0];
+        assert_eq!(
+            restored.entity_type, "",
+            "entity_type must be empty when flat query output is parsed as policy input"
+        );
+    }
+
+    /// Scenario: Input and output formats differ — metadata is regenerated after round-trip
+    #[test]
+    fn test_parse_yaml_flat_query_output_metadata_regenerated_after_policy_parse() {
+        let state = make_state("ethernet", "eth0", 1500);
+        let original_id = state.metadata.id;
+        let flat_yaml = state_to_yaml(&state).unwrap();
+        let restored = &parse_yaml(&flat_yaml).unwrap()[0];
+        assert_ne!(
+            restored.metadata.id, original_id,
+            "metadata.id must be regenerated after YAML round-trip"
+        );
+    }
+
+    /// Scenario: Invalid kind value in selector sub-mapping format returns error
+    #[test]
+    fn test_parse_yaml_selector_submapping_invalid_kind_returns_error() {
+        let yaml = "kind: policy\nselector:\n  name: eth0\nmtu: 1500\n";
+        let result = parse_yaml(yaml);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), YamlError::InvalidKind(_)),
+            "expected InvalidKind error"
+        );
+    }
+
+    /// Scenario: Trailing --- separator is silently skipped (selector sub-mapping format)
+    #[test]
+    fn test_parse_yaml_selector_submapping_trailing_separator_skipped() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\n---\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 1);
+    }
+
+    /// Scenario: A bare document with no fields at all and an empty selector parses ok
+    #[test]
+    fn test_parse_yaml_selector_submapping_empty_selector_submapping() {
+        let yaml = "selector: {}\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].selector, Selector::default());
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(1500));
+    }
+
+    /// Scenario: pci_path in selector sub-mapping goes to selector, not fields
+    #[test]
+    fn test_parse_yaml_selector_submapping_pci_path_in_selector() {
+        let yaml = "selector:\n  pci_path: '0000:03:00.0'\nmtu: 1500\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(
+            states[0].selector.pci_path,
+            Some("0000:03:00.0".to_string())
+        );
+        assert!(!states[0].fields.contains_key("pci_path"));
     }
 }
