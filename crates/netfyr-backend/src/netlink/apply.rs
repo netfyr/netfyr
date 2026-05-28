@@ -2082,4 +2082,285 @@ mod tests {
             );
         }
     }
+
+    // ── DEFAULT_ROUTE_METRIC ──────────────────────────────────────────────────
+
+    /// Spec: "Default route metric applied when the desired state does not specify one."
+    /// The constant must be 100 (matches iproute2 convention).
+    #[test]
+    fn test_default_route_metric_constant_is_100() {
+        assert_eq!(DEFAULT_ROUTE_METRIC, 100, "DEFAULT_ROUTE_METRIC must be 100");
+    }
+
+    // ── value_to_str: IpNetwork variant ──────────────────────────────────────
+
+    /// Value::IpNetwork (from YAML CIDR notation like "10.0.1.0/24") is returned
+    /// as its CIDR string, enabling comparison with kernel-queried CIDR strings.
+    #[test]
+    fn test_value_to_str_ip_network_variant_returns_cidr_notation() {
+        let net: ipnetwork::IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let v = Value::IpNetwork(net);
+        assert_eq!(
+            value_to_str(&v),
+            Some("10.0.1.0/24".to_string()),
+            "Value::IpNetwork must be formatted as CIDR notation"
+        );
+    }
+
+    // ── addr_to_cidr: IpNetwork variant ──────────────────────────────────────
+
+    /// Value::IpNetwork is what YAML policy files produce for CIDR addresses.
+    /// addr_to_cidr must return its string form so it can be compared against
+    /// the addresses the kernel reports as plain strings.
+    #[test]
+    fn test_addr_to_cidr_from_ip_network() {
+        let net: ipnetwork::IpNetwork = "10.0.1.50/24".parse().unwrap();
+        let v = Value::IpNetwork(net);
+        assert_eq!(
+            addr_to_cidr(&v),
+            Some("10.0.1.50/24".to_string()),
+            "Value::IpNetwork must return its CIDR string"
+        );
+    }
+
+    // ── route_address_to_string ───────────────────────────────────────────────
+
+    /// RouteAddress::Inet (IPv4 route address from the kernel) formats as
+    /// dotted-decimal, which is then compared in find_route_message.
+    #[test]
+    fn test_route_address_to_string_inet_returns_dotted_decimal() {
+        use std::net::Ipv4Addr;
+        let addr = RouteAddress::Inet(Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            route_address_to_string(&addr),
+            Some("10.0.1.1".to_string()),
+            "RouteAddress::Inet must format as dotted-decimal"
+        );
+    }
+
+    /// RouteAddress::Inet6 (IPv6 route address) formats as colon-hex.
+    #[test]
+    fn test_route_address_to_string_inet6_returns_colon_hex() {
+        use std::net::Ipv6Addr;
+        let addr = RouteAddress::Inet6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        let result = route_address_to_string(&addr);
+        assert!(result.is_some(), "RouteAddress::Inet6 must return Some");
+        assert_eq!(result.unwrap(), "fd00::1");
+    }
+
+    // ── find_address_message ──────────────────────────────────────────────────
+
+    /// Spec: "Remove an IP address from an ethernet interface" — relies on
+    /// find_address_message to locate the kernel AddressMessage to delete.
+    /// Returns Some when both IP and prefix match.
+    #[test]
+    fn test_find_address_message_returns_some_on_exact_match() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.0.1.50".parse().unwrap();
+        let mut msg = AddressMessage::default();
+        msg.header.prefix_len = 24;
+        msg.attributes.push(AddressAttribute::Address(ip));
+
+        let messages = vec![msg];
+        assert!(
+            find_address_message(&messages, ip, 24).is_some(),
+            "find_address_message must return Some for exact IP+prefix match"
+        );
+    }
+
+    /// Returns None for an empty list.
+    /// Spec: "Removing a non-existent address is idempotent" — when not found,
+    /// apply_modify_fields adds a SkippedOperation with reason "not present".
+    #[test]
+    fn test_find_address_message_returns_none_on_empty_list() {
+        let messages: Vec<AddressMessage> = vec![];
+        let ip: std::net::IpAddr = "10.0.1.50".parse().unwrap();
+        assert!(
+            find_address_message(&messages, ip, 24).is_none(),
+            "find_address_message must return None for empty list"
+        );
+    }
+
+    /// Returns None when the stored prefix_len does not match the requested one.
+    /// Both IP and prefix must match for a successful removal lookup.
+    #[test]
+    fn test_find_address_message_returns_none_on_prefix_mismatch() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.0.1.50".parse().unwrap();
+        let mut msg = AddressMessage::default();
+        msg.header.prefix_len = 32; // stored as /32
+        msg.attributes.push(AddressAttribute::Address(ip));
+
+        let messages = vec![msg];
+        assert!(
+            find_address_message(&messages, ip, 24).is_none(),
+            "find_address_message must return None when prefix_len doesn't match"
+        );
+    }
+
+    /// Returns None when the stored IP does not match.
+    #[test]
+    fn test_find_address_message_returns_none_on_ip_mismatch() {
+        use std::net::IpAddr;
+        let stored_ip: IpAddr = "10.0.1.1".parse().unwrap();
+        let search_ip: IpAddr = "10.0.1.50".parse().unwrap();
+        let mut msg = AddressMessage::default();
+        msg.header.prefix_len = 24;
+        msg.attributes.push(AddressAttribute::Address(stored_ip));
+
+        let messages = vec![msg];
+        assert!(
+            find_address_message(&messages, search_ip, 24).is_none(),
+            "find_address_message must return None when IP doesn't match"
+        );
+    }
+
+    /// Returns the correct entry when multiple addresses exist on the interface.
+    #[test]
+    fn test_find_address_message_finds_correct_entry_in_multi_address_list() {
+        use std::net::IpAddr;
+        let ip1: IpAddr = "10.0.1.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.1.50".parse().unwrap();
+        let mut msg1 = AddressMessage::default();
+        msg1.header.prefix_len = 24;
+        msg1.attributes.push(AddressAttribute::Address(ip1));
+        let mut msg2 = AddressMessage::default();
+        msg2.header.prefix_len = 24;
+        msg2.attributes.push(AddressAttribute::Address(ip2));
+
+        let messages = vec![msg1, msg2];
+        let result = find_address_message(&messages, ip2, 24);
+        assert!(result.is_some(), "find_address_message must find the second entry");
+        let found = result.unwrap();
+        assert!(
+            found.attributes.iter().any(|attr| {
+                matches!(attr, AddressAttribute::Address(a) if format!("{a}") == "10.0.1.50")
+            }),
+            "returned message must contain IP 10.0.1.50"
+        );
+    }
+
+    // ── find_route_message ────────────────────────────────────────────────────
+
+    /// Spec: "Remove a route from an ethernet interface" — relies on
+    /// find_route_message to locate the kernel RouteMessage to delete.
+    /// Returns Some for exact destination + gateway match.
+    #[test]
+    fn test_find_route_message_returns_some_on_destination_and_gateway_match() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut msg = RouteMessage::default();
+        msg.header.destination_prefix_length = 24;
+        msg.attributes.push(RouteAttribute::Destination(RouteAddress::Inet(
+            Ipv4Addr::new(10, 100, 0, 0),
+        )));
+        msg.attributes.push(RouteAttribute::Gateway(RouteAddress::Inet(
+            Ipv4Addr::new(10, 0, 1, 1),
+        )));
+
+        let messages = vec![msg];
+        let dst: IpAddr = "10.100.0.0".parse().unwrap();
+        let gw: IpAddr = "10.0.1.1".parse().unwrap();
+        assert!(
+            find_route_message(&messages, dst, 24, Some(gw)).is_some(),
+            "find_route_message must return Some for exact destination+gateway match"
+        );
+    }
+
+    /// Returns None for an empty list.
+    /// Spec: "Removing a non-existent route counts as success" — when
+    /// find_route_message returns None, apply_modify_fields pushes to
+    /// fields_changed (succeeded), not failed or skipped.
+    #[test]
+    fn test_find_route_message_returns_none_on_empty_list() {
+        let messages: Vec<RouteMessage> = vec![];
+        let dst: std::net::IpAddr = "10.100.0.0".parse().unwrap();
+        let gw: std::net::IpAddr = "10.0.1.1".parse().unwrap();
+        assert!(
+            find_route_message(&messages, dst, 24, Some(gw)).is_none(),
+            "find_route_message must return None for empty list"
+        );
+    }
+
+    /// Returns None when the gateway doesn't match.
+    #[test]
+    fn test_find_route_message_returns_none_on_gateway_mismatch() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut msg = RouteMessage::default();
+        msg.header.destination_prefix_length = 0;
+        msg.attributes.push(RouteAttribute::Gateway(RouteAddress::Inet(
+            Ipv4Addr::new(10, 0, 1, 1),
+        )));
+
+        let messages = vec![msg];
+        let dst: IpAddr = "0.0.0.0".parse().unwrap();
+        let wrong_gw: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(
+            find_route_message(&messages, dst, 0, Some(wrong_gw)).is_none(),
+            "find_route_message must return None when gateway doesn't match"
+        );
+    }
+
+    /// Spec: "Add a route via an ethernet interface" with destination="0.0.0.0/0".
+    /// The kernel represents default routes without an explicit Destination attribute.
+    /// find_route_message must handle this via the unspecified-IP check.
+    #[test]
+    fn test_find_route_message_matches_default_route_without_destination_attribute() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut msg = RouteMessage::default();
+        msg.header.destination_prefix_length = 0;
+        // No RouteAttribute::Destination — kernel omits it for the default route.
+        msg.attributes.push(RouteAttribute::Gateway(RouteAddress::Inet(
+            Ipv4Addr::new(10, 0, 1, 1),
+        )));
+
+        let messages = vec![msg];
+        let dst: IpAddr = "0.0.0.0".parse().unwrap();
+        let gw: IpAddr = "10.0.1.1".parse().unwrap();
+        assert!(
+            find_route_message(&messages, dst, 0, Some(gw)).is_some(),
+            "find_route_message must match default route when Destination attribute is absent"
+        );
+    }
+
+    /// Returns None when the destination prefix_length doesn't match.
+    #[test]
+    fn test_find_route_message_returns_none_on_prefix_length_mismatch() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut msg = RouteMessage::default();
+        msg.header.destination_prefix_length = 32; // stored as /32
+        msg.attributes.push(RouteAttribute::Destination(RouteAddress::Inet(
+            Ipv4Addr::new(10, 0, 1, 50),
+        )));
+
+        let messages = vec![msg];
+        let dst: IpAddr = "10.0.1.50".parse().unwrap();
+        // searching for /24 but stored as /32
+        assert!(
+            find_route_message(&messages, dst, 24, None).is_none(),
+            "find_route_message must return None when prefix_length doesn't match"
+        );
+    }
+
+    /// Returns None when no gateway is expected but message has one (and vice versa).
+    #[test]
+    fn test_find_route_message_requires_consistent_gateway_presence() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Message has a gateway but the search has no gateway (None).
+        let mut msg = RouteMessage::default();
+        msg.header.destination_prefix_length = 24;
+        msg.attributes.push(RouteAttribute::Destination(RouteAddress::Inet(
+            Ipv4Addr::new(10, 0, 1, 0),
+        )));
+        msg.attributes.push(RouteAttribute::Gateway(RouteAddress::Inet(
+            Ipv4Addr::new(10, 0, 1, 1),
+        )));
+
+        let messages = vec![msg];
+        let dst: IpAddr = "10.0.1.0".parse().unwrap();
+        // Searching with no gateway (None) should not match message that has one.
+        assert!(
+            find_route_message(&messages, dst, 24, None).is_none(),
+            "find_route_message must not match when search has no gateway but message has one"
+        );
+    }
 }
