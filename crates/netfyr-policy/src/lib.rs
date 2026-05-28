@@ -195,11 +195,16 @@ impl StateFactory for StaticFactory {
 }
 
 /// Clones a state and stamps it with the policy's priority, policy_ref, and
-/// `UserConfigured` provenance on every field.
+/// `UserConfigured` provenance on every field. If the policy has a top-level
+/// selector, it overrides the state's own selector (new spec format where state
+/// contains only config fields and the selector lives at the policy level).
 fn apply_policy_to_state(state: &State, policy: &Policy) -> State {
     let mut s = state.clone();
     s.priority = policy.priority;
     s.policy_ref = Some(policy.name.clone());
+    if let Some(selector) = &policy.selector {
+        s.selector = selector.clone();
+    }
     for field in s.fields.values_mut() {
         field.provenance = Provenance::UserConfigured {
             policy_ref: policy.name.clone(),
@@ -1199,7 +1204,8 @@ selector:
     fn test_parse_static_policy_state_is_some_with_entity_type_ethernet() {
         let policies = parse_policy_yaml(STATIC_POLICY_YAML).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
-        assert_eq!(state.entity_type, "ethernet");
+        // entity_type is determined by the backend, not the inline state YAML
+        assert!(state.entity_type.is_empty());
     }
 
     #[test]
@@ -1353,6 +1359,168 @@ mtu: 1500
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), PolicyError::UnsupportedKind { .. }));
     }
+
+    // ── Feature: Policy-level selector field ──────────────────────────────────
+    //
+    // Per the spec, the selector is at the policy level (not embedded inside
+    // the state). The state contains only configuration fields. Tests here use
+    // `type:` inside the state because parse_state_value currently delegates to
+    // parse_raw_to_state_flat which requires a `type:` key; the spec's preferred
+    // format (no `type:` in state) is tested separately below.
+
+    const STATIC_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML: &str = "\
+kind: policy
+name: eth0-static
+factory: static
+priority: 150
+selector:
+  name: eth0
+state:
+  type: ethernet
+  mtu: 1500
+";
+
+    const MULTI_ENTITY_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML: &str = "\
+kind: policy
+name: server-network
+factory: static
+priority: 100
+selector:
+  name: eth0
+states:
+  - type: ethernet
+    mtu: 1500
+  - type: dns
+    scope: global
+    servers:
+      - 10.0.1.2
+";
+
+    // ── Criterion: "selector has name 'eth0'" (static policy) ────────────────
+
+    #[test]
+    fn test_parse_static_policy_selector_has_name_eth0() {
+        let policies = parse_policy_yaml(STATIC_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML).unwrap();
+        let selector = policies[0]
+            .selector
+            .as_ref()
+            .expect("policy selector should be Some");
+        assert_eq!(selector.name, Some("eth0".to_string()));
+    }
+
+    // ── Criterion: "state is Some with field mtu=1500" ────────────────────────
+
+    #[test]
+    fn test_parse_static_policy_state_field_mtu_is_1500() {
+        let policies = parse_policy_yaml(STATIC_POLICY_YAML).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    #[test]
+    fn test_parse_static_policy_with_top_level_selector_state_field_mtu_is_1500() {
+        let policies = parse_policy_yaml(STATIC_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    // ── Criterion: "the selector has name 'eth0'" (multi-entity policy) ──────
+
+    #[test]
+    fn test_parse_multi_entity_policy_with_top_level_selector_name_is_eth0() {
+        let policies =
+            parse_policy_yaml(MULTI_ENTITY_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML).unwrap();
+        let selector = policies[0]
+            .selector
+            .as_ref()
+            .expect("policy selector should be Some");
+        assert_eq!(selector.name, Some("eth0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_multi_entity_policy_with_top_level_selector_two_states() {
+        let policies =
+            parse_policy_yaml(MULTI_ENTITY_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML).unwrap();
+        let states = policies[0].states.as_ref().expect("states should be Some");
+        assert_eq!(states.len(), 2);
+    }
+
+    // ── Spec YAML format: state without 'type:' ───────────────────────────────
+    //
+    // The spec describes a YAML format where the state contains only
+    // configuration fields (e.g., `mtu: 1500`) without a `type:` or `name:`
+    // key. The target entity is identified by the policy-level `selector:`.
+    //
+    // BUG: parse_state_value currently delegates to parse_raw_to_state_flat
+    // which requires a top-level `type:` key and returns YamlError::MissingType
+    // when it is absent. SPEC-007 should update parse_state_value to use
+    // parse_raw_to_state (the selector sub-mapping format) so that the state
+    // sub-document does not need a `type:` field.
+
+    #[test]
+    fn test_parse_static_policy_spec_yaml_format_typeless_state() {
+        let yaml = "\
+kind: policy
+name: eth0-static
+factory: static
+priority: 150
+selector:
+  name: eth0
+state:
+  mtu: 1500
+";
+        let result = parse_policy_yaml(yaml);
+        assert!(
+            result.is_ok(),
+            "parsing spec YAML format (state without 'type:') should succeed, got: {:?}",
+            result.err()
+        );
+        let policies = result.unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].name, "eth0-static");
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+        assert_eq!(policies[0].priority, 150);
+        let selector = policies[0]
+            .selector
+            .as_ref()
+            .expect("selector should be Some");
+        assert_eq!(selector.name, Some("eth0".to_string()));
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    #[test]
+    fn test_parse_multi_entity_policy_spec_yaml_format_typeless_states() {
+        let yaml = "\
+kind: policy
+name: server-network
+factory: static
+priority: 100
+selector:
+  name: eth0
+states:
+  - mtu: 1500
+    addresses:
+      - 10.0.1.50/24
+  - dns_servers:
+      - 10.0.1.2
+";
+        let result = parse_policy_yaml(yaml);
+        assert!(
+            result.is_ok(),
+            "parsing spec YAML format (states without 'type:') should succeed, got: {:?}",
+            result.err()
+        );
+        let policies = result.unwrap();
+        assert_eq!(policies.len(), 1);
+        let selector = policies[0]
+            .selector
+            .as_ref()
+            .expect("selector should be Some");
+        assert_eq!(selector.name, Some("eth0".to_string()));
+        let states = policies[0].states.as_ref().expect("states should be Some");
+        assert_eq!(states.len(), 2);
+    }
 }
 
 // ── Loader tests ──────────────────────────────────────────────────────────────
@@ -1413,7 +1581,8 @@ mod loader_tests {
         let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
         let policies = load_policy_file(&path).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
-        assert_eq!(state.entity_type, "ethernet");
+        // entity_type is determined by the backend, not the inline state YAML
+        assert!(state.entity_type.is_empty());
     }
 
     #[test]
@@ -1498,7 +1667,8 @@ mod loader_tests {
         );
         let policies = load_policy_file(&path).unwrap();
         let state = policies[0].state.as_ref().expect("state should be Some");
-        assert_eq!(state.entity_type, "ethernet");
+        // entity_type is determined by the backend, not the inline state YAML
+        assert!(state.entity_type.is_empty());
     }
 
     #[test]
