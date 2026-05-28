@@ -29,18 +29,28 @@
 //!   interfaces.
 
 pub mod diff;
+pub mod entity;
+pub mod field;
 pub mod loader;
+pub mod metadata;
+pub mod provenance;
 pub mod schema;
 pub mod set;
+pub mod value;
 pub mod yaml;
 
 pub use diff::{diff, DiffOp, StateDiff};
+pub use entity::State;
+pub use field::FieldValue;
 pub use loader::{load_dir, load_file};
+pub use metadata::StateMetadata;
+pub use provenance::Provenance;
 pub use schema::{
     EntitySchema, FieldConstraints, FieldSchemaInfo, FieldType, SchemaRegistry, ValidationError,
     ValidationErrorKind, ValidationErrors,
 };
 pub use set::{complement, intersection, union, Conflict, ConflictError, StateSet};
+pub use value::Value;
 pub use yaml::{
     deserialize_value, parse_state_value, parse_yaml, serialize_state_to_value, serialize_value,
     state_to_yaml, state_to_yaml_explicit, YamlError,
@@ -58,15 +68,10 @@ pub mod entity_types {
     pub const ETHERNET: &str = "ethernet";
 }
 
-use chrono::{DateTime, Utc};
-use indexmap::IndexMap;
-use ipnetwork::IpNetwork;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
 use std::str::FromStr;
-use uuid::Uuid;
 
 // ── MacAddrParseError ─────────────────────────────────────────────────────────
 
@@ -261,204 +266,6 @@ impl Selector {
     }
 }
 
-// ── Value ─────────────────────────────────────────────────────────────────────
-
-/// The set of possible field values in a network entity's configuration.
-///
-/// Serialization uses `#[serde(untagged)]` for natural JSON/YAML output.
-/// Deserialization uses a custom impl that routes string values through
-/// IP-aware parsing: only strings containing `/` are tried as `IpNetwork`,
-/// bare IPs become `IpAddr`, and everything else stays `String`.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum Value {
-    Bool(bool),
-    U64(u64),
-    I64(i64),
-    IpNetwork(IpNetwork),
-    IpAddr(IpAddr),
-    List(Vec<Value>),
-    Map(IndexMap<String, Value>),
-    String(String),
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawValue {
-    Bool(bool),
-    U64(u64),
-    I64(i64),
-    String(String),
-    List(Vec<RawValue>),
-    Map(IndexMap<String, RawValue>),
-}
-
-impl From<RawValue> for Value {
-    fn from(raw: RawValue) -> Self {
-        match raw {
-            RawValue::Bool(b) => Value::Bool(b),
-            RawValue::U64(n) => Value::U64(n),
-            RawValue::I64(n) => Value::I64(n),
-            RawValue::String(s) => {
-                if s.contains('/') {
-                    if let Ok(net) = s.parse::<IpNetwork>() {
-                        return Value::IpNetwork(net);
-                    }
-                }
-                if let Ok(ip) = s.parse::<IpAddr>() {
-                    return Value::IpAddr(ip);
-                }
-                Value::String(s)
-            }
-            RawValue::List(items) => {
-                Value::List(items.into_iter().map(Value::from).collect())
-            }
-            RawValue::Map(map) => {
-                Value::Map(map.into_iter().map(|(k, v)| (k, Value::from(v))).collect())
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Value {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        RawValue::deserialize(deserializer).map(Value::from)
-    }
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::String(s) => write!(f, "{s}"),
-            Value::U64(n) => write!(f, "{n}"),
-            Value::I64(n) => write!(f, "{n}"),
-            Value::Bool(b) => write!(f, "{b}"),
-            Value::IpAddr(ip) => write!(f, "{ip}"),
-            Value::IpNetwork(net) => write!(f, "{net}"),
-            Value::List(items) => {
-                write!(f, "[")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{item}")?;
-                }
-                write!(f, "]")
-            }
-            Value::Map(map) => {
-                write!(f, "{{")?;
-                for (i, (k, v)) in map.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{k}: {v}")?;
-                }
-                write!(f, "}}")
-            }
-        }
-    }
-}
-
-impl From<String> for Value {
-    fn from(s: String) -> Self {
-        Value::String(s)
-    }
-}
-
-impl From<&str> for Value {
-    fn from(s: &str) -> Self {
-        Value::String(s.to_owned())
-    }
-}
-
-impl From<u64> for Value {
-    fn from(n: u64) -> Self {
-        Value::U64(n)
-    }
-}
-
-impl From<i64> for Value {
-    fn from(n: i64) -> Self {
-        Value::I64(n)
-    }
-}
-
-impl From<bool> for Value {
-    fn from(b: bool) -> Self {
-        Value::Bool(b)
-    }
-}
-
-impl From<IpAddr> for Value {
-    fn from(ip: IpAddr) -> Self {
-        Value::IpAddr(ip)
-    }
-}
-
-impl From<IpNetwork> for Value {
-    fn from(net: IpNetwork) -> Self {
-        Value::IpNetwork(net)
-    }
-}
-
-impl Value {
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Value::String(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
-    pub fn as_u64(&self) -> Option<u64> {
-        match self {
-            Value::U64(n) => Some(*n),
-            _ => None,
-        }
-    }
-
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Value::I64(n) => Some(*n),
-            _ => None,
-        }
-    }
-
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    pub fn as_ip_addr(&self) -> Option<&IpAddr> {
-        match self {
-            Value::IpAddr(ip) => Some(ip),
-            _ => None,
-        }
-    }
-
-    pub fn as_ip_network(&self) -> Option<&IpNetwork> {
-        match self {
-            Value::IpNetwork(net) => Some(net),
-            _ => None,
-        }
-    }
-
-    pub fn as_list(&self) -> Option<&Vec<Value>> {
-        match self {
-            Value::List(list) => Some(list),
-            _ => None,
-        }
-    }
-
-    pub fn as_map(&self) -> Option<&IndexMap<String, Value>> {
-        match self {
-            Value::Map(map) => Some(map),
-            _ => None,
-        }
-    }
-}
-
 /// Compares two `Value`s using schema-declared comparison keys.
 ///
 /// When `comparison_keys` is empty, falls back to `PartialEq`.
@@ -489,94 +296,6 @@ fn item_eq(a: &Value, b: &Value, comparison_keys: &[String]) -> bool {
         }
         _ => a == b,
     }
-}
-
-// ── Provenance ────────────────────────────────────────────────────────────────
-
-/// Tracks where a field value originated.
-///
-/// Uses internally tagged serde representation (`{"source": "kernel_default"}` etc.)
-/// which is self-documenting in JSON/YAML and handles unit-like variants cleanly.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum Provenance {
-    /// Explicitly set by a user in a policy.
-    UserConfigured { policy_ref: String },
-    /// Never changed; reflects the kernel's initial value.
-    KernelDefault,
-    /// Change detected from an external tool (e.g., iproute2, NetworkManager).
-    ExternalTool {
-        tool: String,
-        detected_at: DateTime<Utc>,
-    },
-    /// Computed by netfyr (e.g., auto-calculated broadcast address).
-    Derived { reason: String },
-}
-
-// ── FieldValue ────────────────────────────────────────────────────────────────
-
-/// A field's value paired with its provenance.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FieldValue {
-    pub value: Value,
-    pub provenance: Provenance,
-}
-
-// ── StateMetadata ─────────────────────────────────────────────────────────────
-
-/// Identity and tracking metadata for a state instance.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StateMetadata {
-    /// UUIDv7 (time-ordered) unique identifier for this state instance.
-    pub id: Uuid,
-    /// Stable across versions of the same logical entity.
-    pub timeline_id: Uuid,
-    /// When this state was created.
-    pub created_at: DateTime<Utc>,
-    /// User-defined key-value labels.
-    pub labels: HashMap<String, String>,
-    /// Optional human-readable description.
-    pub description: Option<String>,
-}
-
-impl StateMetadata {
-    pub fn new() -> Self {
-        Self {
-            id: Uuid::now_v7(),
-            timeline_id: Uuid::now_v7(),
-            created_at: Utc::now(),
-            labels: HashMap::new(),
-            description: None,
-        }
-    }
-}
-
-impl Default for StateMetadata {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── State ─────────────────────────────────────────────────────────────────────
-
-/// The top-level type representing one network entity's configuration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct State {
-    /// The kind of entity (e.g., `"ethernet"`, `"bond"`, `"vlan"`).
-    pub entity_type: String,
-    /// Identifies which system entity this targets.
-    pub selector: Selector,
-    /// Ordered key-value configuration fields.
-    ///
-    /// `IndexMap` is used to preserve insertion order, which matters for
-    /// deterministic YAML serialization and user-facing output.
-    pub fields: IndexMap<String, FieldValue>,
-    /// Identity and tracking metadata.
-    pub metadata: StateMetadata,
-    /// Name of the policy that produced this state.
-    pub policy_ref: Option<String>,
-    /// Numeric priority for field-level conflict resolution (higher wins).
-    pub priority: u32,
 }
 
 // ── Route normalization ──────────────────────────────────────────────────────
@@ -612,6 +331,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use indexmap::IndexMap;
+    use ipnetwork::IpNetwork;
     use std::net::{IpAddr, Ipv4Addr};
 
     // ── MacAddr tests ─────────────────────────────────────────────────────────
