@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "wifi",
+  "description": "WiFi interface entity",
+  "type": "object",
+  "additionalProperties": false,
+  "x-netfyr-inherit": ["ip", "link"],
+  "properties": {
+    "wifi": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "WiFi-specific properties",
+      "x-netfyr-writable": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "Interface mode (sta, ap, monitor, mesh)",
+          "x-netfyr-writable": false
+        },
+        "ssid": {
+          "type": "string",
+          "description": "Connected SSID",
+          "x-netfyr-writable": false
+        },
+        "frequency": {
+          "type": "integer",
+          "description": "Operating frequency in MHz",
+          "x-netfyr-writable": false
+        }
+      }
+    }
+  }
+}

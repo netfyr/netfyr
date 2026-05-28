@@ -68,6 +68,7 @@ pub type EntityType = String;
 /// to avoid typos and centralize the set of supported types.
 pub mod entity_types {
     pub const ETHERNET: &str = "ethernet";
+    pub const WIFI: &str = "wifi";
 }
 
 /// Compares two `Value`s using schema-declared comparison keys.

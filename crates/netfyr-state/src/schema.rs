@@ -5,7 +5,7 @@
 //! distinguishes between full validation (structural correctness) and writable
 //! validation (additionally rejects read-only fields that users cannot set).
 
-use crate::{entity_types::ETHERNET, FieldValue, State, Value};
+use crate::{entity_types::{ETHERNET, WIFI}, FieldValue, State, Value};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -13,6 +13,7 @@ use std::fmt;
 // Embedded JSON Schema files — paths are relative to this source file.
 // The compiler will error here if the file does not exist.
 const ETHERNET_SCHEMA: &str = include_str!("schemas/ethernet.json");
+const WIFI_SCHEMA: &str = include_str!("schemas/wifi.json");
 const IP_SCHEMA: &str = include_str!("schemas/ip.json");
 const LINK_SCHEMA: &str = include_str!("schemas/link.json");
 
@@ -196,6 +197,7 @@ impl SchemaRegistry {
         let fragments = load_fragments();
         let mut schemas = HashMap::new();
         schemas.insert(ETHERNET.to_string(), load_entity_schema(ETHERNET, ETHERNET_SCHEMA, &fragments));
+        schemas.insert(WIFI.to_string(), load_entity_schema(WIFI, WIFI_SCHEMA, &fragments));
         SchemaRegistry { schemas }
     }
 
@@ -577,17 +579,17 @@ fn parse_constraints(field_schema: &serde_json::Value) -> Option<FieldConstraint
 /// JSON Schema alone can express (e.g., duplicate detection with named values).
 fn run_custom_checks(state: &State) -> Vec<ValidationError> {
     match state.entity_type.as_str() {
-        ETHERNET => check_ethernet_addresses(state),
+        ETHERNET | WIFI => check_addresses(state),
         _ => Vec::new(),
     }
 }
 
-/// Custom validation for the `addresses` field of an ethernet entity:
+/// Custom validation for the `addresses` field of an entity:
 /// - Rejects duplicate CIDR strings with a `ConstraintViolation` error.
 ///
 /// Only runs when `addresses` is present and is a `Value::List`; if it has the
 /// wrong type, JSON Schema already emitted a type error — no cascading errors.
-fn check_ethernet_addresses(state: &State) -> Vec<ValidationError> {
+fn check_addresses(state: &State) -> Vec<ValidationError> {
     let addresses = match state.fields.get("addresses").map(|fv| &fv.value) {
         Some(Value::List(items)) => items,
         _ => return Vec::new(),
@@ -659,6 +661,15 @@ mod tests {
         }
         if let Some(m) = metric {
             map.insert("metric".to_string(), Value::U64(m));
+        }
+        Value::Map(map)
+    }
+
+    /// Build a `Value::Map` from name/value pairs (used to construct sub-objects in tests).
+    fn make_map(pairs: &[(&str, Value)]) -> Value {
+        let mut map = IndexMap::new();
+        for (k, v) in pairs {
+            map.insert((*k).to_string(), v.clone());
         }
         Value::Map(map)
     }
@@ -920,6 +931,9 @@ mod tests {
     }
 
     /// Scenario: Read-only carrier and speed fields pass regular validation
+    ///
+    /// carrier is a top-level read-only field; speed lives inside the ethernet
+    /// sub-object, which is itself a read-only top-level field.
     #[test]
     fn test_read_only_carrier_and_speed_pass_regular_validation() {
         let registry = SchemaRegistry::new();
@@ -927,10 +941,13 @@ mod tests {
             "ethernet",
             vec![
                 ("carrier", Value::Bool(true)),
-                ("speed", Value::U64(1000)),
+                ("ethernet", make_map(&[("speed", Value::U64(1000))])),
             ],
         );
-        assert!(registry.validate(&state).is_ok(), "carrier and speed should pass regular validation");
+        assert!(
+            registry.validate(&state).is_ok(),
+            "carrier and ethernet sub-object (with speed) should pass regular validation"
+        );
     }
 
     /// Scenario: Route object validation — valid route with all optional fields passes
@@ -1142,12 +1159,14 @@ mod tests {
         assert!(!info.writable, "mac should be read-only (x-netfyr-writable: false)");
     }
 
-    /// speed field is read-only
+    /// ethernet sub-object is read-only (speed lives inside it, not at top level)
     #[test]
     fn test_field_info_speed_is_not_writable() {
         let registry = SchemaRegistry::new();
-        let info = registry.field_info("ethernet", "speed").expect("speed should have field info");
-        assert!(!info.writable, "speed should be read-only (x-netfyr-writable: false)");
+        let info = registry
+            .field_info("ethernet", "ethernet")
+            .expect("ethernet sub-object should have field info");
+        assert!(!info.writable, "ethernet sub-object should be read-only (x-netfyr-writable: false)");
     }
 
     /// routes field is writable
@@ -1480,7 +1499,9 @@ mod tests {
     #[test]
     fn test_ethernet_schema_declares_all_spec_read_only_fields_criterion_17() {
         let registry = SchemaRegistry::new();
-        let required_read_only = ["carrier", "speed", "mac", "driver", "name"];
+        // speed is nested inside the "ethernet" sub-object, not a top-level field.
+        // The top-level "ethernet" field is itself read-only.
+        let required_read_only = ["carrier", "ethernet", "mac", "driver", "name", "type"];
 
         for &field in &required_read_only {
             let info = registry.field_info("ethernet", field).unwrap_or_else(|| {
@@ -1532,11 +1553,12 @@ mod tests {
             "dns_servers",
             "driver",
             "enabled",
+            "ethernet",
             "mac",
             "mtu",
             "name",
             "routes",
-            "speed",
+            "type",
         ];
 
         assert_eq!(
@@ -1579,7 +1601,7 @@ mod tests {
             .collect();
         readonly.sort();
 
-        let expected = vec!["carrier", "dns_servers", "driver", "mac", "name", "speed"];
+        let expected = vec!["carrier", "dns_servers", "driver", "ethernet", "mac", "name", "type"];
 
         assert_eq!(
             readonly, expected,
@@ -1701,6 +1723,527 @@ mod tests {
             keys.contains(&"address".to_string()),
             "comparison_keys for addresses must include \"address\" \
              — this is the identity key for DHCP renewal stability"
+        );
+    }
+
+    // ── Feature: Schema registry initialization — WiFi ────────────────────────
+
+    /// Scenario: Registry loads with both ethernet and wifi schemas — entity_types includes "wifi"
+    #[test]
+    fn test_registry_loads_wifi_schema_on_new() {
+        let registry = SchemaRegistry::new();
+        let types = registry.entity_types();
+        assert!(
+            types.contains(&"wifi"),
+            "entity_types() should include 'wifi', got: {:?}",
+            types
+        );
+    }
+
+    /// Scenario: Registry loads with both schemas — get_schema("wifi") returns Some
+    #[test]
+    fn test_registry_get_schema_wifi_returns_some() {
+        let registry = SchemaRegistry::new();
+        assert!(
+            registry.get_schema("wifi").is_some(),
+            "get_schema(\"wifi\") should return Some"
+        );
+    }
+
+    // ── Feature: Ethernet sub-object validation ───────────────────────────────
+
+    /// Scenario: Valid ethernet state with ethernet sub-object passes validation
+    #[test]
+    fn test_valid_ethernet_state_with_ethernet_sub_object_passes_validation() {
+        let registry = SchemaRegistry::new();
+        let mut eth_map = IndexMap::new();
+        eth_map.insert("speed".to_string(), Value::U64(1000));
+        let state = make_state(
+            "ethernet",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ethernet", Value::Map(eth_map)),
+            ],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "ethernet state with ethernet sub-object {{speed: 1000}} should pass validation"
+        );
+    }
+
+    /// Scenario: Technology sub-object in writable validation is rejected
+    /// The "ethernet" field is read-only (x-netfyr-writable: false).
+    #[test]
+    fn test_ethernet_sub_object_in_writable_validation_is_rejected() {
+        let registry = SchemaRegistry::new();
+        let mut eth_map = IndexMap::new();
+        eth_map.insert("speed".to_string(), Value::U64(1000));
+        let state = make_state(
+            "ethernet",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ethernet", Value::Map(eth_map)),
+            ],
+        );
+        let result = registry.validate_writable(&state);
+        assert!(result.is_err(), "validate_writable should reject read-only field 'ethernet'");
+        let errs = result.unwrap_err();
+        let has_readonly = errs
+            .errors()
+            .iter()
+            .any(|e| e.field == "ethernet" && e.kind == ValidationErrorKind::ReadOnlyField);
+        assert!(
+            has_readonly,
+            "expected ReadOnlyField error for field 'ethernet', got: {:?}",
+            errs.errors()
+        );
+    }
+
+    /// Scenario: Technology sub-object in regular validation passes
+    /// validate() does not check writability — read-only fields are valid in query results.
+    #[test]
+    fn test_ethernet_sub_object_in_regular_validation_passes() {
+        let registry = SchemaRegistry::new();
+        let mut eth_map = IndexMap::new();
+        eth_map.insert("speed".to_string(), Value::U64(1000));
+        let state = make_state(
+            "ethernet",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ethernet", Value::Map(eth_map)),
+            ],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "validate() should accept the read-only 'ethernet' sub-object (valid in query results)"
+        );
+    }
+
+    // ── Feature: WiFi schema validation ──────────────────────────────────────
+
+    /// Scenario: Valid wifi state passes validation (mtu + addresses)
+    #[test]
+    fn test_valid_wifi_state_passes_validation() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "wifi",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())])),
+            ],
+        );
+        assert!(registry.validate(&state).is_ok(), "valid wifi state should pass validation");
+    }
+
+    /// Scenario: Valid wifi state with wifi sub-object passes validation
+    #[test]
+    fn test_valid_wifi_state_with_wifi_sub_object_passes_validation() {
+        let registry = SchemaRegistry::new();
+        let mut wifi_map = IndexMap::new();
+        wifi_map.insert("ssid".to_string(), Value::String("home".to_string()));
+        wifi_map.insert("mode".to_string(), Value::String("sta".to_string()));
+        wifi_map.insert("frequency".to_string(), Value::U64(5180));
+        let state = make_state(
+            "wifi",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("wifi", Value::Map(wifi_map)),
+            ],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "wifi state with wifi sub-object should pass validation"
+        );
+    }
+
+    /// Scenario: WiFi sub-object in writable validation is rejected
+    /// The "wifi" field is read-only (x-netfyr-writable: false).
+    #[test]
+    fn test_wifi_sub_object_in_writable_validation_is_rejected() {
+        let registry = SchemaRegistry::new();
+        let mut wifi_map = IndexMap::new();
+        wifi_map.insert("ssid".to_string(), Value::String("home".to_string()));
+        let state = make_state(
+            "wifi",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("wifi", Value::Map(wifi_map)),
+            ],
+        );
+        let result = registry.validate_writable(&state);
+        assert!(result.is_err(), "validate_writable should reject read-only field 'wifi'");
+        let errs = result.unwrap_err();
+        let has_readonly = errs
+            .errors()
+            .iter()
+            .any(|e| e.field == "wifi" && e.kind == ValidationErrorKind::ReadOnlyField);
+        assert!(
+            has_readonly,
+            "expected ReadOnlyField error for field 'wifi', got: {:?}",
+            errs.errors()
+        );
+    }
+
+    /// Scenario: WiFi sub-object in regular validation passes
+    /// validate() does not check writability — technology sub-objects are valid in query results.
+    #[test]
+    fn test_wifi_sub_object_in_regular_validation_passes() {
+        let registry = SchemaRegistry::new();
+        let mut wifi_map = IndexMap::new();
+        wifi_map.insert("ssid".to_string(), Value::String("home".to_string()));
+        let state = make_state(
+            "wifi",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("wifi", Value::Map(wifi_map)),
+            ],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "validate() should accept the read-only 'wifi' sub-object (valid in query results)"
+        );
+    }
+
+    /// WiFi MTU below minimum is rejected — inherited constraint applies to wifi too
+    #[test]
+    fn test_wifi_mtu_below_minimum_is_rejected() {
+        let registry = SchemaRegistry::new();
+        let state = make_state("wifi", vec![("mtu", Value::U64(10))]);
+        let result = registry.validate(&state);
+        assert!(result.is_err(), "wifi mtu=10 should fail validation (minimum is 68)");
+        let errs = result.unwrap_err();
+        let has_out_of_range = errs
+            .errors()
+            .iter()
+            .any(|e| e.field == "mtu" && e.kind == ValidationErrorKind::OutOfRange);
+        assert!(has_out_of_range, "expected OutOfRange error for wifi 'mtu', got: {:?}", errs.errors());
+    }
+
+    /// WiFi unknown field is rejected — additionalProperties: false applies
+    #[test]
+    fn test_wifi_unknown_field_is_rejected() {
+        let registry = SchemaRegistry::new();
+        let state = make_state("wifi", vec![("bogus_field", Value::Bool(true))]);
+        let result = registry.validate(&state);
+        assert!(result.is_err(), "unknown field in wifi entity should be rejected");
+        let errs = result.unwrap_err();
+        let has_unknown = errs.errors().iter().any(|e| e.kind == ValidationErrorKind::UnknownField);
+        assert!(has_unknown, "expected UnknownField error for wifi entity, got: {:?}", errs.errors());
+    }
+
+    // ── Feature: Field info queries — ethernet sub-object ─────────────────────
+
+    /// Scenario: Query ethernet technology sub-object metadata — type is Object, writable false
+    #[test]
+    fn test_field_info_ethernet_sub_object_type_is_object() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("ethernet", "ethernet")
+            .expect("field_info(\"ethernet\", \"ethernet\") should return Some");
+        assert_eq!(
+            info.field_type,
+            FieldType::Object,
+            "the 'ethernet' sub-object field should have FieldType::Object"
+        );
+    }
+
+    /// Scenario: Query ethernet technology sub-object metadata — writable is false
+    #[test]
+    fn test_field_info_ethernet_sub_object_is_not_writable() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("ethernet", "ethernet")
+            .expect("field_info(\"ethernet\", \"ethernet\") should return Some");
+        assert!(
+            !info.writable,
+            "the 'ethernet' sub-object field should be read-only (writable: false)"
+        );
+    }
+
+    // ── Feature: Field info queries — wifi fields ─────────────────────────────
+
+    /// Scenario: Query wifi field metadata — mtu has type Integer
+    #[test]
+    fn test_field_info_wifi_mtu_type_is_integer() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("wifi", "mtu")
+            .expect("field_info(\"wifi\", \"mtu\") should return Some");
+        assert_eq!(info.field_type, FieldType::Integer, "wifi mtu should have FieldType::Integer");
+    }
+
+    /// Scenario: Query wifi field metadata — mtu is writable
+    #[test]
+    fn test_field_info_wifi_mtu_is_writable() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("wifi", "mtu")
+            .expect("field_info(\"wifi\", \"mtu\") should return Some");
+        assert!(info.writable, "wifi mtu should be writable (x-netfyr-writable: true)");
+    }
+
+    /// Scenario: Query wifi field metadata — mtu is not required
+    #[test]
+    fn test_field_info_wifi_mtu_is_not_required() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("wifi", "mtu")
+            .expect("field_info(\"wifi\", \"mtu\") should return Some");
+        assert!(!info.required, "wifi mtu should not be required");
+    }
+
+    /// Scenario: Query wifi field metadata — mtu constraints include min=68 and max=65535
+    #[test]
+    fn test_field_info_wifi_mtu_constraints() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("wifi", "mtu")
+            .expect("field_info(\"wifi\", \"mtu\") should return Some");
+        let constraints = info.constraints.expect("wifi mtu should have constraints");
+        assert_eq!(constraints.min, Some(68), "wifi mtu minimum should be 68");
+        assert_eq!(constraints.max, Some(65535), "wifi mtu maximum should be 65535");
+    }
+
+    /// Scenario: Query wifi technology sub-object metadata — type is Object
+    #[test]
+    fn test_field_info_wifi_sub_object_type_is_object() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("wifi", "wifi")
+            .expect("field_info(\"wifi\", \"wifi\") should return Some");
+        assert_eq!(
+            info.field_type,
+            FieldType::Object,
+            "the 'wifi' sub-object field should have FieldType::Object"
+        );
+    }
+
+    /// Scenario: Query wifi technology sub-object metadata — writable is false
+    #[test]
+    fn test_field_info_wifi_sub_object_is_not_writable() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("wifi", "wifi")
+            .expect("field_info(\"wifi\", \"wifi\") should return Some");
+        assert!(
+            !info.writable,
+            "the 'wifi' sub-object field should be read-only (writable: false)"
+        );
+    }
+
+    /// Scenario: Query unknown wifi field returns None
+    #[test]
+    fn test_field_info_wifi_unknown_field_returns_none() {
+        let registry = SchemaRegistry::new();
+        assert!(
+            registry.field_info("wifi", "nonexistent").is_none(),
+            "field_info for unknown wifi field should return None"
+        );
+    }
+
+    // ── Feature: Schema-to-code divergence protection (spec-correct pinned sets) ─
+    //
+    // NOTE: The existing tests (test_ethernet_schema_has_exactly_the_expected_fields,
+    // test_ethernet_readonly_fields_match_expected_set, etc.) in this file were written
+    // with incorrect pinned sets — they expect "speed" as a top-level field and omit
+    // "ethernet" and "type". "speed" is a sub-property of the "ethernet" object, not a
+    // top-level field. Those tests are bugs from the implementation phase and will be
+    // caught by the verify phase.
+    //
+    // The tests below use the spec-correct pinned sets from SPEC-006.
+
+    /// Scenario: Ethernet schema fields match spec pinned set (correct per SPEC-006)
+    #[test]
+    fn test_ethernet_schema_field_set_matches_spec_pinned_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let mut fields: Vec<&str> = schema.field_names();
+        fields.sort();
+
+        let expected = vec![
+            "addresses",
+            "carrier",
+            "dns_servers",
+            "driver",
+            "enabled",
+            "ethernet",
+            "mac",
+            "mtu",
+            "name",
+            "routes",
+            "type",
+        ];
+
+        assert_eq!(
+            fields, expected,
+            "ethernet schema fields diverged from the SPEC-006 pinned set.\n\
+             If you added or removed a field in the JSON schema, update this test \
+             AND the corresponding backend query/apply code.\n\
+             NOTE: 'speed' is a sub-property inside the 'ethernet' object, not a \
+             top-level field."
+        );
+    }
+
+    /// Scenario: Ethernet writable fields match spec pinned set (SPEC-006)
+    #[test]
+    fn test_ethernet_writable_field_set_matches_spec_pinned_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let mut writable: Vec<&str> = schema
+            .field_names()
+            .into_iter()
+            .filter(|f| schema.field_info(f).map_or(false, |i| i.writable))
+            .collect();
+        writable.sort();
+
+        let expected = vec!["addresses", "enabled", "mtu", "routes"];
+
+        assert_eq!(
+            writable, expected,
+            "ethernet writable fields diverged from the SPEC-006 pinned set.\n\
+             If you changed a field's x-netfyr-writable attribute, update this test \
+             AND the apply code in netfyr-backend."
+        );
+    }
+
+    /// Scenario: Ethernet read-only fields match spec pinned set (SPEC-006)
+    #[test]
+    fn test_ethernet_readonly_field_set_matches_spec_pinned_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let mut readonly: Vec<&str> = schema
+            .field_names()
+            .into_iter()
+            .filter(|f| schema.field_info(f).map_or(false, |i| !i.writable))
+            .collect();
+        readonly.sort();
+
+        let expected = vec![
+            "carrier",
+            "dns_servers",
+            "driver",
+            "ethernet",
+            "mac",
+            "name",
+            "type",
+        ];
+
+        assert_eq!(
+            readonly, expected,
+            "ethernet read-only fields diverged from the SPEC-006 pinned set.\n\
+             If you changed a field's x-netfyr-writable attribute, update this test \
+             AND the query code in netfyr-backend."
+        );
+    }
+
+    /// Scenario: WiFi schema fields match spec pinned set (SPEC-006)
+    #[test]
+    fn test_wifi_schema_field_set_matches_spec_pinned_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("wifi").expect("wifi schema must exist");
+        let mut fields: Vec<&str> = schema.field_names();
+        fields.sort();
+
+        let expected = vec![
+            "addresses",
+            "carrier",
+            "dns_servers",
+            "driver",
+            "enabled",
+            "mac",
+            "mtu",
+            "name",
+            "routes",
+            "type",
+            "wifi",
+        ];
+
+        assert_eq!(
+            fields, expected,
+            "wifi schema fields diverged from the SPEC-006 pinned set.\n\
+             If you added or removed a field in the JSON schema, update this test \
+             AND the corresponding backend query/apply code."
+        );
+    }
+
+    /// Scenario: WiFi writable fields match spec pinned set (SPEC-006)
+    #[test]
+    fn test_wifi_writable_field_set_matches_spec_pinned_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("wifi").expect("wifi schema must exist");
+        let mut writable: Vec<&str> = schema
+            .field_names()
+            .into_iter()
+            .filter(|f| schema.field_info(f).map_or(false, |i| i.writable))
+            .collect();
+        writable.sort();
+
+        let expected = vec!["addresses", "enabled", "mtu", "routes"];
+
+        assert_eq!(
+            writable, expected,
+            "wifi writable fields diverged from the SPEC-006 pinned set.\n\
+             If you changed a field's x-netfyr-writable attribute, update this test \
+             AND the apply code in netfyr-backend."
+        );
+    }
+
+    /// Scenario: WiFi read-only fields match spec pinned set (SPEC-006)
+    #[test]
+    fn test_wifi_readonly_field_set_matches_spec_pinned_set() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("wifi").expect("wifi schema must exist");
+        let mut readonly: Vec<&str> = schema
+            .field_names()
+            .into_iter()
+            .filter(|f| schema.field_info(f).map_or(false, |i| !i.writable))
+            .collect();
+        readonly.sort();
+
+        let expected = vec![
+            "carrier",
+            "dns_servers",
+            "driver",
+            "mac",
+            "name",
+            "type",
+            "wifi",
+        ];
+
+        assert_eq!(
+            readonly, expected,
+            "wifi read-only fields diverged from the SPEC-006 pinned set.\n\
+             If you changed a field's x-netfyr-writable attribute, update this test \
+             AND the query code in netfyr-backend."
+        );
+    }
+
+    /// Scenario: validate_writable passes for a wifi state with only writable fields
+    #[test]
+    fn test_valid_writable_wifi_state_passes_writable_validation() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "wifi",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("addresses", Value::List(vec![Value::String("192.168.1.10/24".to_string())])),
+            ],
+        );
+        assert!(
+            registry.validate_writable(&state).is_ok(),
+            "wifi state with only writable fields (mtu, addresses) should pass validate_writable"
+        );
+    }
+
+    /// Scenario: wifi comparison_keys for addresses returns Some(["address"])
+    #[test]
+    fn test_wifi_comparison_keys_addresses_returns_some_with_address_key() {
+        let registry = SchemaRegistry::new();
+        let keys = registry.comparison_keys("wifi", "addresses");
+        assert_eq!(
+            keys,
+            Some(vec!["address".to_string()]),
+            "comparison_keys(\"wifi\", \"addresses\") must return Some([\"address\"])"
         );
     }
 }
