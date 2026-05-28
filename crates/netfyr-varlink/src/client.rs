@@ -565,6 +565,7 @@ mod tests {
             driver: None,
             mac: None,
             pci_path: None,
+            ..Default::default()
         };
 
         let mut client = VarlinkClient::connect(&path).await.unwrap();

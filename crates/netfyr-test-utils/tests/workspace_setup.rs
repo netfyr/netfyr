@@ -273,8 +273,9 @@ fn test_no_extraneous_source_files_in_library_crates() {
     // netfyr-state has set.rs and diff.rs in addition to lib.rs per SPEC-004.
     // SPEC-005 adds loader.rs and yaml.rs for YAML serialization support.
     // SPEC-006 adds schema.rs and schemas/ for entity schema validation.
+    // SPEC-003 adds selector.rs for the Selector and MacAddr types.
     let library_crates: &[(&str, &[&str])] = &[
-        ("netfyr-state", &["diff.rs", "entity.rs", "field.rs", "lib.rs", "loader.rs", "metadata.rs", "provenance.rs", "schema.rs", "schemas", "set.rs", "value.rs", "yaml.rs"]),
+        ("netfyr-state", &["diff.rs", "entity.rs", "field.rs", "lib.rs", "loader.rs", "metadata.rs", "provenance.rs", "schema.rs", "schemas", "selector.rs", "set.rs", "value.rs", "yaml.rs"]),
         // SPEC-203 adds diff.rs and report.rs for diff generation.
         ("netfyr-reconcile", &["diff.rs", "lib.rs", "report.rs"]),
         // SPEC-401 adds dhcp/ for the DHCPv4 factory implementation.

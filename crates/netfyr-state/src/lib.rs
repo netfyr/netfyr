@@ -35,6 +35,7 @@ pub mod loader;
 pub mod metadata;
 pub mod provenance;
 pub mod schema;
+pub mod selector;
 pub mod set;
 pub mod value;
 pub mod yaml;
@@ -49,6 +50,7 @@ pub use schema::{
     EntitySchema, FieldConstraints, FieldSchemaInfo, FieldType, SchemaRegistry, ValidationError,
     ValidationErrorKind, ValidationErrors,
 };
+pub use selector::{MacAddr, MacAddrParseError, Selector};
 pub use set::{complement, intersection, union, Conflict, ConflictError, StateSet};
 pub use value::Value;
 pub use yaml::{
@@ -66,204 +68,6 @@ pub type EntityType = String;
 /// to avoid typos and centralize the set of supported types.
 pub mod entity_types {
     pub const ETHERNET: &str = "ethernet";
-}
-
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
-use std::fmt;
-use std::str::FromStr;
-
-// ── MacAddrParseError ─────────────────────────────────────────────────────────
-
-/// Error returned when parsing a MAC address string fails.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MacAddrParseError;
-
-impl fmt::Display for MacAddrParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid MAC address; expected format AA:BB:CC:DD:EE:FF")
-    }
-}
-
-impl std::error::Error for MacAddrParseError {}
-
-// ── MacAddr ───────────────────────────────────────────────────────────────────
-
-/// A 6-byte hardware (MAC) address.
-///
-/// Stored as raw bytes so equality comparison is always case-insensitive.
-/// Serialized/deserialized as a lowercase colon-separated hex string.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MacAddr(pub [u8; 6]);
-
-impl fmt::Display for MacAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let b = &self.0;
-        write!(
-            f,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            b[0], b[1], b[2], b[3], b[4], b[5]
-        )
-    }
-}
-
-impl FromStr for MacAddr {
-    type Err = MacAddrParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 6 {
-            return Err(MacAddrParseError);
-        }
-        let mut bytes = [0u8; 6];
-        for (i, part) in parts.iter().enumerate() {
-            bytes[i] = u8::from_str_radix(part, 16).map_err(|_| MacAddrParseError)?;
-        }
-        Ok(MacAddr(bytes))
-    }
-}
-
-impl Serialize for MacAddr {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for MacAddr {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-// ── Selector ──────────────────────────────────────────────────────────────────
-
-/// Identifies which system entity a state targets.
-///
-/// All specified (non-None, non-empty) fields must match for `matches()` to
-/// return true (AND logic). Unspecified fields match anything.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Selector {
-    /// Exact interface or entity name (e.g., `"eth0"`, `"bond0.100"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Entity type filter (e.g., `"ethernet"`, `"wifi"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entity_type: Option<String>,
-    /// Kernel driver name (e.g., `"ixgbe"`, `"mlx5_core"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub driver: Option<String>,
-    /// PCI device path for stable hardware identification (e.g., `"0000:03:00.0"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pci_path: Option<String>,
-    /// MAC address (6-byte hardware address).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mac: Option<MacAddr>,
-    /// User-defined key-value labels; all specified labels must be present with
-    /// matching values on the target (subset matching).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub labels: HashMap<String, String>,
-}
-
-impl Selector {
-    /// Returns a selector with all fields unset (matches everything).
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns a selector targeting a specific named entity.
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            name: Some(name.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Returns `true` if all fields set in `self` match the corresponding
-    /// fields in `other`. Unspecified fields (None / empty labels) in `self`
-    /// match anything in `other`.
-    pub fn matches(&self, other: &Selector) -> bool {
-        if let Some(ref v) = self.name {
-            if other.name.as_deref() != Some(v.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ref v) = self.entity_type {
-            if other.entity_type.as_deref() != Some(v.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ref v) = self.driver {
-            if other.driver.as_deref() != Some(v.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ref v) = self.pci_path {
-            if other.pci_path.as_deref() != Some(v.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ref v) = self.mac {
-            if other.mac.as_ref() != Some(v) {
-                return false;
-            }
-        }
-        for (k, v) in &self.labels {
-            if other.labels.get(k) != Some(v) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Returns `true` if the selector has a `name` set, meaning it targets a
-    /// single known entity rather than a class of entities.
-    pub fn is_specific(&self) -> bool {
-        self.name.is_some()
-    }
-
-    /// Returns a stable string key used for indexing in a StateSet.
-    ///
-    /// When `name` is set, returns the name directly. Otherwise, produces a
-    /// deterministic semicolon-delimited encoding of all set fields in
-    /// alphabetical order (e.g., `"driver=ixgbe;entity_type=ethernet"`).
-    ///
-    /// A fully-empty selector returns `""` — two empty selectors are
-    /// semantically identical and correctly map to the same key.
-    pub fn key(&self) -> String {
-        if let Some(ref n) = self.name {
-            return n.clone();
-        }
-
-        // Collect all set fields into a Vec for sorting.
-        // Field names chosen to sort alphabetically: driver, entity_type, mac, pci_path.
-        // Labels are interleaved as "labels.{key}={value}" and sorted together.
-        let mut parts: Vec<String> = Vec::new();
-
-        if let Some(ref v) = self.driver {
-            parts.push(format!("driver={v}"));
-        }
-        if let Some(ref v) = self.entity_type {
-            parts.push(format!("entity_type={v}"));
-        }
-        if let Some(ref v) = self.mac {
-            parts.push(format!("mac={v}"));
-        }
-        if let Some(ref v) = self.pci_path {
-            parts.push(format!("pci_path={v}"));
-        }
-
-        // Sort labels by key for determinism (HashMap iteration order is unspecified).
-        let mut label_pairs: Vec<(&String, &String)> = self.labels.iter().collect();
-        label_pairs.sort_by_key(|(k, _)| k.as_str());
-        for (k, v) in label_pairs {
-            parts.push(format!("labels.{k}={v}"));
-        }
-
-        // Sort all parts together so labels interleave correctly with field names.
-        parts.sort();
-        parts.join(";")
-    }
 }
 
 /// Compares two `Value`s using schema-declared comparison keys.
@@ -438,35 +242,35 @@ mod tests {
         assert!(!sel.matches(&target));
     }
 
-    /// Scenario: Multi-field AND matching succeeds — driver + entity_type both match
+    /// Scenario: Multi-field AND matching succeeds — driver + type_ both match
     #[test]
     fn test_matches_multi_field_and_all_match_returns_true() {
         let sel = Selector {
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         let target = Selector {
             name: Some("eth0".to_string()),
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         assert!(sel.matches(&target));
     }
 
-    /// Scenario: Multi-field AND matching fails on one mismatch — entity_type differs
+    /// Scenario: Multi-field AND matching fails on one mismatch — type_ differs
     #[test]
     fn test_matches_multi_field_and_one_mismatch_returns_false() {
         let sel = Selector {
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("wifi".to_string()),
+            type_: Some("wifi".to_string()),
             ..Default::default()
         };
         let target = Selector {
             name: Some("eth0".to_string()),
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         assert!(!sel.matches(&target));
@@ -482,7 +286,7 @@ mod tests {
         let target = Selector {
             name: Some("eth0".to_string()),
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             pci_path: Some("0000:03:00.0".to_string()),
             ..Default::default()
         };
@@ -496,7 +300,7 @@ mod tests {
         let target = Selector {
             name: Some("eth0".to_string()),
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         assert!(sel.matches(&target));
@@ -650,18 +454,18 @@ mod tests {
     fn test_key_is_deterministic_without_name() {
         let sel = Selector {
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         assert_eq!(sel.key(), sel.key(), "key() must return the same value on repeated calls");
     }
 
-    /// Scenario: key produces deterministic identifier without name — contains driver and entity_type
+    /// Scenario: key produces deterministic identifier without name — contains driver and type
     #[test]
     fn test_key_contains_driver_and_entity_type_without_name() {
         let sel = Selector {
             driver: Some("ixgbe".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         let key = sel.key();
@@ -670,8 +474,8 @@ mod tests {
             "key should contain driver=ixgbe, got: {key}"
         );
         assert!(
-            key.contains("entity_type=ethernet"),
-            "key should contain entity_type=ethernet, got: {key}"
+            key.contains("type=ethernet"),
+            "key should contain type=ethernet, got: {key}"
         );
     }
 
@@ -754,7 +558,7 @@ mod tests {
     fn test_selector_round_trips_through_json() {
         let mut sel = Selector {
             name: Some("eth0".to_string()),
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             driver: Some("ixgbe".to_string()),
             pci_path: Some("0000:03:00.0".to_string()),
             mac: Some("aa:bb:cc:dd:ee:ff".parse().unwrap()),

@@ -267,6 +267,7 @@ fn build_varlink_selector(
         driver,
         mac,
         pci_path,
+        ..Default::default()
     })
 }
 

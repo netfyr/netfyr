@@ -43,7 +43,7 @@ pub fn build_discovered_selector(
 ) -> Selector {
     Selector {
         name: Some(name.to_owned()),
-        entity_type: Some(entity_type.to_owned()),
+        type_: Some(entity_type.to_owned()),
         mac: mac.map(MacAddr),
         driver: driver.map(str::to_owned),
         pci_path: pci_path.map(str::to_owned),
@@ -103,7 +103,7 @@ mod tests {
     fn test_build_discovered_selector_sets_name() {
         let sel = build_discovered_selector("ethernet", "eth0", None, None, None);
         assert_eq!(sel.name.as_deref(), Some("eth0"));
-        assert_eq!(sel.entity_type.as_deref(), Some("ethernet"));
+        assert_eq!(sel.type_.as_deref(), Some("ethernet"));
         assert!(sel.mac.is_none(), "mac must be None when not provided");
         assert!(sel.driver.is_none(), "driver must be None when not provided");
         assert!(sel.pci_path.is_none(), "pci_path must be None when not provided");
@@ -147,7 +147,7 @@ mod tests {
             Some("0000:03:00.0"),
         );
         assert_eq!(sel.name.as_deref(), Some("eth0"));
-        assert_eq!(sel.entity_type.as_deref(), Some("ethernet"));
+        assert_eq!(sel.type_.as_deref(), Some("ethernet"));
         assert_eq!(sel.mac.as_ref().map(|m| m.0), Some(mac));
         assert_eq!(sel.driver.as_deref(), Some("ixgbe"));
         assert_eq!(sel.pci_path.as_deref(), Some("0000:03:00.0"));
@@ -303,33 +303,33 @@ mod tests {
         assert!(user_sel.matches(&discovered), "pci_path selector must match");
     }
 
-    /// Scenario: A user selector with entity_type="ethernet" matches a discovered
+    /// Scenario: A user selector with type_="ethernet" matches a discovered
     /// selector built for the "ethernet" entity type.
     #[test]
     fn test_build_discovered_selector_entity_type_match() {
         let discovered = build_discovered_selector("ethernet", "eth0", None, None, None);
         let user_sel = Selector {
-            entity_type: Some("ethernet".to_string()),
+            type_: Some("ethernet".to_string()),
             ..Default::default()
         };
         assert!(
             user_sel.matches(&discovered),
-            "entity_type selector must match discovered selector with same entity type"
+            "type_ selector must match discovered selector with same entity type"
         );
     }
 
-    /// Scenario: A user selector with entity_type="wifi" does not match a
+    /// Scenario: A user selector with type_="wifi" does not match a
     /// discovered selector built for "ethernet".
     #[test]
     fn test_build_discovered_selector_entity_type_mismatch_does_not_match() {
         let discovered = build_discovered_selector("ethernet", "eth0", None, None, None);
         let user_sel = Selector {
-            entity_type: Some("wifi".to_string()),
+            type_: Some("wifi".to_string()),
             ..Default::default()
         };
         assert!(
             !user_sel.matches(&discovered),
-            "entity_type selector 'wifi' must not match discovered selector for 'ethernet'"
+            "type_ selector 'wifi' must not match discovered selector for 'ethernet'"
         );
     }
 
