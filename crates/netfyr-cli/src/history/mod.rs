@@ -2303,9 +2303,9 @@ mod tests {
         );
     }
 
-    /// AC: 5 address additions and 3 removals shows all 8 addresses individually.
+    /// AC: 5 address additions and 3 removals (total 8, in 3-8 range) shows first 2 per direction + count suffix.
     #[test]
-    fn test_changes_summary_5_addr_additions_3_removals_shows_all() {
+    fn test_changes_summary_5_addr_additions_3_removals_shows_capped() {
         let added: Vec<serde_json::Value> = (1..=5)
             .map(|i| serde_json::json!(format!("10.0.0.{}/24", i + 10)))
             .collect();
@@ -2325,20 +2325,27 @@ mod tests {
             }],
         }];
         let result = changes_summary(&ops);
-        // 5 added + 3 removed = 8 total → all shown individually, no abbreviation
+        // 5 added + 3 removed = 8 total (3-8 range) → first 2 added by value + (+3 addrs), first 2 removed by value + (-1 addrs)
         assert!(
-            !result.contains("addrs)"),
-            "8 total address changes should show all individually without abbreviation, got: {}",
+            result.contains("(+3 addrs)"),
+            "5 additions should show first 2 by value + '(+3 addrs)', got: {}",
             result
         );
-        for i in 1..=5 {
-            let addr = format!("+10.0.0.{}/24", i + 10);
-            assert!(result.contains(&addr), "should show {}, got: {}", addr, result);
-        }
-        for i in 1..=3 {
-            let addr = format!("-192.168.{}.1/24", i);
-            assert!(result.contains(&addr), "should show {}, got: {}", addr, result);
-        }
+        assert!(
+            result.contains("(-1 addrs)"),
+            "3 removals should show first 2 by value + '(-1 addrs)', got: {}",
+            result
+        );
+        // First 2 added addresses should appear by value
+        assert!(result.contains("+10.0.0.11/24"), "first added address should appear, got: {}", result);
+        assert!(result.contains("+10.0.0.12/24"), "second added address should appear, got: {}", result);
+        // Third+ added should not appear individually
+        assert!(!result.contains("+10.0.0.13/24"), "third added address should be counted not shown, got: {}", result);
+        // First 2 removed addresses should appear by value
+        assert!(result.contains("-192.168.1.1/24"), "first removed address should appear, got: {}", result);
+        assert!(result.contains("-192.168.2.1/24"), "second removed address should appear, got: {}", result);
+        // Third removed should not appear individually
+        assert!(!result.contains("-192.168.3.1/24"), "third removed address should be counted not shown, got: {}", result);
     }
 
     /// AC: 10 address additions and 10 removals shows only counts "+10 addrs, -10 addrs".
@@ -2434,9 +2441,9 @@ mod tests {
         );
     }
 
-    /// AC: Non-default routes show individual destinations.
+    /// AC: Non-default routes show count-only (not individual destinations).
     #[test]
-    fn test_changes_summary_non_default_routes_show_destinations() {
+    fn test_changes_summary_non_default_routes_show_count_only() {
         let ops = vec![SerializableDiffOp {
             kind: "modify".to_string(),
             entity_type: "ethernet".to_string(),
@@ -2454,15 +2461,19 @@ mod tests {
             }],
         }];
         let result = changes_summary(&ops);
-        for expected in &["+rt 10.0.0.0/8 via 192.168.1.1", "+rt 172.16.0.0/12 via 192.168.1.1", "+rt 192.168.2.0/24 via 192.168.1.1"] {
-            assert!(
-                result.contains(expected),
-                "non-default route {} should appear; got: {}", expected, result
-            );
-        }
+        assert!(
+            result.contains("+3 routes"),
+            "3 non-default routes should show '+3 routes' count-only, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("+rt"),
+            "non-default routes must not show individual '+rt ...' format, got: {}",
+            result
+        );
     }
 
-    /// AC: Default route and non-default routes: all shown by destination.
+    /// AC: Default route and non-default routes: default shown by value, non-default as count.
     #[test]
     fn test_changes_summary_default_route_and_non_default_routes_mixed() {
         let ops = vec![SerializableDiffOp {
@@ -2489,13 +2500,17 @@ mod tests {
             "default route should be shown by value, got: {}",
             result
         );
-        for expected in &["+rt 10.0.0.0/8 via 192.168.1.1", "+rt 172.16.0.0/12 via 192.168.1.1", "+rt 192.168.2.0/24 via 192.168.1.1", "+rt 203.0.113.0/24 via 192.168.1.1"] {
-            assert!(
-                result.contains(expected),
-                "non-default route {} should appear; got: {}",
-                expected, result
-            );
-        }
+        // Non-default routes use count-only format per spec
+        assert!(
+            result.contains("+4 routes"),
+            "4 non-default routes should show '+4 routes' count-only, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("+rt"),
+            "non-default routes must not use '+rt ...' individual format, got: {}",
+            result
+        );
     }
 
     /// AC: Default route removal is shown by value "-dflt via ...".

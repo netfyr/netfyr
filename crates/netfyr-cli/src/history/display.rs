@@ -96,6 +96,24 @@ fn format_address_changes(added: Vec<&str>, removed: Vec<&str>) -> Vec<String> {
         return parts;
     }
 
+    if total >= 3 {
+        let show_add = added_sorted.len().min(2);
+        for addr in &added_sorted[..show_add] {
+            parts.push(format!("+{}", addr));
+        }
+        if added_sorted.len() > 2 {
+            parts.push(format!("(+{} addrs)", added_sorted.len() - 2));
+        }
+        let show_rem = removed_sorted.len().min(2);
+        for addr in &removed_sorted[..show_rem] {
+            parts.push(format!("-{}", addr));
+        }
+        if removed_sorted.len() > 2 {
+            parts.push(format!("(-{} addrs)", removed_sorted.len() - 2));
+        }
+        return parts;
+    }
+
     for addr in &added_sorted {
         parts.push(format!("+{}", addr));
     }
@@ -103,22 +121,6 @@ fn format_address_changes(added: Vec<&str>, removed: Vec<&str>) -> Vec<String> {
         parts.push(format!("-{}", addr));
     }
     parts
-}
-
-fn format_route_dest_via(r: &serde_json::Value) -> String {
-    let dest = r
-        .as_object()
-        .and_then(|o| o.get("destination"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    match r
-        .as_object()
-        .and_then(|o| o.get("gateway"))
-        .and_then(|v| v.as_str())
-    {
-        Some(gw) => format!("{} via {}", dest, gw),
-        None => dest.to_string(),
-    }
 }
 
 fn format_route_changes(
@@ -172,19 +174,18 @@ fn format_route_changes(
     }
     let n_add = added_nondflt.len();
     let n_rem = removed_nondflt.len();
-    if n_add + n_rem >= 9 {
-        if n_add > 0 {
+    if n_add > 0 {
+        if n_add == 1 {
+            parts.push("+1 route".to_string());
+        } else {
             parts.push(format!("+{} routes", n_add));
         }
-        if n_rem > 0 {
+    }
+    if n_rem > 0 {
+        if n_rem == 1 {
+            parts.push("-1 route".to_string());
+        } else {
             parts.push(format!("-{} routes", n_rem));
-        }
-    } else {
-        for r in &added_nondflt {
-            parts.push(format!("+rt {}", format_route_dest_via(r)));
-        }
-        for r in &removed_nondflt {
-            parts.push(format!("-rt {}", format_route_dest_via(r)));
         }
     }
     parts
