@@ -50,9 +50,21 @@ Default directory for policy files.
 .I /var/lib/netfyr/
 State directory for persistent daemon data.
 .SH EXAMPLES
-See
-.BR netfyr-diagnose (1)
-for usage details.
+Run a diagnostic check on all managed interfaces:
+.PP
+.RS 4
+.nf
+netfyr diagnose
+.fi
+.RE
+.PP
+Scan the last 24 hours and output findings as JSON:
+.PP
+.RS 4
+.nf
+netfyr diagnose --since 24h -o json
+.fi
+.RE
 .SH ENVIRONMENT
 .TP
 .B NO_COLOR

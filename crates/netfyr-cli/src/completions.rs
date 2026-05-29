@@ -109,6 +109,26 @@ mod tests {
         );
     }
 
+    /// AC: completion script contains "diagnose" subcommand.
+    #[test]
+    fn test_generate_bash_completion_contains_diagnose_subcommand() {
+        let output = generate_bash_completion();
+        assert!(
+            output.contains("diagnose"),
+            "completion script must contain the 'diagnose' subcommand"
+        );
+    }
+
+    /// AC: completion script contains "show" subcommand.
+    #[test]
+    fn test_generate_bash_completion_contains_show_subcommand() {
+        let output = generate_bash_completion();
+        assert!(
+            output.contains("show"),
+            "completion script must contain the 'show' subcommand"
+        );
+    }
+
     /// AC: completion script contains "completions" subcommand.
     #[test]
     fn test_generate_bash_completion_contains_completions_subcommand() {

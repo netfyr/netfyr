@@ -14,11 +14,19 @@ Two operational modes are supported and detected automatically. In standalone mo
 .PP
 Subcommands:
 .PP
-apply    Load and apply policy files to the system.
+apply        Load and apply policy files to the system.
 .PP
-query    Query current network state from the kernel or daemon.
+query        Query current network state from the kernel or daemon.
 .PP
-history  Show journal history of state changes.
+history      Show journal history of state changes.
+.PP
+revert       Revert system state to match a journal snapshot.
+.PP
+show         Show system overview and daemon status.
+.PP
+diagnose     Diagnose network problems from the journal.
+.PP
+completions  Generate shell completion scripts.
 .SH OPTIONS
 .TP
 \fB\-\-color\fR \fI<COLOR>\fR [default: auto]
@@ -108,6 +116,8 @@ flag.
 .BR netfyr-show (1),
 .BR netfyr-history (1),
 .BR netfyr-revert (1),
+.BR netfyr-diagnose (1),
+.BR netfyr-completions (1),
 .BR netfyr-daemon (8),
 .BR netfyr-examples (7),
 .BR netfyr.yaml (5)

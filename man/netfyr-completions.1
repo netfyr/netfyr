@@ -52,9 +52,21 @@ Default directory for policy files.
 .I /var/lib/netfyr/
 State directory for persistent daemon data.
 .SH EXAMPLES
-See
-.BR netfyr-completions (1)
-for usage details.
+Generate bash completions and install them:
+.PP
+.RS 4
+.nf
+netfyr completions bash > ~/.local/share/bash-completion/completions/netfyr
+.fi
+.RE
+.PP
+Generate fish completions:
+.PP
+.RS 4
+.nf
+netfyr completions fish > ~/.config/fish/completions/netfyr.fish
+.fi
+.RE
 .SH ENVIRONMENT
 .TP
 .B NO_COLOR
