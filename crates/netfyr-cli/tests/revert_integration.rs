@@ -122,11 +122,6 @@ fn test_revert_nonexistent_entry_shows_entry_not_found_in_output() {
 }
 
 /// AC (spec): `netfyr revert 9999` for a nonexistent entry exits with code 1.
-///
-/// NOTE: The current implementation exits with code 2 in standalone mode (the
-/// anyhow error bubbles to main() which always uses ExitCode::from(2u8)).
-/// Daemon mode correctly returns exit code 1 via VarlinkError::EntryNotFound.
-/// This test captures the spec requirement; a failing result indicates a bug.
 #[test]
 fn test_revert_nonexistent_entry_exit_code_is_1() {
     let dir = tempfile::tempdir().unwrap();
