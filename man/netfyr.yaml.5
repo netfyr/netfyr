@@ -22,31 +22,32 @@ field declares the desired state of a single network entity.
 It is automatically wrapped into a static policy with default priority 100
 and a name derived from the filename.
 .PP
-All properties are written at the top level in a flat format:
-.B type
-and selector properties (see
-.BR SELECTORS )
-identify the target entity, and configuration properties (see
-.BR FIELDS )
-declare its desired state.
+The
+.B selector:
+sub-mapping identifies the target entity using selector properties
+(see
+.BR SELECTORS ).
+All other top-level keys (except
+.B kind
+and
+.BR selector )
+are configuration fields that declare the desired state (see
+.BR FIELDS ).
 .PP
 Fields:
 .TP
-.B type
-(string, required)
-The entity type.
-Currently supported:
-.BR ethernet .
-.TP
-.B "Selector properties (at top level)"
-See
-.B SELECTORS
-below.
-Fields:
+.B selector
+(mapping, required)
+Identifies the target entity.
+Contains selector properties:
+.BR type ,
 .BR name ,
 .BR driver ,
 .BR mac ,
 .BR pci_path .
+See
+.B SELECTORS
+below.
 .TP
 .B "Configuration properties (at top level)"
 See
@@ -61,8 +62,8 @@ For ethernet:
 Example:
 .RS 4
 .nf
-type: ethernet
-name: eth0
+selector:
+  name: eth0
 mtu: 1500
 addresses:
   - 10.0.1.50/24
@@ -113,23 +114,18 @@ Higher values take precedence when two policies set the same field on the
 same interface.
 .TP
 .B selector
-(mapping, required for dhcpv4)
-Identifies the target interface.
-Used with
-.BR "factory: dhcpv4" .
-For static policies, selector fields are written inside
-.B state
-or
-.B states
-instead.
-See
-.B SELECTORS
-below for the available fields.
+(mapping, required)
+Identifies the target entity.
+Contains selector properties (see
+.BR SELECTORS ).
 .TP
 .B state
 (mapping, optional)
-A single entity state definition in flat format, with the same structure as
-the bare state format.
+Configuration fields for the target entity (e.g.,
+.BR mtu ,
+.BR addresses ,
+.BR routes ).
+Does not contain selector fields.
 Mutually exclusive with
 .BR states .
 Used with
@@ -137,7 +133,8 @@ Used with
 .TP
 .B states
 (sequence, optional)
-A list of entity state definitions in flat format.
+A list of configuration-field mappings.
+Each entry contains only configuration fields.
 Used when a policy produces multiple entities.
 Mutually exclusive with
 .BR state .
@@ -151,9 +148,9 @@ kind: policy
 name: server\-network
 factory: static
 priority: 150
-state:
-  type: ethernet
+selector:
   name: eth0
+state:
   mtu: 9000
   addresses:
     - 10.0.1.50/24
@@ -167,15 +164,12 @@ kind: policy
 name: server\-network
 factory: static
 priority: 150
+selector:
+  name: eth0
 states:
-  - type: ethernet
-    name: eth0
-    mtu: 9000
+  - mtu: 9000
     addresses:
       - 10.0.1.50/24
-  - type: ethernet
-    name: eth1
-    mtu: 1500
 .fi
 .RE
 .PP
@@ -197,21 +191,29 @@ Each document is parsed independently and produces one policy.
 Example:
 .RS 4
 .nf
-type: ethernet
-name: eth0
+selector:
+  name: eth0
 mtu: 9000
----
-type: ethernet
-name: eth1
+\-\-\-
+selector:
+  name: eth1
 mtu: 1500
 .fi
 .RE
 .SH SELECTORS
 Selector fields identify which system entity a state targets.
-They are written at the top level of a state definition, alongside the
-.B type
-and configuration fields.
+They are always written inside a
+.B selector:
+mapping \(em either at the top level of a bare state document or at the
+policy level of an explicit policy document.
 All specified selector fields must match (AND logic).
+.TP
+.B type
+(string, optional)
+Entity type filter (e.g.,
+.BR ethernet ).
+Used for technology filtering when the selector would otherwise match
+multiple entity types.
 .TP
 .B name
 (string)
@@ -233,20 +235,13 @@ PCI device path (e.g.,
 MAC address in colon-separated hexadecimal (e.g.,
 .BR aa:bb:cc:dd:ee:ff ).
 Comparison is case-insensitive.
-.PP
-Note: In
-.B dhcpv4
-policies, selector fields are wrapped in a
-.B selector:
-mapping at the policy level rather than inside a state block, because the
-policy-level
-.B name
-field would otherwise collide with the interface name selector.
 .SH FIELDS
-Configuration fields are written at the top level of a state definition,
-alongside the
-.B type
-and selector properties.
+Configuration fields are written at the top level of a bare state document
+(outside the
+.B selector:
+mapping) or inside the
+.B state:
+mapping of an explicit policy.
 The available fields depend on the entity type.
 .SS Ethernet
 The following fields apply to
@@ -332,6 +327,13 @@ Default is 254 (main table).
 (integer, optional)
 Type of Service (TOS/DSCP) filter.
 Valid range: 0\(en255.
+.TP
+.B protocol
+(string, optional)
+Route protocol (e.g.,
+.BR static ,
+.BR dhcp ,
+.BR kernel ).
 .RE
 .TP
 .B state
