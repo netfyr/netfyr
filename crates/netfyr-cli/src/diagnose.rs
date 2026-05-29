@@ -2472,4 +2472,188 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("key=value"), "error should mention key=value format");
     }
+
+    // ── detect_policy_conflict ────────────────────────────────────────────────────
+
+    /// AC: Policy conflict detected when a field oscillates 2+ times across 4 applied entries.
+    /// Oscillation pattern: mtu cycles 1500→9000→1500→9000 (two revisits = two oscillations).
+    #[test]
+    fn test_policy_conflict_detected_when_field_oscillates_across_four_applies() {
+        let entries = vec![
+            make_applied_entry(10, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3600),
+            make_applied_entry(11, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3500),
+            make_applied_entry(12, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3400),
+            make_applied_entry(13, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3300),
+        ];
+
+        let findings = detect_policy_conflict(&entries, &[], "ethernet", "eth0", None);
+
+        assert_eq!(findings.len(), 1, "should detect a policy conflict finding");
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(matches!(f.pattern, PatternKind::PolicyConflict));
+    }
+
+    /// AC: Policy conflict finding details mention the oscillating field.
+    #[test]
+    fn test_policy_conflict_finding_mentions_oscillating_field() {
+        let entries = vec![
+            make_applied_entry(10, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3600),
+            make_applied_entry(11, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3500),
+            make_applied_entry(12, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3400),
+            make_applied_entry(13, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3300),
+        ];
+
+        let findings = detect_policy_conflict(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        let all_text = format!("{} {:?}", findings[0].summary, findings[0].details);
+        assert!(all_text.contains("mtu"), "conflict finding must name the oscillating field 'mtu'");
+    }
+
+    /// AC: Policy conflict suggests reviewing overlapping policies.
+    #[test]
+    fn test_policy_conflict_suggests_reviewing_policies() {
+        let entries = vec![
+            make_applied_entry(10, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3600),
+            make_applied_entry(11, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3500),
+            make_applied_entry(12, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3400),
+            make_applied_entry(13, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3300),
+        ];
+
+        let findings = detect_policy_conflict(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        let actions = findings[0].suggested_actions.join(" ");
+        assert!(
+            actions.contains("polic"),
+            "suggested actions should mention reviewing policies, got: {:?}",
+            actions
+        );
+    }
+
+    /// AC: Fewer than 3 applied entries do not trigger a policy conflict (threshold is ≥3).
+    #[test]
+    fn test_no_policy_conflict_with_fewer_than_three_applied_entries() {
+        // Only 2 applies, even with oscillation — below the threshold.
+        let entries = vec![
+            make_applied_entry(10, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3600),
+            make_applied_entry(11, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3500),
+        ];
+
+        let findings = detect_policy_conflict(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(findings.is_empty(), "fewer than 3 applied entries must not trigger conflict");
+    }
+
+    /// AC: Fields that change monotonically (no revisited values) are not reported as conflicts.
+    #[test]
+    fn test_no_policy_conflict_when_field_changes_monotonically() {
+        // mtu increases uniquely across 4 applies — no value is ever revisited.
+        let entries = vec![
+            make_applied_entry(10, "ethernet", "eth0", serde_json::json!({ "mtu": 1000u64 }), 3600),
+            make_applied_entry(11, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3500),
+            make_applied_entry(12, "ethernet", "eth0", serde_json::json!({ "mtu": 2000u64 }), 3400),
+            make_applied_entry(13, "ethernet", "eth0", serde_json::json!({ "mtu": 9000u64 }), 3300),
+        ];
+
+        let findings = detect_policy_conflict(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(findings.is_empty(), "monotonically changing fields must not trigger conflict");
+    }
+
+    /// AC: Entries not for the target entity are ignored in conflict detection.
+    #[test]
+    fn test_no_policy_conflict_when_oscillation_is_on_different_entity() {
+        // eth1 oscillates, but we're analyzing eth0 (which only has 2 stable applies).
+        let entries = vec![
+            make_applied_entry(10, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3600),
+            make_applied_entry(11, "ethernet", "eth0", serde_json::json!({ "mtu": 1500u64 }), 3500),
+            // eth1 entries with oscillation — should not affect eth0 analysis.
+            make_applied_entry(12, "ethernet", "eth1", serde_json::json!({ "mtu": 9000u64 }), 3400),
+            make_applied_entry(13, "ethernet", "eth1", serde_json::json!({ "mtu": 1500u64 }), 3300),
+            make_applied_entry(14, "ethernet", "eth1", serde_json::json!({ "mtu": 9000u64 }), 3200),
+            make_applied_entry(15, "ethernet", "eth1", serde_json::json!({ "mtu": 1500u64 }), 3100),
+        ];
+
+        let findings = detect_policy_conflict(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(findings.is_empty(), "oscillation on eth1 must not produce conflict for eth0");
+    }
+
+    // ── run_analysis: selector matches no entity ──────────────────────────────────
+
+    /// AC: When selector matches no managed entity, exit code is 0 (no error to report).
+    #[test]
+    fn test_run_analysis_no_matching_entity_for_selector_returns_success() {
+        let applied = make_applied_entry(
+            10,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 1500u64 }),
+            3600,
+        );
+        let data = CollectedData {
+            entries: vec![applied.clone()],
+            current_state: vec![make_ser_state(
+                "ethernet",
+                "eth0",
+                serde_json::json!({ "mtu": 1500u64 }),
+            )],
+            managed_entities: vec![("ethernet".to_string(), "eth0".to_string())],
+            last_applied_entry: Some(applied),
+        };
+        let args = DiagnoseArgs {
+            selector: vec![("name".to_string(), "eth99".to_string())],
+            since: "1h".to_string(),
+            output: DiagnoseOutputFormat::Text,
+        };
+
+        let result = run_analysis(data, &args);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            ExitCode::SUCCESS,
+            "selector matching no entity must return exit code 0"
+        );
+    }
+
+    // ── drift with multiple fields: both fields reported ──────────────────────────
+
+    /// AC: Drift with multiple fields — both mtu and addresses differences appear in details.
+    #[test]
+    fn test_drift_multiple_fields_both_mtu_and_address_changes_reported() {
+        let applied = make_applied_entry(
+            10,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 1500u64, "addresses": ["10.0.1.50/24"] }),
+            3600,
+        );
+        // Current state has different mtu AND extra address.
+        let current = vec![make_ser_state(
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64, "addresses": ["10.0.1.50/24", "10.0.1.99/24"] }),
+        )];
+
+        let findings =
+            detect_configuration_drift(&[], &current, "ethernet", "eth0", Some(&applied));
+
+        assert!(!findings.is_empty(), "should detect at least one drift finding");
+        // At least two drift details should be present (mtu + addresses).
+        assert!(
+            findings[0].details.len() >= 2,
+            "drift with two differing fields must produce at least 2 detail lines, got: {:?}",
+            findings[0].details
+        );
+        let all_text = findings[0].details.join(" ");
+        assert!(all_text.contains("mtu"), "details must mention mtu drift");
+        assert!(
+            all_text.contains("addresses") || all_text.contains("10.0.1.99"),
+            "details must mention address drift, got: {:?}",
+            findings[0].details
+        );
+    }
 }
