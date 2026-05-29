@@ -229,6 +229,40 @@ fn append_examples(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, ".fi")?;
             writeln!(buf, ".RE")?;
         }
+        Some("diagnose") => {
+            writeln!(buf, "Run a diagnostic check on all managed interfaces:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr diagnose")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, "Scan the last 24 hours and output findings as JSON:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr diagnose --since 24h -o json")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+        }
+        Some("completions") => {
+            writeln!(buf, "Generate bash completions and install them:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr completions bash > ~/.local/share/bash-completion/completions/netfyr")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, "Generate fish completions:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr completions fish > ~/.config/fish/completions/netfyr.fish")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
+        }
         Some(other) => {
             // Fallback for any future subcommands.
             writeln!(buf, "See")?;
@@ -261,6 +295,8 @@ fn append_see_also(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, ".BR netfyr-show (1),")?;
             writeln!(buf, ".BR netfyr-history (1),")?;
             writeln!(buf, ".BR netfyr-revert (1),")?;
+            writeln!(buf, ".BR netfyr-diagnose (1),")?;
+            writeln!(buf, ".BR netfyr-completions (1),")?;
             writeln!(buf, ".BR netfyr-daemon (8),")?;
             writeln!(buf, ".BR netfyr-examples (7),")?;
             writeln!(buf, r".BR netfyr.yaml (5)")?;
@@ -1104,6 +1140,18 @@ mod tests {
         assert!(man_page_path_exists("netfyr-revert.1"), "man/netfyr-revert.1 must exist");
     }
 
+    /// AC: Generate all man pages — netfyr-diagnose.1 must exist.
+    #[test]
+    fn test_generated_netfyr_diagnose_1_exists() {
+        assert!(man_page_path_exists("netfyr-diagnose.1"), "man/netfyr-diagnose.1 must exist (run `cargo xtask man`)");
+    }
+
+    /// AC: Generate all man pages — netfyr-completions.1 must exist.
+    #[test]
+    fn test_generated_netfyr_completions_1_exists() {
+        assert!(man_page_path_exists("netfyr-completions.1"), "man/netfyr-completions.1 must exist (run `cargo xtask man`)");
+    }
+
     // ── Top-level netfyr.1 content ────────────────────────────────────────────
 
     /// AC: Top-level man page lists all subcommands — DESCRIPTION mentions apply.
@@ -1248,7 +1296,7 @@ mod tests {
     /// AC: All subcommand pages include EXIT STATUS, FILES, EXAMPLES, SEE ALSO.
     #[test]
     fn test_all_subcommand_pages_have_required_sections() {
-        let pages = ["netfyr-apply.1", "netfyr-query.1", "netfyr-history.1", "netfyr-revert.1", "netfyr-show.1"];
+        let pages = ["netfyr-apply.1", "netfyr-query.1", "netfyr-history.1", "netfyr-revert.1", "netfyr-show.1", "netfyr-diagnose.1", "netfyr-completions.1"];
         for page in pages {
             let content = read_generated_man_page(page);
             assert!(content.contains("EXIT STATUS"), "{page} must contain EXIT STATUS section");
@@ -1544,6 +1592,46 @@ mod tests {
         );
     }
 
+    // ── EXAMPLES section — diagnose subcommand ────────────────────────────────
+
+    /// AC: diagnose EXAMPLES section header is emitted.
+    #[test]
+    fn test_diagnose_examples_section_header_present() {
+        let out = render(|buf| append_examples(buf, Some("diagnose")));
+        assert!(out.contains(".SH EXAMPLES"), "EXAMPLES .SH header must be present for diagnose");
+    }
+
+    /// AC: diagnose EXAMPLES must contain at least two real-world usage examples.
+    #[test]
+    fn test_diagnose_examples_has_at_least_two_nf_blocks() {
+        let out = render(|buf| append_examples(buf, Some("diagnose")));
+        let nf_count = out.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "diagnose EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
+    // ── EXAMPLES section — completions subcommand ─────────────────────────────
+
+    /// AC: completions EXAMPLES section header is emitted.
+    #[test]
+    fn test_completions_examples_section_header_present() {
+        let out = render(|buf| append_examples(buf, Some("completions")));
+        assert!(out.contains(".SH EXAMPLES"), "EXAMPLES .SH header must be present for completions");
+    }
+
+    /// AC: completions EXAMPLES must contain at least two real-world usage examples.
+    #[test]
+    fn test_completions_examples_has_at_least_two_nf_blocks() {
+        let out = render(|buf| append_examples(buf, Some("completions")));
+        let nf_count = out.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "completions EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
     // ── ENVIRONMENT section ───────────────────────────────────────────────────
 
     /// AC: ENVIRONMENT section header is emitted.
@@ -1677,6 +1765,8 @@ mod tests {
             "netfyr-history.1",
             "netfyr-revert.1",
             "netfyr-show.1",
+            "netfyr-diagnose.1",
+            "netfyr-completions.1",
         ];
         for page in pages {
             let content = read_generated_man_page(page);
@@ -1886,6 +1976,36 @@ mod tests {
         assert!(
             nf_count >= 2,
             "netfyr-revert.1 EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
+    /// AC: netfyr-diagnose.1 EXAMPLES contains at least two usage examples.
+    #[test]
+    fn test_netfyr_diagnose_1_examples_has_at_least_two_examples() {
+        let content = read_generated_man_page("netfyr-diagnose.1");
+        let ex_start = content
+            .find(".SH EXAMPLES")
+            .expect("EXAMPLES section must exist in netfyr-diagnose.1");
+        let ex = &content[ex_start..];
+        let nf_count = ex.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "netfyr-diagnose.1 EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
+        );
+    }
+
+    /// AC: netfyr-completions.1 EXAMPLES contains at least two usage examples.
+    #[test]
+    fn test_netfyr_completions_1_examples_has_at_least_two_examples() {
+        let content = read_generated_man_page("netfyr-completions.1");
+        let ex_start = content
+            .find(".SH EXAMPLES")
+            .expect("EXAMPLES section must exist in netfyr-completions.1");
+        let ex = &content[ex_start..];
+        let nf_count = ex.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "netfyr-completions.1 EXAMPLES must contain at least 2 usage examples (.nf blocks); found {nf_count}"
         );
     }
 
@@ -2384,6 +2504,9 @@ mod tests {
             ("netfyr-query.1", read_file("netfyr-query.1")),
             ("netfyr-history.1", read_file("netfyr-history.1")),
             ("netfyr-revert.1", read_file("netfyr-revert.1")),
+            ("netfyr-show.1", read_file("netfyr-show.1")),
+            ("netfyr-diagnose.1", read_file("netfyr-diagnose.1")),
+            ("netfyr-completions.1", read_file("netfyr-completions.1")),
             ("netfyr-examples.7", read_file("netfyr-examples.7")),
             ("netfyr-daemon.8", read_file("netfyr-daemon.8")),
         ];
@@ -2399,5 +2522,439 @@ mod tests {
                 "man/{name} must be identical after second `cargo xtask man` run (idempotency)"
             );
         }
+    }
+
+    // ── Troff rendering helper ────────────────────────────────────────────────
+
+    /// Run groff/nroff on a man page file and assert it renders without
+    /// warnings or errors.  Silently skips if neither tool is on PATH.
+    fn assert_man_page_renders_clean(man_path: &std::path::Path) {
+        use std::process::Command;
+        for program in &["groff", "nroff"] {
+            let which = Command::new("which").arg(program).output();
+            if which.map(|o| o.status.success()).unwrap_or(false) {
+                let output = Command::new(program)
+                    .args(["-man", "-Tutf8"])
+                    .arg(man_path)
+                    .output()
+                    .unwrap_or_else(|e| panic!("Failed to spawn {program}: {e}"));
+                assert!(
+                    output.status.success(),
+                    "{program} exited with non-zero status rendering {}:\nstderr: {}",
+                    man_path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let warnings: Vec<&str> = stderr
+                    .lines()
+                    .filter(|l| l.contains("warning") || l.contains("error"))
+                    .collect();
+                assert!(
+                    warnings.is_empty(),
+                    "{program} produced warnings/errors rendering {}:\n{}",
+                    man_path.display(),
+                    warnings.join("\n")
+                );
+                return;
+            }
+        }
+        eprintln!(
+            "WARNING: neither groff nor nroff found; skipping render test for {}",
+            man_path.display()
+        );
+    }
+
+    // ── Man page rendering — generated section 1 pages ────────────────────────
+
+    /// AC: Generated netfyr.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr.1"));
+    }
+
+    /// AC: Generated netfyr-apply.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_apply_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-apply.1"));
+    }
+
+    /// AC: Generated netfyr-query.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_query_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-query.1"));
+    }
+
+    /// AC: Generated netfyr-show.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_show_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-show.1"));
+    }
+
+    /// AC: Generated netfyr-history.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_history_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-history.1"));
+    }
+
+    /// AC: Generated netfyr-revert.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_revert_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-revert.1"));
+    }
+
+    /// AC: Generated netfyr-diagnose.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_diagnose_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-diagnose.1"));
+    }
+
+    /// AC: Generated netfyr-completions.1 renders without troff warnings or errors.
+    #[test]
+    fn test_netfyr_completions_1_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-completions.1"));
+    }
+
+    // ── Man page rendering — hand-written pages ───────────────────────────────
+
+    /// AC: Hand-written netfyr-daemon.8 renders without troff warnings or errors.
+    #[test]
+    fn test_daemon_8_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-daemon.8"));
+    }
+
+    /// AC: Hand-written netfyr-examples.7 renders without troff warnings or errors.
+    #[test]
+    fn test_examples_7_renders_without_groff_errors() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_man_page_renders_clean(&manifest_dir.join("../man/netfyr-examples.7"));
+    }
+
+    // ── netfyr.1 DESCRIPTION completeness ────────────────────────────────────
+
+    /// AC: Top-level man page DESCRIPTION mentions the "show" subcommand.
+    /// Spec: "the DESCRIPTION section mentions apply, query, and show subcommands"
+    #[test]
+    fn test_netfyr_1_description_mentions_show() {
+        let content = read_generated_man_page("netfyr.1");
+        let desc_start = content
+            .find(".SH DESCRIPTION")
+            .expect("DESCRIPTION section must exist in netfyr.1");
+        let next_section = content[desc_start + 1..]
+            .find("\n.SH ")
+            .map(|i| desc_start + 1 + i)
+            .unwrap_or(content.len());
+        let desc = &content[desc_start..next_section];
+        assert!(
+            desc.contains("show"),
+            "netfyr.1 DESCRIPTION must mention the show subcommand; section:\n{desc}"
+        );
+    }
+
+    // ── netfyr.1 SEE ALSO — all subcommands must be listed ───────────────────
+
+    /// AC: netfyr.1 SEE ALSO references netfyr-show(1).
+    #[test]
+    fn test_netfyr_1_see_also_references_netfyr_show_1() {
+        let content = read_generated_man_page("netfyr.1");
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr.1");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-show"),
+            "netfyr.1 SEE ALSO must reference netfyr-show(1)"
+        );
+    }
+
+    /// AC: netfyr.1 SEE ALSO references netfyr-diagnose(1).
+    /// Spec: "the SEE ALSO section references all subcommand man pages"
+    #[test]
+    fn test_netfyr_1_see_also_references_netfyr_diagnose_1() {
+        let content = read_generated_man_page("netfyr.1");
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr.1");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-diagnose"),
+            "netfyr.1 SEE ALSO must reference netfyr-diagnose(1)"
+        );
+    }
+
+    /// AC: netfyr.1 SEE ALSO references netfyr-completions(1).
+    /// Spec: "the SEE ALSO section references all subcommand man pages"
+    #[test]
+    fn test_netfyr_1_see_also_references_netfyr_completions_1() {
+        let content = read_generated_man_page("netfyr.1");
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr.1");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-completions"),
+            "netfyr.1 SEE ALSO must reference netfyr-completions(1)"
+        );
+    }
+
+    // ── append_see_also(None) completeness — unit-level ──────────────────────
+
+    /// AC: append_see_also(None) includes netfyr-show(1).
+    #[test]
+    fn test_see_also_toplevel_helper_references_netfyr_show_1() {
+        let out = render(|buf| append_see_also(buf, None));
+        assert!(
+            out.contains("netfyr-show (1)") || out.contains("netfyr-show(1)"),
+            "top-level SEE ALSO helper must reference netfyr-show(1); got:\n{out}"
+        );
+    }
+
+    /// AC: append_see_also(None) includes netfyr-diagnose(1).
+    /// Spec requires all subcommand pages to be referenced in the top-level page.
+    #[test]
+    fn test_see_also_toplevel_helper_references_netfyr_diagnose_1() {
+        let out = render(|buf| append_see_also(buf, None));
+        assert!(
+            out.contains("netfyr-diagnose (1)") || out.contains("netfyr-diagnose(1)"),
+            "top-level SEE ALSO helper must reference netfyr-diagnose(1); got:\n{out}"
+        );
+    }
+
+    /// AC: append_see_also(None) includes netfyr-completions(1).
+    /// Spec requires all subcommand pages to be referenced in the top-level page.
+    #[test]
+    fn test_see_also_toplevel_helper_references_netfyr_completions_1() {
+        let out = render(|buf| append_see_also(buf, None));
+        assert!(
+            out.contains("netfyr-completions (1)") || out.contains("netfyr-completions(1)"),
+            "top-level SEE ALSO helper must reference netfyr-completions(1); got:\n{out}"
+        );
+    }
+
+    // ── netfyr-daemon.8 SEE ALSO references ──────────────────────────────────
+
+    /// AC: Daemon man page SEE ALSO references netfyr(1).
+    #[test]
+    fn test_daemon_8_see_also_references_netfyr_1() {
+        let content = read_daemon_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr-daemon.8");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr (1)") || see_also.contains("netfyr(1)"),
+            "netfyr-daemon.8 SEE ALSO must reference netfyr(1)"
+        );
+    }
+
+    /// AC: Daemon man page SEE ALSO references netfyr-apply(1).
+    #[test]
+    fn test_daemon_8_see_also_references_netfyr_apply_1() {
+        let content = read_daemon_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr-daemon.8");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-apply") || see_also.contains("netfyr\\-apply"),
+            "netfyr-daemon.8 SEE ALSO must reference netfyr-apply(1)"
+        );
+    }
+
+    /// AC: Daemon man page SEE ALSO references netfyr-history(1).
+    #[test]
+    fn test_daemon_8_see_also_references_netfyr_history_1() {
+        let content = read_daemon_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr-daemon.8");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-history") || see_also.contains("netfyr\\-history"),
+            "netfyr-daemon.8 SEE ALSO must reference netfyr-history(1)"
+        );
+    }
+
+    /// AC: Daemon man page SEE ALSO references netfyr-revert(1).
+    #[test]
+    fn test_daemon_8_see_also_references_netfyr_revert_1() {
+        let content = read_daemon_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr-daemon.8");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-revert") || see_also.contains("netfyr\\-revert"),
+            "netfyr-daemon.8 SEE ALSO must reference netfyr-revert(1)"
+        );
+    }
+
+    // ── netfyr-examples.7 SEE ALSO references ────────────────────────────────
+
+    /// AC: Examples man page SEE ALSO references netfyr-daemon(8).
+    #[test]
+    fn test_examples_7_see_also_references_netfyr_daemon_8() {
+        let content = read_examples_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr-examples.7");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-daemon") || see_also.contains("netfyr\\-daemon"),
+            "netfyr-examples.7 SEE ALSO must reference netfyr-daemon(8)"
+        );
+    }
+
+    /// AC: Examples man page SEE ALSO references netfyr-apply(1).
+    #[test]
+    fn test_examples_7_see_also_references_netfyr_apply_1() {
+        let content = read_examples_man_page();
+        let see_also_start = content.find("SEE ALSO").expect("SEE ALSO must exist in netfyr-examples.7");
+        let see_also = &content[see_also_start..];
+        assert!(
+            see_also.contains("netfyr-apply") || see_also.contains("netfyr\\-apply"),
+            "netfyr-examples.7 SEE ALSO must reference netfyr-apply(1)"
+        );
+    }
+
+    // ── netfyr-apply.1 EXAMPLES — dry-run in a named scenario ────────────────
+
+    /// AC: The dry-run usage in apply EXAMPLES shows the policies directory path.
+    #[test]
+    fn test_apply_examples_dry_run_shows_policies_path() {
+        let out = render(|buf| append_examples(buf, Some("apply")));
+        // Both examples must be present: the dry-run one should reference a .yaml path.
+        assert!(
+            out.contains("--dry-run") && out.contains("/etc/netfyr/policies/"),
+            "apply EXAMPLES must contain both --dry-run and /etc/netfyr/policies/ in the same section"
+        );
+    }
+
+    // ── netfyr-daemon.8 DESCRIPTION ──────────────────────────────────────────
+
+    /// AC: Daemon man page DESCRIPTION mentions the Varlink socket.
+    #[test]
+    fn test_daemon_8_description_mentions_varlink() {
+        let content = read_daemon_man_page();
+        let desc_start = content.find(".SH DESCRIPTION").expect("DESCRIPTION must exist in netfyr-daemon.8");
+        let next_section = content[desc_start + 1..]
+            .find("\n.SH ")
+            .map(|i| desc_start + 1 + i)
+            .unwrap_or(content.len());
+        let desc = &content[desc_start..next_section];
+        assert!(
+            desc.contains("Varlink") || desc.contains("varlink") || desc.contains("socket"),
+            "netfyr-daemon.8 DESCRIPTION must mention the Varlink socket"
+        );
+    }
+
+    /// AC: Daemon man page DESCRIPTION mentions the journal.
+    #[test]
+    fn test_daemon_8_description_mentions_journal() {
+        let content = read_daemon_man_page();
+        let desc_start = content.find(".SH DESCRIPTION").expect("DESCRIPTION must exist in netfyr-daemon.8");
+        let next_section = content[desc_start + 1..]
+            .find("\n.SH ")
+            .map(|i| desc_start + 1 + i)
+            .unwrap_or(content.len());
+        let desc = &content[desc_start..next_section];
+        assert!(
+            desc.contains("journal") || desc.contains("Journal"),
+            "netfyr-daemon.8 DESCRIPTION must mention the journal"
+        );
+    }
+
+    // ── netfyr-daemon.8 FILES section ────────────────────────────────────────
+
+    /// AC: Daemon man page FILES section lists the Varlink socket path.
+    #[test]
+    fn test_daemon_8_files_lists_varlink_socket() {
+        let content = read_daemon_man_page();
+        let files_start = content.find(".SH FILES").expect("FILES section must exist in netfyr-daemon.8");
+        let files = &content[files_start..];
+        assert!(
+            files.contains("/run/netfyr/netfyr.sock"),
+            "netfyr-daemon.8 FILES must list /run/netfyr/netfyr.sock"
+        );
+    }
+
+    /// AC: Daemon man page FILES section lists the journal directory.
+    #[test]
+    fn test_daemon_8_files_lists_journal_directory() {
+        let content = read_daemon_man_page();
+        let files_start = content.find(".SH FILES").expect("FILES section must exist in netfyr-daemon.8");
+        let files = &content[files_start..];
+        assert!(
+            files.contains("/var/lib/netfyr/journal/"),
+            "netfyr-daemon.8 FILES must list /var/lib/netfyr/journal/"
+        );
+    }
+
+    /// AC: Daemon man page FILES section lists the policies directory.
+    #[test]
+    fn test_daemon_8_files_lists_etc_netfyr_policies() {
+        let content = read_daemon_man_page();
+        let files_start = content.find(".SH FILES").expect("FILES section must exist in netfyr-daemon.8");
+        let files = &content[files_start..];
+        assert!(
+            files.contains("/etc/netfyr/policies/"),
+            "netfyr-daemon.8 FILES must list /etc/netfyr/policies/"
+        );
+    }
+
+    // ── netfyr-examples.7 has copy-pasteable examples in each scenario ────────
+
+    /// AC: Static IP scenario in examples.7 includes mtu and routes fields.
+    #[test]
+    fn test_examples_7_static_ip_example_is_complete() {
+        let content = read_examples_man_page();
+        let section_start = content
+            .find("STATIC IP")
+            .expect("STATIC IP section must exist in netfyr-examples.7");
+        let next_section = content[section_start + 1..]
+            .find("\n.SH ")
+            .map(|i| section_start + 1 + i)
+            .unwrap_or(content.len());
+        let section = &content[section_start..next_section];
+        assert!(section.contains("mtu"), "STATIC IP section must include mtu field");
+        assert!(section.contains("routes"), "STATIC IP section must include routes field");
+        assert!(section.contains(".nf"), "STATIC IP section must have a copy-pasteable example (.nf block)");
+    }
+
+    /// AC: DHCP scenario in examples.7 shows the complete policy syntax.
+    #[test]
+    fn test_examples_7_dhcp_example_shows_complete_policy() {
+        let content = read_examples_man_page();
+        let section_start = content
+            .find("DHCP ON AN INTERFACE")
+            .expect("DHCP ON AN INTERFACE section must exist in netfyr-examples.7");
+        let next_section = content[section_start + 1..]
+            .find("\n.SH ")
+            .map(|i| section_start + 1 + i)
+            .unwrap_or(content.len());
+        let section = &content[section_start..next_section];
+        assert!(
+            section.contains("kind: policy"),
+            "DHCP section must show 'kind: policy' in the example"
+        );
+        assert!(
+            section.contains("selector:"),
+            "DHCP section must show selector field"
+        );
+    }
+
+    /// AC: PRIORITY OVERRIDE scenario shows two concrete files with different priorities.
+    #[test]
+    fn test_examples_7_priority_override_shows_two_files() {
+        let content = read_examples_man_page();
+        let section_start = content
+            .find("PRIORITY OVERRIDE")
+            .expect("PRIORITY OVERRIDE section must exist in netfyr-examples.7");
+        let next_section = content[section_start + 1..]
+            .find("\n.SH ")
+            .map(|i| section_start + 1 + i)
+            .unwrap_or(content.len());
+        let section = &content[section_start..next_section];
+        let nf_count = section.matches(".nf").count();
+        assert!(
+            nf_count >= 2,
+            "PRIORITY OVERRIDE must show at least 2 example files (.nf blocks); found {nf_count}"
+        );
+        assert!(
+            section.contains("priority: 200") || section.contains("priority: 100"),
+            "PRIORITY OVERRIDE must show concrete priority values"
+        );
     }
 }

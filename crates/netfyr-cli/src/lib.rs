@@ -73,11 +73,19 @@ pub fn resolve_color_mode(mode: &ColorMode) {
 ///
 /// Subcommands:
 ///
-///   apply    Load and apply policy files to the system.
+///   apply        Load and apply policy files to the system.
 ///
-///   query    Query current network state from the kernel or daemon.
+///   query        Query current network state from the kernel or daemon.
 ///
-///   history  Show journal history of state changes.
+///   history      Show journal history of state changes.
+///
+///   revert       Revert system state to match a journal snapshot.
+///
+///   show         Show system overview and daemon status.
+///
+///   diagnose     Diagnose network problems from the journal.
+///
+///   completions  Generate shell completion scripts.
 #[derive(Parser)]
 #[command(name = "netfyr", about = "Declarative Linux network configuration")]
 #[command(subcommand_required = true, arg_required_else_help = true)]
