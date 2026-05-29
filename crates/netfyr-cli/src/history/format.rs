@@ -20,21 +20,21 @@ pub(crate) fn format_timestamp(ts: DateTime<Utc>, now: DateTime<Utc>, absolute: 
     if absolute {
         return ts.format("%Y-%m-%d %H:%M:%S").to_string();
     }
-    let ts_date = ts.date_naive();
-    let now_date = now.date_naive();
-    if ts_date == now_date {
-        let secs = (now - ts).num_seconds().max(0);
-        if secs < 60 {
-            format!("{} sec ago", secs)
-        } else if secs < 3600 {
-            format!("{} min ago", secs / 60)
-        } else {
-            format!("{}h ago", secs / 3600)
-        }
-    } else if ts_date == now_date - chrono::Duration::days(1) {
-        format!("yesterday {}", ts.format("%H:%M"))
+    let secs = (now - ts).num_seconds().max(0);
+    if secs < 60 {
+        format!("{} sec ago", secs)
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
     } else {
-        ts.format("%Y-%m-%d %H:%M").to_string()
+        let ts_date = ts.date_naive();
+        let now_date = now.date_naive();
+        if ts_date == now_date - chrono::Duration::days(1) {
+            format!("yesterday {}", ts.format("%H:%M"))
+        } else {
+            ts.format("%Y-%m-%d %H:%M").to_string()
+        }
     }
 }
 

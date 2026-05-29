@@ -95,13 +95,17 @@ impl Journal {
 
     /// Append a journal entry. Assigns seq and timestamp, handles rotation.
     pub fn append(&mut self, mut entry: JournalEntry) -> Result<()> {
-        // Open file in create/append mode
+        // Open file with read+write access so we can hold the write lock for
+        // the entire append+rotate window (spec requirement).
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.current_path)?;
 
-        // Acquire advisory write lock (blocks until acquired)
+        // Acquire advisory write lock (blocks until acquired). The lock is held
+        // until after rotation completes — preventing readers from observing a
+        // truncated file mid-rotation.
         Self::lock_file_write(&file)?;
 
         // Assign sequence number; caller is responsible for setting timestamp.
@@ -122,17 +126,19 @@ impl Journal {
 
         self.entry_count += 1;
 
-        // Unlock (file descriptor closed when it goes out of scope, releasing lock)
-        Self::unlock_file(&file)?;
-        drop(file);
-
-        // Check rotation thresholds
+        // Check rotation thresholds while still holding the write lock.
+        // rotate_locked() reads, compresses, and truncates current.ndjson
+        // atomically with respect to concurrent readers.
         let file_size = std::fs::metadata(&self.current_path)
             .map(|m| m.len())
             .unwrap_or(0);
         if self.entry_count >= self.max_entries || file_size >= self.max_size {
-            self.rotate()?;
+            self.rotate_locked(&file)?;
         }
+
+        // Release lock (explicit unlock + drop).
+        Self::unlock_file(&file)?;
+        drop(file);
 
         Ok(())
     }
@@ -171,18 +177,27 @@ impl Journal {
         Ok(None)
     }
 
-    /// Rotate the current journal into the archive directory (gzip compressed).
-    fn rotate(&mut self) -> Result<()> {
+    /// Rotate while holding the write lock on `locked_file` (current.ndjson).
+    ///
+    /// The caller must have already acquired F_WRLCK on `locked_file`. This
+    /// method reads the file content via the same fd, compresses it into the
+    /// archive directory, then truncates current.ndjson — all within the lock
+    /// window. Concurrent readers holding F_RDLCK will block until this
+    /// returns and the lock is released by the caller.
+    fn rotate_locked(&mut self, locked_file: &std::fs::File) -> Result<()> {
+        use std::io::{Read, Seek};
+
         let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
         let archive_name = format!("journal-{}.ndjson.gz", timestamp);
         let archive_path = self.archive_dir.join(&archive_name);
 
-        // Read current content
-        let content = match std::fs::read(&self.current_path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => return Err(JournalError::Io(e)),
-        };
+        // Read content through the locked fd (same fd that holds F_WRLCK).
+        let mut content = Vec::new();
+        {
+            let mut f = locked_file;
+            f.seek(std::io::SeekFrom::Start(0))?;
+            f.read_to_end(&mut content)?;
+        }
 
         // Write gzip-compressed archive
         let archive_file = std::fs::File::create(&archive_path)?;
@@ -190,8 +205,8 @@ impl Journal {
         encoder.write_all(&content)?;
         encoder.finish()?;
 
-        // Recreate empty current.ndjson
-        std::fs::File::create(&self.current_path)?;
+        // Truncate current.ndjson to zero via the locked fd.
+        locked_file.set_len(0)?;
         self.entry_count = 0;
 
         Ok(())
@@ -239,11 +254,21 @@ impl Journal {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn read_current_entries(&self) -> Result<Vec<JournalEntry>> {
-        let content = match std::fs::read_to_string(&self.current_path) {
-            Ok(c) => c,
+        // Open, lock, read, unlock on the same fd to prevent observing partial
+        // writes or a truncated file during concurrent rotation.
+        let file = match std::fs::File::open(&self.current_path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(JournalError::Io(e)),
         };
+
+        Self::lock_file_read(&file)?;
+
+        let mut content = String::new();
+        use std::io::Read;
+        (&file).read_to_string(&mut content)?;
+
+        Self::unlock_file(&file)?;
 
         let entries = content
             .lines()
@@ -252,6 +277,22 @@ impl Journal {
             .collect();
 
         Ok(entries)
+    }
+
+    fn lock_file_read(file: &std::fs::File) -> Result<()> {
+        let fd = file.as_raw_fd();
+        let mut fl = libc::flock {
+            l_type: libc::F_RDLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETLKW, &mut fl) };
+        if ret == -1 {
+            return Err(JournalError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     fn lock_file_write(file: &std::fs::File) -> Result<()> {

@@ -211,6 +211,16 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
             .collect::<Vec<_>>()
             .join(", ");
         let policies_vec: Vec<netfyr_policy::Policy> = policy_set.iter().cloned().collect();
+
+        // Query actual post-apply state; fall back to desired state on error.
+        let post_apply_state = match registry.query_all().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, "failed to query post-apply state for journal; using desired state");
+                effective_state.clone()
+            }
+        };
+
         match Journal::open_default() {
             Ok(mut journal) => {
                 let mut serializable_diff = SerializableDiff::from(&reconcile_diff);
@@ -221,7 +231,7 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
                     trigger: Trigger::PolicyApply { source },
                     active_policies: summarize_policies(&policies_vec),
                     diff: serializable_diff,
-                    state_after: SerializableStateSet::from(&effective_state),
+                    state_after: SerializableStateSet::from(&post_apply_state),
                     outcome: ApplyOutcome::Applied {
                         succeeded: apply_report.succeeded.len() as u32,
                         failed: apply_report.failed.len() as u32,
