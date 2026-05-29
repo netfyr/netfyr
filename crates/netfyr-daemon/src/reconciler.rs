@@ -255,6 +255,7 @@ impl Reconciler {
                 entities = %changed.join(", "),
                 "External change detected"
             );
+            tracing::debug!(entities = ?changed, "external change recorded");
         }
 
         Ok(())
