@@ -610,8 +610,7 @@ fn test_history_show_route_diff_zero_metric_omitted() {
 
 // ── Feature: Route destination shown in CHANGES column ───────────────────────
 
-/// AC: The list-view CHANGES column shows routes with "rt" prefix and
-/// destination, e.g. "+rt 10.0.0.0/8", distinguishing them from addresses.
+/// AC: The list-view CHANGES column shows a single non-default route as "+1 route" (count-only).
 #[test]
 fn test_history_list_changes_column_shows_route_destination() {
     let entry = make_entry_with_diff("veth1", vec![SerializableFieldChange {
@@ -628,12 +627,16 @@ fn test_history_list_changes_column_shows_route_destination() {
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
     assert!(
-        text.contains("+rt 10.0.0.0/8"),
-        "CHANGES column must show '+rt 10.0.0.0/8'; got:\n{text}"
+        text.contains("+1 route"),
+        "CHANGES column must show '+1 route' count-only for non-default route; got:\n{text}"
+    );
+    assert!(
+        !text.contains("+rt"),
+        "CHANGES column must not use '+rt' individual format; got:\n{text}"
     );
 }
 
-/// AC: Route with a gateway shows "via GATEWAY" after the destination.
+/// AC: Non-default route with a gateway shows count-only "+1 route", not the destination.
 #[test]
 fn test_history_list_changes_column_shows_route_with_gateway() {
     let entry = make_entry_with_diff("veth1", vec![SerializableFieldChange {
@@ -650,12 +653,16 @@ fn test_history_list_changes_column_shows_route_with_gateway() {
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
     assert!(
-        text.contains("+rt 10.0.0.0/8 via 192.168.1.1"),
-        "CHANGES column must show '+rt 10.0.0.0/8 via 192.168.1.1'; got:\n{text}"
+        text.contains("+1 route"),
+        "CHANGES column must show '+1 route' count-only for non-default route; got:\n{text}"
+    );
+    assert!(
+        !text.contains("+rt"),
+        "CHANGES column must not use '+rt' individual format; got:\n{text}"
     );
 }
 
-/// AC: Removed routes show "rt" prefix and gateway when present.
+/// AC: Removed non-default routes show count-only "-1 route", not the destination.
 #[test]
 fn test_history_list_changes_column_shows_removed_route_destination() {
     let entry = make_entry_with_diff("veth1", vec![SerializableFieldChange {
@@ -672,8 +679,12 @@ fn test_history_list_changes_column_shows_removed_route_destination() {
     assert!(output.status.success(), "history should exit 0; got: {}", combined(&output));
     let text = combined(&output);
     assert!(
-        text.contains("-rt 192.168.1.0/24 via 192.168.1.1"),
-        "CHANGES column must show '-rt 192.168.1.0/24 via 192.168.1.1' for removed route; got:\n{text}"
+        text.contains("-1 route"),
+        "CHANGES column must show '-1 route' count-only for removed non-default route; got:\n{text}"
+    );
+    assert!(
+        !text.contains("-rt"),
+        "CHANGES column must not use '-rt' individual format; got:\n{text}"
     );
 }
 

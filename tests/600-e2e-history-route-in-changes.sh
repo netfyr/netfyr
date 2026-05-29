@@ -1,14 +1,14 @@
 #!/bin/bash
 # 600-e2e-history-route-in-changes.sh -- End-to-end: netfyr history CHANGES
-# column shows route destinations explicitly (with "rt" prefix and optional
-# "via" gateway) instead of abbreviated "+N route(s)" counts.
+# column shows non-default routes as count-only ("+N routes") and default
+# routes by value ("+dflt via GW").
 #
 # Scenarios:
-#   1. Single route without gateway  → "+rt DEST"
-#   2. Single route with gateway     → "+rt DEST via GW"
-#   3. Multiple routes (< 9)         → each shown individually
-#   4. Route removal                 → "-rt DEST"
-#   5. Many routes (>= 9)            → falls back to "+N routes" count
+#   1. Single non-default route         → "+1 route" (count-only)
+#   2. Multiple non-default routes      → "+N routes" (count-only)
+#   3. Non-default route removal        → "-N routes" (count-only)
+#   4. Default route                    → "+dflt via GW" (by value)
+#   5. Default + non-default routes     → "+dflt via GW, +N routes"
 #
 # Requires: unshare, ip (iproute2)
 # Usage:
@@ -137,7 +137,7 @@ assert_matches() {
     fi
 }
 
-# ── Scenario 1: Single route without gateway → "+rt 10.100.0.0/24" ─────────
+# ── Scenario 1: Single non-default route → "+1 route" (count-only) ──────────
 
 POLICY_1="$TMPDIR_TEST/policy-1.yaml"
 cat > "$POLICY_1" <<'EOF'
@@ -154,47 +154,19 @@ state:
     - destination: "10.100.0.0/24"
 EOF
 
-apply_policy "$POLICY_1" "single route without gateway"
+apply_policy "$POLICY_1" "single non-default route"
 
 HIST=$(run_history -n 1)
 LAST_LINE=$(echo "$HIST" | tail -n 1)
-assert_contains "$LAST_LINE" "+rt 10.100.0.0/24" \
-    "scenario 1: single route without gateway must show '+rt 10.100.0.0/24'"
-assert_not_contains "$LAST_LINE" "+1 route" \
-    "scenario 1: must not show abbreviated '+1 route'"
+assert_contains "$LAST_LINE" "+1 route" \
+    "scenario 1: single non-default route must show '+1 route' count-only"
+assert_not_contains "$LAST_LINE" "+rt" \
+    "scenario 1: must not show individual '+rt' format"
 
-# ── Scenario 2: Route with gateway → "+rt DEST via GW" ─────────────────────
-# The daemon has a known issue applying static gateway routes (it appends /32
-# to the gateway IP), so kernel apply fails. The journal entry is still written
-# with the route diff, which is what we need to test the history format.
+# ── Scenario 2: Multiple non-default routes → "+N routes" (count-only) ──────
 
 POLICY_2="$TMPDIR_TEST/policy-2.yaml"
 cat > "$POLICY_2" <<'EOF'
-kind: policy
-name: rt-test
-factory: static
-priority: 100
-state:
-  type: ethernet
-  name: veth-rt0
-  addresses:
-    - "10.99.0.1/24"
-  routes:
-    - destination: "10.200.0.0/16"
-      gateway: "10.99.0.2"
-EOF
-
-apply_policy_allow_fail "$POLICY_2"
-
-HIST=$(run_history -n 1)
-LAST_LINE=$(echo "$HIST" | tail -n 1)
-assert_matches "$LAST_LINE" '\+rt 10\.200\.0\.0/16 via 10\.99\.0\.2' \
-    "scenario 2: route with gateway must show '+rt 10.200.0.0/16 via 10.99.0.2'"
-
-# ── Scenario 3: Multiple routes (< 9) → each shown individually ────────────
-
-POLICY_3="$TMPDIR_TEST/policy-3.yaml"
-cat > "$POLICY_3" <<'EOF'
 kind: policy
 name: rt-test
 factory: static
@@ -210,20 +182,44 @@ state:
     - destination: "10.50.0.0/16"
 EOF
 
-apply_policy "$POLICY_3" "multiple routes"
+apply_policy "$POLICY_2" "multiple non-default routes"
 
 HIST=$(run_history -n 1)
 LAST_LINE=$(echo "$HIST" | tail -n 1)
-assert_contains "$LAST_LINE" "+rt 172.16.0.0/12" \
-    "scenario 3: must show '+rt 172.16.0.0/12'"
-assert_contains "$LAST_LINE" "+rt 192.168.2.0/24" \
-    "scenario 3: must show '+rt 192.168.2.0/24'"
-assert_contains "$LAST_LINE" "+rt 10.50.0.0/16" \
-    "scenario 3: must show '+rt 10.50.0.0/16'"
-assert_not_contains "$LAST_LINE" "+3 routes" \
-    "scenario 3: must not show abbreviated '+3 routes'"
+# 3 new routes added (policy 2 has 3 routes, policy 1 had 1)
+# The diff will show +2 routes added and -1 route removed (or just the net change)
+# What matters is that the word "route" appears and "+rt" does not.
+assert_matches "$LAST_LINE" '[+-][0-9]+ route' \
+    "scenario 2: multiple routes must show count-only format (e.g. '+2 routes')"
+assert_not_contains "$LAST_LINE" "+rt" \
+    "scenario 2: must not show individual '+rt' format"
 
-# ── Scenario 4: Route removal → "-rt DEST" ─────────────────────────────────
+# ── Scenario 3: Non-default route removal → "-N routes" (count-only) ────────
+
+POLICY_3="$TMPDIR_TEST/policy-3.yaml"
+cat > "$POLICY_3" <<'EOF'
+kind: policy
+name: rt-test
+factory: static
+priority: 100
+state:
+  type: ethernet
+  name: veth-rt0
+  addresses:
+    - "10.99.0.1/24"
+EOF
+
+apply_policy "$POLICY_3" "remove all non-default routes"
+
+HIST=$(run_history -n 1)
+LAST_LINE=$(echo "$HIST" | tail -n 1)
+# Should show "-N routes" for the removed routes
+assert_matches "$LAST_LINE" '-[0-9]+ route' \
+    "scenario 3: removed non-default routes must show count-only format (e.g. '-3 routes')"
+assert_not_contains "$LAST_LINE" "-rt" \
+    "scenario 3: must not show individual '-rt' format"
+
+# ── Scenario 4: Default route → "+dflt via GW" (by value) ───────────────────
 
 POLICY_4="$TMPDIR_TEST/policy-4.yaml"
 cat > "$POLICY_4" <<'EOF'
@@ -236,20 +232,19 @@ state:
   name: veth-rt0
   addresses:
     - "10.99.0.1/24"
+  routes:
+    - destination: "0.0.0.0/0"
+      gateway: "10.99.0.254"
 EOF
 
-apply_policy "$POLICY_4" "remove routes"
+apply_policy_allow_fail "$POLICY_4"
 
 HIST=$(run_history -n 1)
 LAST_LINE=$(echo "$HIST" | tail -n 1)
-assert_contains "$LAST_LINE" "-rt 172.16.0.0/12" \
-    "scenario 4: removal must show '-rt 172.16.0.0/12'"
-assert_contains "$LAST_LINE" "-rt 192.168.2.0/24" \
-    "scenario 4: removal must show '-rt 192.168.2.0/24'"
-assert_contains "$LAST_LINE" "-rt 10.50.0.0/16" \
-    "scenario 4: removal must show '-rt 10.50.0.0/16'"
+assert_contains "$LAST_LINE" "+dflt via 10.99.0.254" \
+    "scenario 4: default route must be shown by value '+dflt via 10.99.0.254'"
 
-# ── Scenario 5: Many routes (>= 9) → falls back to "+N routes" count ───────
+# ── Scenario 5: Default + non-default → "+dflt via GW, +N routes" ───────────
 
 POLICY_5="$TMPDIR_TEST/policy-5.yaml"
 cat > "$POLICY_5" <<'EOF'
@@ -263,23 +258,23 @@ state:
   addresses:
     - "10.99.0.1/24"
   routes:
+    - destination: "0.0.0.0/0"
+      gateway: "10.99.0.254"
     - destination: "10.1.0.0/24"
     - destination: "10.2.0.0/24"
     - destination: "10.3.0.0/24"
-    - destination: "10.4.0.0/24"
-    - destination: "10.5.0.0/24"
-    - destination: "10.6.0.0/24"
-    - destination: "10.7.0.0/24"
-    - destination: "10.8.0.0/24"
-    - destination: "10.9.0.0/24"
 EOF
 
-apply_policy "$POLICY_5" "many routes (9)"
+apply_policy_allow_fail "$POLICY_5"
 
 HIST=$(run_history -n 1)
 LAST_LINE=$(echo "$HIST" | tail -n 1)
-assert_contains "$LAST_LINE" "+9 routes" \
-    "scenario 5: 9 routes must fall back to '+9 routes' count"
+# Default route by value, non-default as count
+assert_contains "$LAST_LINE" "+dflt via 10.99.0.254" \
+    "scenario 5: default route must be shown by value '+dflt via 10.99.0.254'"
+# 3 new non-default routes (10.1, 10.2, 10.3) were added vs previous 0 non-default
+assert_matches "$LAST_LINE" '[+][0-9]+ route' \
+    "scenario 5: non-default routes must show count-only format"
 assert_not_contains "$LAST_LINE" "+rt " \
     "scenario 5: must not show individual '+rt' entries"
 
