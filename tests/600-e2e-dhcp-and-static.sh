@@ -12,34 +12,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=helpers.sh
 source "$SCRIPT_DIR/helpers.sh"
 
-NETFYR_BIN="${NETFYR_BIN:-$SCRIPT_DIR/../target/debug/netfyr}"
-NETFYR_DAEMON_BIN="${NETFYR_DAEMON_BIN:-$SCRIPT_DIR/../target/debug/netfyr-daemon}"
-
-if [[ ! -x "$NETFYR_BIN" ]]; then
-    echo "FAIL: 600-e2e-dhcp-and-static: netfyr binary not found at $NETFYR_BIN" >&2
-    exit 1
-fi
-if [[ ! -x "$NETFYR_DAEMON_BIN" ]]; then
-    echo "FAIL: 600-e2e-dhcp-and-static: netfyr-daemon binary not found at $NETFYR_DAEMON_BIN" >&2
-    exit 1
-fi
 if ! command -v dnsmasq >/dev/null 2>&1; then
     echo "FAIL: 600-e2e-dhcp-and-static: dnsmasq not found; install dnsmasq to run DHCP tests" >&2
     exit 1
 fi
 
+require_binaries
 netns_setup "$@"
-
-# ---------- Inside the namespace ----------
-
-TMPDIR_TEST=$(mktemp -d)
-DAEMON_PID=""
-trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
-
-SOCKET_PATH="$TMPDIR_TEST/netfyr.sock"
-POLICY_DIR="$TMPDIR_TEST/policies"
-JOURNAL_DIR="$TMPDIR_TEST/journal"
-mkdir -p "$POLICY_DIR" "$JOURNAL_DIR"
+daemon_test_setup
+setup_journal
 
 # Static interface pair.
 create_veth veth-static0 veth-static1
@@ -51,27 +32,7 @@ add_address veth-dhcp1 10.99.1.1/24
 # Start dnsmasq DHCP server on the server-side interface.
 start_dnsmasq veth-dhcp1 10.99.1.1 10.99.1.100 10.99.1.200 120
 
-# Start the daemon.
-NETFYR_SOCKET_PATH="$SOCKET_PATH" \
-NETFYR_POLICY_DIR="$POLICY_DIR" \
-NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
-    "$NETFYR_DAEMON_BIN" &
-DAEMON_PID=$!
-
-# Poll for daemon socket (up to 5 seconds).
-SOCKET_WAIT=0
-while [[ ! -S "$SOCKET_PATH" ]]; do
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-        echo "FAIL: 600-e2e-dhcp-and-static: daemon exited before socket appeared" >&2
-        exit 1
-    fi
-    if (( SOCKET_WAIT >= 50 )); then
-        echo "FAIL: 600-e2e-dhcp-and-static: daemon socket did not appear within 5 seconds" >&2
-        exit 1
-    fi
-    sleep 0.1
-    (( SOCKET_WAIT++ )) || true
-done
+start_daemon
 
 # Write two policy files: static for veth-static0 and DHCPv4 for veth-dhcp0.
 APPLY_DIR="$TMPDIR_TEST/apply-policies"
@@ -100,7 +61,7 @@ EOF
 
 # Apply both policies atomically from the directory.
 APPLY_EXIT=0
-NETFYR_SOCKET_PATH="$SOCKET_PATH" "$NETFYR_BIN" apply "$APPLY_DIR/" || APPLY_EXIT=$?
+"$NETFYR_BIN" apply "$APPLY_DIR/" || APPLY_EXIT=$?
 if [[ $APPLY_EXIT -ne 0 ]]; then
     echo "FAIL: 600-e2e-dhcp-and-static: netfyr apply exited with code $APPLY_EXIT" >&2
     exit 1
@@ -120,10 +81,11 @@ assert_has_address veth-dhcp0 "10.99.1."
 assert_not_has_address veth-dhcp0 "10.99.0."
 assert_not_has_address veth-static0 "10.99.1."
 
+# Give daemon time to finish reconciliation and journal writes.
+sleep 2
+
 # Verify the DHCP lease event was recorded in the journal with trigger "dhcp-acquire".
-HISTORY_OUTPUT=$(NETFYR_SOCKET_PATH="$SOCKET_PATH" \
-    NETFYR_JOURNAL_DIR="$JOURNAL_DIR" \
-    "$NETFYR_BIN" history -n 10 2>&1)
+HISTORY_OUTPUT=$(NO_COLOR=1 "$NETFYR_BIN" history -n 5 2>&1)
 if ! echo "$HISTORY_OUTPUT" | grep -qF "dhcp-acquire"; then
     echo "FAIL: 600-e2e-dhcp-and-static: history does not contain dhcp-acquire trigger" >&2
     echo "      output: $HISTORY_OUTPUT" >&2
