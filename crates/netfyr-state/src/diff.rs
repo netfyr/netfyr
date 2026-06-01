@@ -445,22 +445,23 @@ mod tests {
         assert!(!result.is_empty());
     }
 
-    /// DHCP map address vs kernel string address produces no diff when CIDRs match.
+    /// DHCP map address vs kernel IpNetwork address produces no diff when CIDRs match.
     #[test]
-    fn test_diff_dhcp_map_address_vs_kernel_string_no_diff() {
+    fn test_diff_dhcp_map_address_vs_kernel_ipnetwork_no_diff() {
         let mut from = StateSet::new();
-        // Kernel query produces string addresses
+        // Kernel query produces IpNetwork addresses
+        let net: ipnetwork::IpNetwork = "10.0.1.50/24".parse().unwrap();
         from.insert(make_state(
             "ethernet",
             "eth0",
-            vec![("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())]))],
+            vec![("addresses", Value::List(vec![Value::IpNetwork(net)]))],
             100,
         ));
 
         let mut to = StateSet::new();
         // DHCP factory produces map addresses with lifetime
         let mut addr_map = IndexMap::new();
-        addr_map.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        addr_map.insert("address".to_string(), Value::IpNetwork("10.0.1.50/24".parse().unwrap()));
         addr_map.insert("valid_lft".to_string(), Value::U64(3600));
         addr_map.insert("preferred_lft".to_string(), Value::U64(3600));
         to.insert(make_state(
@@ -471,23 +472,23 @@ mod tests {
         ));
 
         let result = diff(&from, &to, &SchemaRegistry::new());
-        assert!(result.is_empty(), "DHCP map address with same CIDR as kernel string should produce no diff");
+        assert!(result.is_empty(), "DHCP map address with same CIDR as kernel IpNetwork should produce no diff");
     }
 
-    /// DHCP map address vs kernel string address produces Modify when CIDRs differ.
+    /// DHCP map address vs kernel IpNetwork address produces Modify when CIDRs differ.
     #[test]
-    fn test_diff_dhcp_map_address_vs_kernel_string_different_cidr() {
+    fn test_diff_dhcp_map_address_vs_kernel_ipnetwork_different_cidr() {
         let mut from = StateSet::new();
         from.insert(make_state(
             "ethernet",
             "eth0",
-            vec![("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())]))],
+            vec![("addresses", Value::List(vec![Value::IpNetwork("10.0.1.50/24".parse().unwrap())]))],
             100,
         ));
 
         let mut to = StateSet::new();
         let mut addr_map = IndexMap::new();
-        addr_map.insert("address".to_string(), Value::String("10.0.1.51/24".to_string()));
+        addr_map.insert("address".to_string(), Value::IpNetwork("10.0.1.51/24".parse().unwrap()));
         addr_map.insert("valid_lft".to_string(), Value::U64(3600));
         to.insert(make_state(
             "ethernet",

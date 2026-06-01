@@ -94,10 +94,17 @@ pub fn values_eq_for_field(a: &Value, b: &Value, comparison_keys: &[String]) -> 
 fn item_eq(a: &Value, b: &Value, comparison_keys: &[String]) -> bool {
     match (a, b) {
         (Value::Map(ma), Value::Map(mb)) => {
-            comparison_keys.iter().all(|k| ma.get(k) == mb.get(k))
+            comparison_keys.iter().all(|k| match (ma.get(k), mb.get(k)) {
+                (Some(va), Some(vb)) => va == vb || va.to_string() == vb.to_string(),
+                (None, None) => true,
+                _ => false,
+            })
         }
-        (Value::Map(m), Value::String(s)) | (Value::String(s), Value::Map(m)) => {
-            comparison_keys.first().and_then(|k| m.get(k).and_then(Value::as_str)) == Some(s.as_str())
+        (Value::Map(m), other) | (other, Value::Map(m)) => {
+            comparison_keys.first()
+                .and_then(|k| m.get(k))
+                .map(|v| v == other || v.to_string() == other.to_string())
+                .unwrap_or(false)
         }
         _ => a == b,
     }
@@ -1041,5 +1048,37 @@ mod tests {
         let a = Value::U64(1500);
         let b = Value::U64(1500);
         assert!(values_eq_for_field(&a, &b, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_map_vs_ipnetwork_matches_on_comparison_key() {
+        let keys = vec!["address".to_string()];
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::IpNetwork("10.0.1.50/24".parse().unwrap()));
+        m.insert("valid_lft".to_string(), Value::U64(3600));
+        let map_val = Value::List(vec![Value::Map(m)]);
+        let net_val = Value::List(vec![Value::IpNetwork("10.0.1.50/24".parse().unwrap())]);
+        assert!(values_eq_for_field(&map_val, &net_val, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_map_with_string_key_vs_ipnetwork_matches() {
+        let keys = vec!["address".to_string()];
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::String("10.0.1.50/24".to_string()));
+        m.insert("valid_lft".to_string(), Value::U64(3600));
+        let map_val = Value::List(vec![Value::Map(m)]);
+        let net_val = Value::List(vec![Value::IpNetwork("10.0.1.50/24".parse().unwrap())]);
+        assert!(values_eq_for_field(&map_val, &net_val, &keys));
+    }
+
+    #[test]
+    fn test_values_eq_map_vs_ipnetwork_mismatch() {
+        let keys = vec!["address".to_string()];
+        let mut m = IndexMap::new();
+        m.insert("address".to_string(), Value::IpNetwork("10.0.1.51/24".parse().unwrap()));
+        let map_val = Value::List(vec![Value::Map(m)]);
+        let net_val = Value::List(vec![Value::IpNetwork("10.0.1.50/24".parse().unwrap())]);
+        assert!(!values_eq_for_field(&map_val, &net_val, &keys));
     }
 }
