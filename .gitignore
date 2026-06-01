@@ -1,3 +1,4 @@
 /target
 /vendor
 /.factory/
+.claude/settings.local.json
