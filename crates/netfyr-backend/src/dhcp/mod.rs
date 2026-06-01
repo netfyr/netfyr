@@ -15,6 +15,8 @@ use std::time::Instant;
 use futures::TryStreamExt;
 use rtnetlink::new_connection;
 
+use std::net::IpAddr;
+
 use indexmap::IndexMap;
 use netfyr_state::{entity_types::ETHERNET, FieldValue, Provenance, Selector, State, StateMetadata, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -234,10 +236,14 @@ pub fn lease_to_state(
     // Interface must stay up — this is always present regardless of lease options.
     fields.insert("enabled".to_string(), fv(Value::Bool(true)));
 
-    // Addresses field: [{address: "ip/prefix", valid_lft: N, preferred_lft: N}]
+    // Addresses field: [{address: ip/prefix, valid_lft: N, preferred_lft: N}]
+    // The address value uses Value::IpNetwork to match the format produced by
+    // the kernel query layer (dump_addresses), so the diff engine's
+    // comparison_keys lookup considers them equal when only lifetimes differ.
     let cidr = format!("{}/{}", lease.ip, lease.subnet_mask_to_prefix());
+    let addr_net: ipnetwork::IpNetwork = cidr.parse().expect("valid CIDR from DHCP lease");
     let mut addr_map = IndexMap::new();
-    addr_map.insert("address".to_string(), Value::String(cidr));
+    addr_map.insert("address".to_string(), Value::IpNetwork(addr_net));
     addr_map.insert("valid_lft".to_string(), Value::U64(lease.lease_time as u64));
     addr_map.insert("preferred_lft".to_string(), Value::U64(lease.lease_time as u64));
     fields.insert(
@@ -245,21 +251,19 @@ pub fn lease_to_state(
         fv(Value::List(vec![Value::Map(addr_map)])),
     );
 
-    // Routes field: [{destination: "0.0.0.0/0", gateway: "gw_ip", metric: 100}]
-    // The metric field must be present to match the format produced by the
-    // query layer (build_route_value). Without it, the diff engine sees two
-    // different route objects for the same destination and generates a
-    // simultaneous add+remove — the add is skipped (EEXIST) and the remove
-    // succeeds, deleting the default route.
+    // Routes field: [{destination: 0.0.0.0/0, gateway: gw_ip, metric: 100}]
+    // Value types (IpNetwork, IpAddr) must match the format produced by the
+    // kernel query layer (build_route_value). Without matching types, the diff
+    // engine's PartialEq comparison treats identical routes as different.
     if let Some(gateway) = lease.gateway {
         let mut route_map = IndexMap::new();
         route_map.insert(
             "destination".to_string(),
-            Value::String("0.0.0.0/0".to_string()),
+            Value::IpNetwork("0.0.0.0/0".parse().expect("valid default route")),
         );
         route_map.insert(
             "gateway".to_string(),
-            Value::String(gateway.to_string()),
+            Value::IpAddr(IpAddr::V4(gateway)),
         );
         route_map.insert(
             "metric".to_string(),
@@ -383,8 +387,8 @@ mod tests {
         assert_eq!(addresses.len(), 1, "must have exactly one address");
         let addr_map = addresses[0].as_map().expect("address must be a map");
         assert_eq!(
-            addr_map.get("address").and_then(|v| v.as_str()),
-            Some("10.0.1.50/24"),
+            addr_map.get("address").map(|v| v.to_string()),
+            Some("10.0.1.50/24".to_string()),
             "address key must be formatted as ip/prefix"
         );
         assert_eq!(
@@ -420,13 +424,13 @@ mod tests {
         assert_eq!(
             route_map
                 .get("destination")
-                .and_then(Value::as_str),
-            Some("0.0.0.0/0"),
+                .map(|v| v.to_string()),
+            Some("0.0.0.0/0".to_string()),
             "default route destination must be 0.0.0.0/0"
         );
         assert_eq!(
-            route_map.get("gateway").and_then(Value::as_str),
-            Some("10.0.1.1"),
+            route_map.get("gateway").map(|v| v.to_string()),
+            Some("10.0.1.1".to_string()),
             "gateway must match lease gateway"
         );
         assert_eq!(
@@ -810,8 +814,8 @@ mod tests {
                 let addr_map = addresses[0].as_map()
                     .expect("LeaseAcquired address must be a map");
                 assert_eq!(
-                    addr_map.get("address").and_then(|v| v.as_str()),
-                    Some("10.0.1.50/24"),
+                    addr_map.get("address").map(|v| v.to_string()),
+                    Some("10.0.1.50/24".to_string()),
                     "LeaseAcquired address must include leased IP with correct prefix"
                 );
                 // Spec: "the produced State contains the default gateway route"
@@ -825,13 +829,13 @@ mod tests {
                 assert!(!routes.is_empty(), "routes must be non-empty");
                 let route_map = routes[0].as_map().expect("route must be a map");
                 assert_eq!(
-                    route_map.get("destination").and_then(Value::as_str),
-                    Some("0.0.0.0/0"),
+                    route_map.get("destination").map(|v| v.to_string()),
+                    Some("0.0.0.0/0".to_string()),
                     "default route destination must be 0.0.0.0/0"
                 );
                 assert_eq!(
-                    route_map.get("gateway").and_then(Value::as_str),
-                    Some("10.0.1.1"),
+                    route_map.get("gateway").map(|v| v.to_string()),
+                    Some("10.0.1.1".to_string()),
                     "default route gateway must match lease gateway"
                 );
                 assert_eq!(

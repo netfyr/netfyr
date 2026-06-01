@@ -294,10 +294,16 @@ impl Reconciler {
 
         let actual_state = self.backend_registry.query_all().await?;
 
+        // Strip IPv6 addresses and routes from the actual state before diff
+        // computation. Policies currently manage only IPv4; without filtering,
+        // kernel-assigned IPv6 items (link-local addresses, RA routes) appear
+        // as spurious removals in the diff and journal.
+        let actual_for_diff = filter_ipv6_list_items(&actual_state);
+
         // Compute the rich diff for journal recording.
         let reconcile_diff = generate_diff(
             &effective_state,
-            &actual_state,
+            &actual_for_diff,
             &managed_entities,
             &self.schema_registry,
         );
@@ -313,7 +319,7 @@ impl Reconciler {
         // Additionally, drop fields marked keep-when-absent that are not in the
         // desired state — these have a kernel default and should not be unset
         // just because no policy manages them.
-        let managed_actual = self.restrict_to_managed(&actual_state, &effective_state);
+        let managed_actual = self.restrict_to_managed(&actual_for_diff, &effective_state);
 
         let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state, &self.schema_registry);
         let state_diff = inject_dhcp_addresses(&trigger, policy_store, &effective_state, state_diff);
@@ -424,9 +430,10 @@ impl Reconciler {
         let conflicts = merged.conflicts;
 
         let actual_state = self.backend_registry.query_all().await?;
+        let actual_for_diff = filter_ipv6_list_items(&actual_state);
 
         let reconcile_diff =
-            generate_diff(&effective_state, &actual_state, &managed_entities, &self.schema_registry);
+            generate_diff(&effective_state, &actual_for_diff, &managed_entities, &self.schema_registry);
 
         Ok((reconcile_diff, conflicts))
     }
@@ -443,18 +450,19 @@ impl Reconciler {
         dry_run: bool,
     ) -> Result<RevertResult> {
         let actual_state = self.backend_registry.query_all().await?;
+        let actual_for_diff = filter_ipv6_list_items(&actual_state);
 
         let managed_entities: HashSet<EntityKey> = target_state.entities().into_iter().collect();
 
         let reconcile_diff = generate_diff(
             target_state,
-            &actual_state,
+            &actual_for_diff,
             &managed_entities,
             &self.schema_registry,
         );
 
         // Restrict actual state to only entities present in the target snapshot.
-        let managed_actual = self.restrict_to_managed(&actual_state, target_state);
+        let managed_actual = self.restrict_to_managed(&actual_for_diff, target_state);
 
         let state_diff = netfyr_state::diff::diff(&managed_actual, target_state, &self.schema_registry);
 
@@ -875,6 +883,51 @@ fn restrict_to_dhcp_trigger(
         .filter(|op| op.selector().name.as_deref() == Some(iface))
         .collect();
     netfyr_state::StateDiff::new(filtered_ops)
+}
+
+/// Return a copy of `set` with IPv6 items removed from the `addresses` and
+/// `routes` list fields.
+///
+/// Policies currently manage only IPv4. Without filtering, kernel-assigned
+/// IPv6 items (link-local addresses, RA-learned routes) appear in the actual
+/// state but not in the desired state, causing the diff engine to report
+/// spurious removals.
+fn filter_ipv6_list_items(set: &StateSet) -> StateSet {
+    use netfyr_state::Value;
+
+    fn is_ipv6(v: &Value) -> bool {
+        match v {
+            Value::IpNetwork(net) => net.is_ipv6(),
+            Value::IpAddr(ip) => ip.is_ipv6(),
+            Value::String(s) => s.contains(':') && !s.contains('.'),
+            Value::Map(m) => m.get("address").map(|a| is_ipv6(a)).unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    fn is_ipv6_route(v: &Value) -> bool {
+        match v {
+            Value::Map(m) => m.get("destination").map(|d| is_ipv6(d)).unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    let mut filtered = StateSet::new();
+    for state in set.iter() {
+        let mut s = state.clone();
+        if let Some(fv) = s.fields.get_mut("addresses") {
+            if let Value::List(ref mut addrs) = fv.value {
+                addrs.retain(|v| !is_ipv6(v));
+            }
+        }
+        if let Some(fv) = s.fields.get_mut("routes") {
+            if let Value::List(ref mut routes) = fv.value {
+                routes.retain(|v| !is_ipv6_route(v));
+            }
+        }
+        filtered.insert(s);
+    }
+    filtered
 }
 
 /// Return a copy of `set` with all `STABLE_FIELDS` removed from every state.
