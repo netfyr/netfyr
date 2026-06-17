@@ -507,7 +507,7 @@ async fn handle_revert(
         }
     };
 
-    let entry_timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+    let entry_timestamp = entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let target_state = match entry.state_after.to_state_set() {
         Ok(s) => s,

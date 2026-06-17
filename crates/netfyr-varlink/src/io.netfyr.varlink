@@ -30,7 +30,8 @@ type Selector (
     name: ?string,
     driver: ?string,
     mac: ?string,
-    pci_path: ?string
+    pci_path: ?string,
+    labels: ?[string]string
 )
 
 type StateDef (

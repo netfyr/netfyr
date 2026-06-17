@@ -1594,6 +1594,117 @@ mod tests {
 
     // ── Varlink interface file tests ─────────────────────────────────────────
 
+    /// Scenario: Interface definition file defines all 8 required methods.
+    ///
+    /// AC: "it defines 8 methods: SubmitPolicies, Query, DryRun, GetStatus,
+    ///       GetHistory, GetJournalEntry, Revert, GetShowInfo"
+    #[test]
+    fn test_varlink_interface_file_defines_all_8_required_methods() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let varlink_file = std::path::Path::new(manifest_dir)
+            .join("src")
+            .join("io.netfyr.varlink");
+
+        let content = std::fs::read_to_string(&varlink_file)
+            .expect("io.netfyr.varlink must exist and be readable");
+
+        let required_methods = [
+            "SubmitPolicies",
+            "Query",
+            "DryRun",
+            "GetStatus",
+            "GetHistory",
+            "GetJournalEntry",
+            "Revert",
+            "GetShowInfo",
+        ];
+        for method in &required_methods {
+            assert!(
+                content.contains(&format!("method {method}")),
+                "interface must define method '{method}' (AC: file defines 8 methods)"
+            );
+        }
+        // Count total method declarations to confirm exactly 8.
+        let method_count = content.lines().filter(|l| l.starts_with("method ")).count();
+        assert_eq!(
+            method_count, 8,
+            "interface must define exactly 8 methods, found {method_count}"
+        );
+    }
+
+    /// Scenario: Interface definition file defines all 5 required error types.
+    ///
+    /// AC: error types InvalidPolicy, BackendError, InternalError, EntryNotFound,
+    ///     PermissionDenied must all be present.
+    #[test]
+    fn test_varlink_interface_file_defines_all_5_error_types() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let varlink_file = std::path::Path::new(manifest_dir)
+            .join("src")
+            .join("io.netfyr.varlink");
+
+        let content = std::fs::read_to_string(&varlink_file)
+            .expect("io.netfyr.varlink must exist and be readable");
+
+        let required_errors = [
+            "InvalidPolicy",
+            "BackendError",
+            "InternalError",
+            "EntryNotFound",
+            "PermissionDenied",
+        ];
+        for error in &required_errors {
+            assert!(
+                content.contains(&format!("error {error}")),
+                "interface must define error '{error}'"
+            );
+        }
+    }
+
+    /// Scenario: Interface file SubmitPolicies method signature matches the spec.
+    ///
+    /// The method must take a `[]Policy` parameter and return an `ApplyReport`.
+    #[test]
+    fn test_varlink_interface_submit_policies_signature() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .expect("io.netfyr.varlink must be readable");
+
+        assert!(
+            content.contains("method SubmitPolicies(policies: []Policy) -> (report: ApplyReport)"),
+            "SubmitPolicies must accept []Policy and return ApplyReport"
+        );
+    }
+
+    /// Scenario: Interface file Revert method signature includes dry_run parameter.
+    ///
+    /// The Revert method must accept both `target_seq` and `dry_run` parameters
+    /// as specified in the authorization table (dry_run=false requires root).
+    #[test]
+    fn test_varlink_interface_revert_method_has_dry_run_parameter() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let content = std::fs::read_to_string(
+            std::path::Path::new(manifest_dir).join("src").join("io.netfyr.varlink"),
+        )
+        .expect("io.netfyr.varlink must be readable");
+
+        let revert_line = content
+            .lines()
+            .find(|l| l.starts_with("method Revert"))
+            .expect("Revert method must exist in the interface file");
+
+        assert!(
+            revert_line.contains("dry_run"),
+            "Revert method must have a 'dry_run' parameter; got: {revert_line}"
+        );
+        assert!(
+            revert_line.contains("target_seq"),
+            "Revert method must have a 'target_seq' parameter; got: {revert_line}"
+        );
+    }
+
     /// Interface definition file defines key composite types (Policy, Selector,
     /// ApplyReport, StateDiff, ShowInfo).
     #[test]
