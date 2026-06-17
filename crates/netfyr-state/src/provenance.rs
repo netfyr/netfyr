@@ -20,3 +20,110 @@ pub enum Provenance {
     /// Computed by netfyr (e.g., auto-calculated broadcast address).
     Derived { reason: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    // ── Scenario: All types serialize and deserialize with serde ─────────────
+
+    #[test]
+    fn test_provenance_user_configured_json_round_trip() {
+        let p = Provenance::UserConfigured {
+            policy_ref: "my-policy".to_string(),
+        };
+        let json = serde_json::to_string(&p).expect("must serialize");
+        let restored: Provenance = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(p, restored);
+    }
+
+    #[test]
+    fn test_provenance_kernel_default_json_round_trip() {
+        let p = Provenance::KernelDefault;
+        let json = serde_json::to_string(&p).expect("must serialize");
+        let restored: Provenance = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(p, restored);
+    }
+
+    #[test]
+    fn test_provenance_external_tool_json_round_trip() {
+        let ts = Utc::now();
+        let p = Provenance::ExternalTool {
+            tool: "iproute2".to_string(),
+            detected_at: ts,
+        };
+        let json = serde_json::to_string(&p).expect("must serialize");
+        let restored: Provenance = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(p, restored);
+    }
+
+    #[test]
+    fn test_provenance_derived_json_round_trip() {
+        let p = Provenance::Derived {
+            reason: "auto-broadcast".to_string(),
+        };
+        let json = serde_json::to_string(&p).expect("must serialize");
+        let restored: Provenance = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(p, restored);
+    }
+
+    // ── Verify internally-tagged serde representation ────────────────────────
+
+    #[test]
+    fn test_provenance_user_configured_has_source_tag() {
+        let p = Provenance::UserConfigured {
+            policy_ref: "bond0".to_string(),
+        };
+        let json = serde_json::to_string(&p).expect("must serialize");
+        assert!(
+            json.contains("\"source\""),
+            "Provenance must use 'source' as the tag key; got: {json}"
+        );
+        assert!(
+            json.contains("user_configured"),
+            "UserConfigured variant must serialize to 'user_configured'; got: {json}"
+        );
+        assert!(
+            json.contains("\"policy_ref\""),
+            "policy_ref field must be present; got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_provenance_kernel_default_has_source_tag() {
+        let p = Provenance::KernelDefault;
+        let json = serde_json::to_string(&p).expect("must serialize");
+        assert!(
+            json.contains("\"source\""),
+            "Provenance must use 'source' as the tag key; got: {json}"
+        );
+        assert!(
+            json.contains("kernel_default"),
+            "KernelDefault must serialize to 'kernel_default'; got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_provenance_external_tool_has_source_tag() {
+        let ts = Utc::now();
+        let p = Provenance::ExternalTool {
+            tool: "NetworkManager".to_string(),
+            detected_at: ts,
+        };
+        let json = serde_json::to_string(&p).expect("must serialize");
+        assert!(json.contains("external_tool"), "ExternalTool must serialize with 'external_tool'; got: {json}");
+        assert!(json.contains("\"tool\""), "tool field must appear; got: {json}");
+        assert!(json.contains("\"detected_at\""), "detected_at field must appear; got: {json}");
+    }
+
+    #[test]
+    fn test_provenance_derived_has_source_tag() {
+        let p = Provenance::Derived {
+            reason: "auto-broadcast".to_string(),
+        };
+        let json = serde_json::to_string(&p).expect("must serialize");
+        assert!(json.contains("derived"), "Derived must serialize with 'derived'; got: {json}");
+        assert!(json.contains("\"reason\""), "reason field must appear; got: {json}");
+    }
+}

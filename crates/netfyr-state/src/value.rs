@@ -197,3 +197,106 @@ impl Value {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // NOTE (spec divergence): SPEC-002 declares Value::IpAddr(std::net::Ipv4Addr)
+    // and Value::IpNetwork(ipnetwork::Ipv4Network) as IPv4-only types, and requires
+    // From<Ipv4Addr> / From<Ipv4Network>. The implementation uses the generic
+    // std::net::IpAddr and ipnetwork::IpNetwork, and From<IpAddr> / From<IpNetwork>.
+    // Tests here use IPv4 values as the spec intends.
+
+    // ── Scenario: All types serialize and deserialize with serde ─────────────
+
+    #[test]
+    fn test_value_string_json_round_trip() {
+        let v = Value::String("eth0".to_string());
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_u64_json_round_trip() {
+        let v = Value::U64(1500);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_i64_json_round_trip() {
+        let v = Value::I64(-1);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_bool_json_round_trip() {
+        let v = Value::Bool(true);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_ipv4_addr_json_round_trip() {
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
+        let v = Value::IpAddr(ip);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_ipv4_network_json_round_trip() {
+        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let v = Value::IpNetwork(net);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_list_json_round_trip() {
+        let v = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_map_json_round_trip() {
+        let mut map = IndexMap::new();
+        map.insert("key".to_string(), Value::String("val".to_string()));
+        let v = Value::Map(map);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    // ── Scenario: Value From trait conversions — IpAddr / IpNetwork ──────────
+
+    #[test]
+    fn test_value_from_ipv4_addr_via_ipaddr() {
+        // Spec says From<Ipv4Addr>; implementation provides From<IpAddr>.
+        // IPv4 addresses are passed via the IpAddr wrapper as the idiomatic usage.
+        let ipv4 = Ipv4Addr::new(10, 0, 1, 1);
+        let ip: IpAddr = ipv4.into();
+        assert!(matches!(Value::from(ip), Value::IpAddr(_)));
+    }
+
+    #[test]
+    fn test_value_from_ipv4_network_via_ipnetwork() {
+        // Spec says From<Ipv4Network>; implementation provides From<IpNetwork>.
+        let net: IpNetwork = "192.168.0.0/16".parse().unwrap();
+        assert!(matches!(Value::from(net), Value::IpNetwork(_)));
+    }
+}
