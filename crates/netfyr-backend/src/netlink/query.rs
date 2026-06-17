@@ -22,7 +22,7 @@ pub async fn establish_connection() -> Result<Handle, BackendError> {
                 BackendError::PermissionDenied(e.to_string())
             } else {
                 BackendError::QueryFailed {
-                    entity_type: "ethernet".to_string(),
+                    entity_type: "interface".to_string(),
                     source: Box::new(e),
                 }
             }

@@ -1,8 +1,12 @@
 #!/bin/bash
 # 102-query-routes.sh
 # Integration test: Query an ethernet interface and verify the "routes" field is
-# present in the output and contains the connected subnet route.
+# present in the output and contains a non-kernel static route.
 # Mapped to spec acceptance scenario: "Query ethernet interface includes routes".
+#
+# Note: the kernel-connected route (10.99.0.0/24, proto kernel) is intentionally
+# excluded per spec. An explicit static route (10.77.0.0/24, proto boot) is added
+# so the routes list is non-empty and the "destination" assertion can succeed.
 #
 # Usage:
 #   NETFYR_BIN=./target/debug/netfyr bash tests/102-query-routes.sh
@@ -26,9 +30,12 @@ netns_setup "$@"
 
 # Create a veth pair and configure an address on veth-test0.
 # Adding 10.99.0.1/24 automatically installs a connected route 10.99.0.0/24
-# via the kernel (proto kernel scope link).
+# via the kernel (proto kernel scope link) — that route is excluded by the implementation.
 create_veth veth-test0 veth-test1
 add_address veth-test0 10.99.0.1/24
+
+# Add an explicit static route that will survive the kernel-route filter.
+ip route add 10.77.0.0/24 dev veth-test0 scope link
 
 # Query the specific interface in daemon-free mode.
 output=$("$NETFYR_BIN" query \
@@ -43,10 +50,9 @@ if ! echo "$output" | grep -q '"routes"'; then
     exit 1
 fi
 
-# Assert: the connected subnet route for 10.99.0.0/24 appears in the routes list.
-# The kernel installs this route automatically when the address 10.99.0.1/24 is added.
-if ! echo "$output" | grep -q '10\.99\.0'; then
-    echo "FAIL: 102-query-routes: output does not contain the connected route 10.99.0.0/24" >&2
+# Assert: the static route 10.77.0.0/24 appears in the routes list.
+if ! echo "$output" | grep -q '10\.77\.0'; then
+    echo "FAIL: 102-query-routes: output does not contain the static route 10.77.0.0/24" >&2
     echo "Output: $output" >&2
     exit 1
 fi

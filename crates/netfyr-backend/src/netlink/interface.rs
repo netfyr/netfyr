@@ -1046,6 +1046,8 @@ pub async fn query_interfaces(
         carrier: Option<u8>,
         enabled: bool,
         detected_type: &'static str,
+        driver: Option<String>,
+        pci_path: Option<String>,
     }
 
     let mut candidate_links: Vec<LinkInfo2> = Vec::new();
@@ -1079,6 +1081,8 @@ pub async fn query_interfaces(
             carrier: extract_link_carrier(msg),
             enabled: extract_link_enabled(msg),
             detected_type: "", // filled in step 3
+            driver: None,      // filled in step 3
+            pci_path: None,    // filled in step 3
         });
     }
 
@@ -1096,6 +1100,7 @@ pub async fn query_interfaces(
 
         link.detected_type = detected_type;
 
+        // Cache sysfs reads here so step 7 can reuse them without a second syscall.
         let driver = read_sysfs_driver(&link.name);
         let pci_path = read_sysfs_pci_path(&link.name);
         let discovered = build_discovered_selector(
@@ -1112,6 +1117,8 @@ pub async fn query_interfaces(
             }
         }
 
+        link.driver = driver;
+        link.pci_path = pci_path;
         matched_links.push(link);
     }
 
@@ -1129,7 +1136,7 @@ pub async fn query_interfaces(
     let mut state_set = StateSet::new();
 
     for link in matched_links {
-        let driver = read_sysfs_driver(&link.name);
+        let driver = link.driver;
         let detected_type = link.detected_type;
 
         let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
