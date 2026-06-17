@@ -101,10 +101,17 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::{resolve_color_mode, ColorMode};
+    use std::sync::Mutex;
+
+    // The `colored` crate uses global state (`SHOULD_COLORIZE`) that all tests
+    // in this process share. Tests that read or write the override must hold
+    // this mutex so they don't race each other.
+    static COLOR_MUTEX: Mutex<()> = Mutex::new(());
 
     /// AC: Color mode "never" must not panic (smoke test for global override).
     #[test]
     fn test_resolve_color_mode_never_does_not_panic() {
+        let _g = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         resolve_color_mode(&ColorMode::Never);
         // Undo the global override so this test does not affect others.
         colored::control::unset_override();
@@ -113,6 +120,7 @@ mod tests {
     /// AC: Color mode "always" must not panic.
     #[test]
     fn test_resolve_color_mode_always_does_not_panic() {
+        let _g = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         resolve_color_mode(&ColorMode::Always);
         colored::control::unset_override();
     }
@@ -120,6 +128,7 @@ mod tests {
     /// AC: Color mode "auto" must not panic (uses TTY auto-detection, no override).
     #[test]
     fn test_resolve_color_mode_auto_does_not_panic() {
+        let _g = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         resolve_color_mode(&ColorMode::Auto);
         // Auto does not set an override, so nothing to undo.
     }
@@ -129,6 +138,7 @@ mod tests {
     /// Even with --color=always, NO_COLOR must force colors off.
     #[test]
     fn test_resolve_color_mode_no_color_env_var_disables_colors_even_with_always_flag() {
+        let _g = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Ensure NO_COLOR is absent initially.
         // SAFETY: single-threaded env manipulation guarded by test isolation.
         unsafe { std::env::remove_var("NO_COLOR") };
@@ -157,6 +167,7 @@ mod tests {
     /// AC: --color=never disables colors (colored string has no ANSI codes).
     #[test]
     fn test_resolve_color_mode_never_disables_colored_output() {
+        let _g = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Ensure NO_COLOR is absent so it does not interfere.
         unsafe { std::env::remove_var("NO_COLOR") };
         // Start with colors explicitly on so the test is meaningful.
@@ -179,6 +190,7 @@ mod tests {
     /// AC: --color=always enables colors (colored string has ANSI codes).
     #[test]
     fn test_resolve_color_mode_always_enables_colored_output() {
+        let _g = COLOR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Ensure NO_COLOR is absent so it does not interfere.
         unsafe { std::env::remove_var("NO_COLOR") };
         // Start with colors explicitly off so the test is meaningful.

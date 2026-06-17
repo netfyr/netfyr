@@ -1585,6 +1585,91 @@ mod tests {
         assert!(names.contains(&"eth2"), "eth2 must be in changed_entities");
     }
 
+    // ── Feature: is_applying flag after reconcile_and_apply ──────────────────
+
+    /// AC: is_applying is false after reconcile_and_apply completes.
+    ///
+    /// The spec requires the flag to be cleared at the end of reconcile_and_apply
+    /// so the netlink monitor resumes listening for external changes.
+    #[tokio::test]
+    async fn test_reconciler_is_not_applying_after_reconcile_and_apply_completes() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let _ = reconciler
+            .reconcile_and_apply(&store, &factory_manager, Trigger::DaemonStartup)
+            .await;
+        assert!(
+            !reconciler.is_applying(),
+            "is_applying must be false after reconcile_and_apply completes"
+        );
+    }
+
+    // ── Feature: Dry-run with non-empty store does not alter state ────────────
+
+    /// AC: "the current system state is unchanged" — dry_run with a static policy
+    /// for a nonexistent interface must not modify the number of system entities.
+    #[tokio::test]
+    async fn test_reconciler_dry_run_with_policy_does_not_alter_system_state() {
+        use netfyr_policy::parse_policy_yaml;
+        let reconciler = Reconciler::new();
+        let yaml = "kind: policy\nname: test\nfactory: static\npriority: 100\n\
+                    state:\n  type: ethernet\n  name: nonexistent-eth99\n  mtu: 1400\n";
+        let policies = parse_policy_yaml(yaml).unwrap();
+        let store = PolicyStore::ephemeral(policies);
+        let factory_manager = FactoryManager::new();
+
+        let before = reconciler.query(None, None).await.unwrap();
+        let _ = reconciler.dry_run(&store, &factory_manager).await.unwrap();
+        let after = reconciler.query(None, None).await.unwrap();
+
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "dry_run with a policy for a nonexistent interface must not change the \
+             number of system entities"
+        );
+    }
+
+    // ── Feature: Replace-all reflected in managed_entity_names ───────────────
+
+    /// AC: "Submit policies replaces entire set / reconciliation runs with only C and D"
+    ///
+    /// After replacing the policy store's policy set, managed_entity_names must
+    /// reflect only the new set — the old interfaces must not appear.
+    #[test]
+    fn test_managed_entity_names_changes_to_reflect_new_policy_set_after_replacement() {
+        use netfyr_policy::parse_policy_yaml;
+        let reconciler = Reconciler::new();
+        let fm = FactoryManager::new();
+
+        let yaml_a = "kind: policy\nname: p1\nfactory: static\npriority: 100\n\
+                      selector:\n  name: iface-old\nstate:\n  mtu: 1400\n";
+        let policies_a = parse_policy_yaml(yaml_a).unwrap();
+        let store_a = PolicyStore::ephemeral(policies_a);
+
+        let names_a = reconciler.managed_entity_names(&store_a, &fm);
+        assert!(
+            names_a.contains("iface-old"),
+            "iface-old must be managed under old policy set"
+        );
+
+        let yaml_b = "kind: policy\nname: p2\nfactory: static\npriority: 100\n\
+                      selector:\n  name: iface-new\nstate:\n  mtu: 1300\n";
+        let policies_b = parse_policy_yaml(yaml_b).unwrap();
+        let store_b = PolicyStore::ephemeral(policies_b);
+
+        let names_b = reconciler.managed_entity_names(&store_b, &fm);
+        assert!(
+            names_b.contains("iface-new"),
+            "iface-new must be managed under new policy set"
+        );
+        assert!(
+            !names_b.contains("iface-old"),
+            "iface-old must no longer be managed after policy replacement"
+        );
+    }
+
     // ── Feature: Stable fields excluded from external diffs (AC) ──────────────
     //
     // STABLE_FIELDS = ["name", "driver", "mac"]
