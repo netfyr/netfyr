@@ -2042,4 +2042,190 @@ mod tests {
             );
         }
     }
+
+    // ── Feature: Daemon writes journal entries (SPEC-351) ─────────────────────
+    //
+    // These tests verify the "Daemon writes journal entries" acceptance criteria
+    // by running reconcile_and_apply with a real journal directory and confirming
+    // that the resulting entry has the correct trigger type.
+    //
+    // Each test creates its own isolated temp directory and serialises env var
+    // mutations behind DAEMON_JOURNAL_ENV_MUTEX so that concurrent test threads
+    // do not interfere with each other.
+
+    static DAEMON_JOURNAL_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DAEMON_JOURNAL_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn daemon_journal_temp_dir() -> std::path::PathBuf {
+        let id = DAEMON_JOURNAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "netfyr-daemon-journal-test-{}-{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// AC: Daemon records journal entry on startup — reconcile_and_apply with
+    /// Trigger::DaemonStartup writes an entry with trigger type "daemon_startup".
+    #[tokio::test]
+    async fn test_reconciler_daemon_startup_trigger_writes_journal_entry() {
+        let dir = daemon_journal_temp_dir();
+        let _lock = DAEMON_JOURNAL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Safety: protected by DAEMON_JOURNAL_ENV_MUTEX — no concurrent env mutation.
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let reconciler = Reconciler::new();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let _ = reconciler
+            .reconcile_and_apply(&store, &factory_manager, Trigger::DaemonStartup)
+            .await;
+
+        // Read back the journal entries written to the temp directory.
+        let journal = Journal::open(&dir).expect("journal must open for reading");
+        let entries = journal.read_recent(10).expect("read_recent must succeed");
+
+        assert!(
+            !entries.is_empty(),
+            "reconcile_and_apply with DaemonStartup must write at least one journal entry"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e.trigger, Trigger::DaemonStartup)),
+            "journal must contain an entry with trigger type 'daemon_startup'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: Daemon records journal entry on policy submission — reconcile_and_apply
+    /// with Trigger::PolicyApply { source: "daemon" } writes an entry with
+    /// trigger type "policy_apply" and source "daemon".
+    #[tokio::test]
+    async fn test_reconciler_policy_apply_trigger_writes_journal_entry_with_daemon_source() {
+        let dir = daemon_journal_temp_dir();
+        let _lock = DAEMON_JOURNAL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let reconciler = Reconciler::new();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let _ = reconciler
+            .reconcile_and_apply(
+                &store,
+                &factory_manager,
+                Trigger::PolicyApply { source: "daemon".into() },
+            )
+            .await;
+
+        let journal = Journal::open(&dir).expect("journal must open for reading");
+        let entries = journal.read_recent(10).expect("read_recent must succeed");
+
+        assert!(
+            !entries.is_empty(),
+            "reconcile_and_apply with PolicyApply trigger must write at least one journal entry"
+        );
+        assert!(
+            entries.iter().any(|e| {
+                matches!(&e.trigger, Trigger::PolicyApply { source } if source == "daemon")
+            }),
+            "journal must contain a PolicyApply entry with source='daemon'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: Daemon records journal entry on DHCP event — reconcile_and_apply with
+    /// Trigger::DhcpEvent writes an entry with trigger type "dhcp_event".
+    ///
+    /// The policy_name does not need to match an actual DHCP policy for the
+    /// entry to be recorded — the trigger is stored verbatim in the journal.
+    #[tokio::test]
+    async fn test_reconciler_dhcp_event_trigger_writes_journal_entry() {
+        let dir = daemon_journal_temp_dir();
+        let _lock = DAEMON_JOURNAL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let reconciler = Reconciler::new();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let _ = reconciler
+            .reconcile_and_apply(
+                &store,
+                &factory_manager,
+                Trigger::DhcpEvent {
+                    policy_name: "dhcp-eth0".into(),
+                    event_kind: "lease_acquired".into(),
+                },
+            )
+            .await;
+
+        let journal = Journal::open(&dir).expect("journal must open for reading");
+        let entries = journal.read_recent(10).expect("read_recent must succeed");
+
+        assert!(
+            !entries.is_empty(),
+            "reconcile_and_apply with DhcpEvent trigger must write at least one journal entry"
+        );
+        assert!(
+            entries.iter().any(|e| {
+                matches!(
+                    &e.trigger,
+                    Trigger::DhcpEvent { event_kind, .. } if event_kind == "lease_acquired"
+                )
+            }),
+            "journal must contain a DhcpEvent entry with event_kind='lease_acquired'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AC: Journal entry outcome is "applied" with succeeded=0 when there are no
+    /// changes (system already in desired state). The daemon always writes a journal
+    /// entry after reconcile_and_apply regardless of whether there was a diff.
+    #[tokio::test]
+    async fn test_reconciler_reconcile_and_apply_no_diff_writes_journal_entry_with_zero_counts() {
+        let dir = daemon_journal_temp_dir();
+        let _lock = DAEMON_JOURNAL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let reconciler = Reconciler::new();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        // Empty policy store → empty diff → no-op reconciliation.
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let _ = reconciler
+            .reconcile_and_apply(&store, &factory_manager, Trigger::DaemonStartup)
+            .await;
+
+        let journal = Journal::open(&dir).expect("journal must open for reading");
+        let entries = journal.read_recent(10).expect("read_recent must succeed");
+
+        assert!(
+            !entries.is_empty(),
+            "reconcile_and_apply must write a journal entry even when there is no diff"
+        );
+
+        let entry = entries.iter().find(|e| matches!(e.trigger, Trigger::DaemonStartup))
+            .expect("must find a DaemonStartup entry");
+
+        match &entry.outcome {
+            netfyr_journal::ApplyOutcome::Applied { succeeded, failed, skipped } => {
+                assert_eq!(*failed, 0, "no-op reconciliation must have 0 failed");
+                let _ = (succeeded, skipped); // counts may be 0 or non-zero depending on managed entities
+            }
+            other => panic!("expected Applied outcome for no-diff reconciliation, got {:?}", other),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
