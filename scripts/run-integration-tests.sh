@@ -101,6 +101,7 @@ test_pids=""
 for script in $scripts; do
     name=$(basename "$script")
     (
+        set +e
         touch "$statusdir/running.$name"
         bash "$script" > "$logdir/$name.log" 2>&1
         rc=$?
