@@ -1102,11 +1102,6 @@ mod tests {
     // sub-mapping format: entity_type is always empty (determined by backend),
     // selector comes from a "selector:" sub-mapping, all other keys are fields.
     //
-    // NOTE: Several tests above this section test OLD flat-format behaviour
-    // (e.g., top-level "type:" → entity_type, top-level "name:" → selector).
-    // Those tests are for the previous implementation and are now incorrect for
-    // the current parse_yaml() function. They are left in place for the verify
-    // phase to reconcile.
 
     /// Scenario: Parse bare state with selector sub-mapping — returns one State
     #[test]
