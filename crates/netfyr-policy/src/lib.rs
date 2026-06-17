@@ -2043,16 +2043,11 @@ mod loader_tests {
         assert!(policy_set.is_empty());
     }
 
-    // ── SPEC-008: Bare state shorthand — selector sub-mapping format ───────────
+    // ── SPEC-008: Bare state shorthand — acceptance-criterion coverage ───────────
     //
-    // These tests exercise the SPEC-008 acceptance criteria using the NEW bare
-    // state format where `selector:` is a sub-mapping at the top level, and all
-    // other top-level keys (except `kind`) are state fields.
-    //
-    // The existing tests above this section use the OLD flat format (top-level
-    // `type:` and `name:` keys) which the current implementation rejects with
-    // LoaderError::MissingSelector. Those tests are left in place for the verify
-    // phase to reconcile.
+    // These tests provide one-to-one coverage of the SPEC-008 Gherkin acceptance
+    // criteria. Both this section and the loader_tests above use the selector
+    // sub-mapping format (`selector:` at top level, remaining keys as state fields).
 
     // ── Scenario: Single bare state file is wrapped into a policy ─────────────
 
