@@ -33,8 +33,9 @@ mtu: 1400
 EOF
 
 # Capture the exit code — expect non-zero (total failure = exit 2).
-"$NETFYR_BIN" apply "$POLICY_FILE" 2>&1
-EXIT_CODE=$?
+# Use || to prevent set -e from aborting the script before we check the code.
+EXIT_CODE=0
+"$NETFYR_BIN" apply "$POLICY_FILE" 2>&1 || EXIT_CODE=$?
 
 if [[ $EXIT_CODE -eq 0 ]]; then
     echo "FAIL: 103-apply-nonexistent-interface: expected non-zero exit code, got 0" >&2

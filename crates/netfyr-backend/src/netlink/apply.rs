@@ -1381,6 +1381,20 @@ fn make_field_failure(name: &str, error: BackendError, field: &str) -> FailedOpe
 mod tests {
     use super::*;
     use netfyr_state::{FieldValue, Provenance, Selector, StateMetadata, Value};
+    use rtnetlink::packet_core::ErrorMessage;
+    use std::num::NonZeroI32;
+
+    // ── Error helper ──────────────────────────────────────────────────────────
+
+    /// Build a `rtnetlink::Error::NetlinkError` carrying the given POSIX errno.
+    /// The kernel sends negative errno values; this function negates `errno` before
+    /// storing it in `ErrorMessage.code` to match kernel behaviour.
+    fn make_netlink_error(errno: i32) -> rtnetlink::Error {
+        // ErrorMessage is #[non_exhaustive], so we must use Default + field mutation.
+        let mut msg = ErrorMessage::default();
+        msg.code = NonZeroI32::new(-errno);
+        rtnetlink::Error::NetlinkError(msg)
+    }
 
     // ── Helper constructors ───────────────────────────────────────────────────
 
@@ -2361,6 +2375,176 @@ mod tests {
         assert!(
             find_route_message(&messages, dst, 24, None).is_none(),
             "find_route_message must not match when search has no gateway but message has one"
+        );
+    }
+
+    // ── extract_errno ─────────────────────────────────────────────────────────
+
+    /// Scenario: AC-7, AC-8, AC-9 — errno extraction from a NetlinkError.
+    /// extract_errno must return Some(errno) for a NetlinkError whose code
+    /// is the kernel-encoded negative errno.
+    #[test]
+    fn test_extract_errno_returns_some_for_netlink_error() {
+        let err = make_netlink_error(17); // EEXIST
+        assert_eq!(
+            extract_errno(&err),
+            Some(17),
+            "extract_errno must return Some(17) for EEXIST NetlinkError"
+        );
+    }
+
+    /// extract_errno must return None for non-NetlinkError variants (e.g. RequestFailed).
+    #[test]
+    fn test_extract_errno_returns_none_for_non_netlink_error() {
+        let err = rtnetlink::Error::RequestFailed;
+        assert_eq!(
+            extract_errno(&err),
+            None,
+            "extract_errno must return None for non-NetlinkError variants"
+        );
+    }
+
+    // ── is_eexist ─────────────────────────────────────────────────────────────
+
+    /// Scenario: AC-7 — Adding an already-existing address is idempotent.
+    /// is_eexist must return true when the kernel signals EEXIST (errno 17).
+    #[test]
+    fn test_is_eexist_returns_true_for_errno_17_eexist() {
+        let err = make_netlink_error(17);
+        assert!(
+            is_eexist(&err),
+            "is_eexist must return true for EEXIST (errno 17)"
+        );
+    }
+
+    /// is_eexist must return false for other errnos (e.g. ENOENT=2, EPERM=1).
+    #[test]
+    fn test_is_eexist_returns_false_for_other_errnos() {
+        for errno in [1, 2, 3, 13, 19, 99] {
+            let err = make_netlink_error(errno);
+            assert!(
+                !is_eexist(&err),
+                "is_eexist must return false for errno {errno}"
+            );
+        }
+    }
+
+    /// is_eexist must return false for non-NetlinkError variants.
+    #[test]
+    fn test_is_eexist_returns_false_for_non_netlink_error() {
+        let err = rtnetlink::Error::RequestFailed;
+        assert!(
+            !is_eexist(&err),
+            "is_eexist must return false for non-NetlinkError"
+        );
+    }
+
+    // ── is_not_found_error ────────────────────────────────────────────────────
+
+    /// Scenario: AC-8 — Removing a non-existent address is idempotent.
+    /// Scenario: AC-9 — Removing a non-existent route counts as success.
+    /// is_not_found_error must return true for all "already absent" errno values:
+    /// ENOENT=2, ESRCH=3, ENODEV=19, EADDRNOTAVAIL=99.
+    #[test]
+    fn test_is_not_found_error_returns_true_for_enoent() {
+        assert!(
+            is_not_found_error(&make_netlink_error(2)),
+            "is_not_found_error must return true for ENOENT (errno 2)"
+        );
+    }
+
+    #[test]
+    fn test_is_not_found_error_returns_true_for_esrch() {
+        assert!(
+            is_not_found_error(&make_netlink_error(3)),
+            "is_not_found_error must return true for ESRCH (errno 3)"
+        );
+    }
+
+    #[test]
+    fn test_is_not_found_error_returns_true_for_enodev() {
+        assert!(
+            is_not_found_error(&make_netlink_error(19)),
+            "is_not_found_error must return true for ENODEV (errno 19)"
+        );
+    }
+
+    #[test]
+    fn test_is_not_found_error_returns_true_for_eaddrnotavail() {
+        assert!(
+            is_not_found_error(&make_netlink_error(99)),
+            "is_not_found_error must return true for EADDRNOTAVAIL (errno 99)"
+        );
+    }
+
+    /// is_not_found_error must return false for EEXIST (errno 17).
+    #[test]
+    fn test_is_not_found_error_returns_false_for_eexist() {
+        assert!(
+            !is_not_found_error(&make_netlink_error(17)),
+            "is_not_found_error must return false for EEXIST (errno 17)"
+        );
+    }
+
+    /// is_not_found_error must return false for non-NetlinkError variants.
+    #[test]
+    fn test_is_not_found_error_returns_false_for_non_netlink_error() {
+        let err = rtnetlink::Error::RequestFailed;
+        assert!(
+            !is_not_found_error(&err),
+            "is_not_found_error must return false for non-NetlinkError"
+        );
+    }
+
+    // ── map_netlink_error ─────────────────────────────────────────────────────
+
+    /// EPERM (errno 1) must map to BackendError::PermissionDenied.
+    #[test]
+    fn test_map_netlink_error_eperm_gives_permission_denied() {
+        let err = map_netlink_error(make_netlink_error(1), "test op");
+        assert!(
+            matches!(err, BackendError::PermissionDenied(_)),
+            "EPERM must map to PermissionDenied; got {err:?}"
+        );
+    }
+
+    /// EACCES (errno 13) must map to BackendError::PermissionDenied.
+    #[test]
+    fn test_map_netlink_error_eacces_gives_permission_denied() {
+        let err = map_netlink_error(make_netlink_error(13), "test op");
+        assert!(
+            matches!(err, BackendError::PermissionDenied(_)),
+            "EACCES must map to PermissionDenied; got {err:?}"
+        );
+    }
+
+    /// ENODEV (errno 19) must map to BackendError::NotFound.
+    #[test]
+    fn test_map_netlink_error_enodev_gives_not_found() {
+        let err = map_netlink_error(make_netlink_error(19), "test op");
+        assert!(
+            matches!(err, BackendError::NotFound { .. }),
+            "ENODEV must map to NotFound; got {err:?}"
+        );
+    }
+
+    /// An unrecognised errno must fall through to BackendError::ApplyFailed.
+    #[test]
+    fn test_map_netlink_error_unknown_errno_gives_apply_failed() {
+        let err = map_netlink_error(make_netlink_error(42), "test op");
+        assert!(
+            matches!(err, BackendError::ApplyFailed { .. }),
+            "Unknown errno must map to ApplyFailed; got {err:?}"
+        );
+    }
+
+    /// A non-NetlinkError (no errno) must fall through to BackendError::ApplyFailed.
+    #[test]
+    fn test_map_netlink_error_non_netlink_error_gives_apply_failed() {
+        let err = map_netlink_error(rtnetlink::Error::RequestFailed, "test op");
+        assert!(
+            matches!(err, BackendError::ApplyFailed { .. }),
+            "Non-NetlinkError must map to ApplyFailed; got {err:?}"
         );
     }
 }

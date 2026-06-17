@@ -46,7 +46,7 @@ use netfyr_reconcile::{
 // Import the state-level diff function via its full module path to avoid the
 // name ambiguity between the `diff` module and the re-exported `diff` function.
 use netfyr_state::diff::diff as compute_state_diff;
-use netfyr_state::{SchemaRegistry, State, StateDiff as StateDiffState, StateSet};
+use netfyr_state::{schema::ValidationErrorKind, SchemaRegistry, State, StateDiff as StateDiffState, StateSet};
 use netfyr_varlink::{
     VarlinkApplyReport, VarlinkClient, VarlinkError, VarlinkPolicy, VarlinkStateDiff,
 };
@@ -347,6 +347,15 @@ fn validate_policies(policy_set: &PolicySet, schema: &SchemaRegistry) -> Result<
         for state in states {
             if let Err(errs) = schema.validate(state) {
                 for err in errs.errors() {
+                    // Bare-state YAML files have no entity type at load time;
+                    // the backend resolves it at query time. Skip this error
+                    // so that apply can proceed and report NotFound if the
+                    // interface does not exist.
+                    if err.kind == ValidationErrorKind::UnknownEntityType
+                        && state.entity_type.is_empty()
+                    {
+                        continue;
+                    }
                     all_errors.push(format!(
                         "policy '{}': field '{}': {}",
                         policy.name, err.field, err.message
