@@ -137,6 +137,34 @@ mod tests {
         );
     }
 
+    /// BackendError::QueryFailed display must include the entity type.
+    #[test]
+    fn test_backend_error_query_failed_display_contains_entity_type() {
+        let err = BackendError::QueryFailed {
+            entity_type: "ethernet".to_string(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "io error")),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ethernet"),
+            "QueryFailed display must contain the entity type; got: {msg}"
+        );
+    }
+
+    /// BackendError::ApplyFailed display must include the operation description.
+    #[test]
+    fn test_backend_error_apply_failed_display_contains_operation() {
+        let err = BackendError::ApplyFailed {
+            operation: "modify eth0".to_string(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "io error")),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("modify eth0"),
+            "ApplyFailed display must contain the operation; got: {msg}"
+        );
+    }
+
     /// BackendError variants are Debug-formattable (required by #[derive(Debug)]).
     #[test]
     fn test_backend_error_variants_are_debug_formattable() {
