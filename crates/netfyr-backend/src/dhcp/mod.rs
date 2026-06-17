@@ -1079,4 +1079,109 @@ mod tests {
         // The important invariant: no panic, no hang.
         let _ = next;
     }
+
+    // ── SPEC-408: DHCPv4 renewal stability ──────────────────────────────────
+
+    fn make_renewal_lease(ip: Ipv4Addr, lease_time: u32) -> DhcpLease {
+        DhcpLease {
+            ip,
+            subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Some(Ipv4Addr::new(10, 99, 0, 1)),
+            dns_servers: vec![],
+            lease_time,
+            renewal_time: lease_time / 2,
+            rebind_time: (lease_time * 7) / 8,
+            server_id: Ipv4Addr::new(10, 99, 0, 1),
+            acquired_at: Instant::now(),
+        }
+    }
+
+    /// SPEC-408 AC: Renewal with identical address and changed valid_lft
+    /// must compare equal under x-netfyr-comparison-keys=["address"].
+    ///
+    /// Verifies the full pipeline: lease_to_state → SchemaRegistry.comparison_keys
+    /// → values_eq_for_field produces true even when lease_time differs.
+    #[test]
+    fn test_dhcp_renewal_same_ip_no_diff_with_comparison_keys() {
+        use netfyr_state::{values_eq_for_field, SchemaRegistry};
+
+        let original = make_renewal_lease(Ipv4Addr::new(10, 99, 0, 100), 120);
+        let renewed = make_renewal_lease(Ipv4Addr::new(10, 99, 0, 100), 3600);
+
+        let original_state = lease_to_state(&original, "veth-dhcp0", "dhcp-policy", 100);
+        let renewed_state = lease_to_state(&renewed, "veth-dhcp0", "dhcp-policy", 100);
+
+        let schema = SchemaRegistry::new();
+        let keys = schema
+            .comparison_keys("ethernet", "addresses")
+            .expect("ethernet.addresses must have comparison keys");
+
+        assert!(
+            values_eq_for_field(
+                &original_state.fields["addresses"].value,
+                &renewed_state.fields["addresses"].value,
+                &keys,
+            ),
+            "Renewal with same IP must NOT produce an address diff even when valid_lft changes (SPEC-408)"
+        );
+    }
+
+    /// SPEC-408 AC: Renewal that changes the IP address must produce a diff.
+    ///
+    /// Confirms that x-netfyr-comparison-keys only suppresses lifetime changes;
+    /// an actual IP change still registers as unequal.
+    #[test]
+    fn test_dhcp_renewal_different_ip_produces_diff_with_comparison_keys() {
+        use netfyr_state::{values_eq_for_field, SchemaRegistry};
+
+        let original = make_renewal_lease(Ipv4Addr::new(10, 99, 0, 100), 120);
+        let changed_ip = make_renewal_lease(Ipv4Addr::new(10, 99, 0, 101), 120);
+
+        let original_state = lease_to_state(&original, "veth-dhcp0", "dhcp-policy", 100);
+        let changed_state = lease_to_state(&changed_ip, "veth-dhcp0", "dhcp-policy", 100);
+
+        let schema = SchemaRegistry::new();
+        let keys = schema
+            .comparison_keys("ethernet", "addresses")
+            .expect("ethernet.addresses must have comparison keys");
+
+        assert!(
+            !values_eq_for_field(
+                &original_state.fields["addresses"].value,
+                &changed_state.fields["addresses"].value,
+                &keys,
+            ),
+            "Renewal with changed IP must produce an address diff (SPEC-408)"
+        );
+    }
+
+    /// SPEC-408 AC: A lease renewal that only changes lease_time (→ valid_lft
+    /// and preferred_lft) and keeps the same IP must compare as equal.
+    ///
+    /// Validates the specific scenario where the server grants a longer (or
+    /// shorter) lease on renewal but the address assignment is unchanged.
+    #[test]
+    fn test_dhcp_renewal_changed_valid_lft_only_no_address_diff() {
+        use netfyr_state::{values_eq_for_field, SchemaRegistry};
+
+        let short_lease = make_renewal_lease(Ipv4Addr::new(10, 99, 0, 100), 120);
+        let long_lease = make_renewal_lease(Ipv4Addr::new(10, 99, 0, 100), 86400);
+
+        let short_state = lease_to_state(&short_lease, "veth-dhcp0", "dhcp-policy", 100);
+        let long_state = lease_to_state(&long_lease, "veth-dhcp0", "dhcp-policy", 100);
+
+        let schema = SchemaRegistry::new();
+        let keys = schema
+            .comparison_keys("ethernet", "addresses")
+            .expect("ethernet.addresses must have comparison keys");
+
+        assert!(
+            values_eq_for_field(
+                &short_state.fields["addresses"].value,
+                &long_state.fields["addresses"].value,
+                &keys,
+            ),
+            "Changed lease_time only must not produce an address diff (SPEC-408)"
+        );
+    }
 }
