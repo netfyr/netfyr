@@ -129,12 +129,6 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     // 4. Convert each policy into a PolicyInput for the reconciliation engine.
     let inputs = policies_to_inputs(&policy_set)?;
 
-    // Compute managed_entities before merge() consumes the inputs.
-    let managed_entities: HashSet<EntityKey> = inputs
-        .iter()
-        .flat_map(|input| input.state_set.entities())
-        .collect();
-
     // 5. Reconcile: merge all inputs into an effective state, detecting conflicts.
     let reconciliation = merge(inputs);
 
@@ -151,6 +145,35 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
         ..
     } = reconciliation;
     netfyr_state::normalize_route_defaults(&mut effective_state);
+
+    // Resolve empty entity types for bare-state YAML policies.
+    // Bare-state YAML files (no `kind:` field) parse with entity_type = "" because
+    // the shorthand format carries no entity type. After querying actual state we
+    // can resolve by matching the selector key. Interfaces not yet present in actual
+    // state (brand-new entities) default to "ethernet", which is the only entity
+    // type the bare-state shorthand is defined to represent.
+    {
+        let empty_keys: Vec<String> = effective_state
+            .iter()
+            .filter(|s| s.entity_type.is_empty())
+            .map(|s| s.selector.key())
+            .collect();
+
+        for key in empty_keys {
+            if let Some(mut state) = effective_state.remove("", &key) {
+                state.entity_type = actual_state
+                    .iter()
+                    .find(|a| a.selector.key() == key)
+                    .map(|a| a.entity_type.clone())
+                    .unwrap_or_else(|| "ethernet".to_string());
+                effective_state.insert(state);
+            }
+        }
+    }
+
+    // Derive managed_entities from effective_state after entity type resolution
+    // so that generate_diff and the managed_actual filter use correct types.
+    let managed_entities: HashSet<EntityKey> = effective_state.entities().into_iter().collect();
 
     // 7. Compute diffs:
     //    - reconcile diff: rich per-field diff for display (old→new values)
@@ -347,10 +370,10 @@ fn validate_policies(policy_set: &PolicySet, schema: &SchemaRegistry) -> Result<
         for state in states {
             if let Err(errs) = schema.validate(state) {
                 for err in errs.errors() {
-                    // Bare-state YAML files have no entity type at load time;
-                    // the backend resolves it at query time. Skip this error
-                    // so that apply can proceed and report NotFound if the
-                    // interface does not exist.
+                    // Bare-state YAML files have no entity type at parse time.
+                    // Entity type resolution happens later in run_apply() after
+                    // querying actual system state. Skip this validation error
+                    // so the apply can proceed.
                     if err.kind == ValidationErrorKind::UnknownEntityType
                         && state.entity_type.is_empty()
                     {

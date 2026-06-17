@@ -6,10 +6,7 @@
 #   1. Say "Applied 1 change" (singular, because only one entity is modified).
 #   2. Mention the changed entity and the field that changed.
 #   3. Exit with code 0.
-#
-# NOTE: The spec requires "Applied 1 change" (singular). The implementation
-# currently outputs "Applied 1 changes" (always plural), which is a bug the
-# verify phase should fix.
+
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=helpers.sh
@@ -66,6 +63,21 @@ fi
 # AC: the output must mention the changed field (mtu).
 if ! echo "$OUTPUT" | grep -q "mtu"; then
     echo "FAIL: 301-apply-change-output-text: output does not mention changed field 'mtu'" >&2
+    echo "      output: $OUTPUT" >&2
+    exit 1
+fi
+
+# AC: "the output shows 'mtu: 1500 -> 9000'" — both the old and new MTU values
+# must be visible so the user can see exactly what changed.
+# The veth default MTU is 1500; the policy sets 1400, so the old→new pair is
+# "1500 -> 1400". These values must both appear in the per-operation line.
+if ! echo "$OUTPUT" | grep -q "1500"; then
+    echo "FAIL: 301-apply-change-output-text: output does not show old value 1500" >&2
+    echo "      output: $OUTPUT" >&2
+    exit 1
+fi
+if ! echo "$OUTPUT" | grep -q "1400"; then
+    echo "FAIL: 301-apply-change-output-text: output does not show new value 1400" >&2
     echo "      output: $OUTPUT" >&2
     exit 1
 fi
