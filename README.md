@@ -172,7 +172,7 @@ Integration tests are shell scripts in `tests/` named `NNN-description.sh`. They
 
 ## Architecture
 
-The project is a Rust workspace with nine crates arranged in layers:
+The project is a Rust workspace with ten crates arranged in layers:
 
 | Crate | Role |
 |---|---|
@@ -185,6 +185,7 @@ The project is a Rust workspace with nine crates arranged in layers:
 | `netfyr-cli` | User-facing CLI binary (`netfyr`) with subcommands: `apply`, `query`, `history`, `revert`, `diagnose`, `show`, `completions` |
 | `netfyr-daemon` | Long-running daemon for dynamic factories (DHCPv4), Varlink server, systemd integration |
 | `netfyr-test-utils` | Shared test utilities (network namespace setup, dnsmasq helpers) |
+| `xtask` | Development automation (man page generation via `clap_mangen`) |
 
 Dependency flow: `netfyr-state` is the foundation. `netfyr-policy` and `netfyr-reconcile` depend on it. `netfyr-backend` depends on `netfyr-state`. `netfyr-journal` depends on `netfyr-state`. `netfyr-varlink` depends on all library crates. `netfyr-cli` and `netfyr-daemon` are the top-level binaries that wire everything together.
 

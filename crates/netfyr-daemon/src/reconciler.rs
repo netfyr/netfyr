@@ -900,14 +900,14 @@ fn filter_ipv6_list_items(set: &StateSet) -> StateSet {
             Value::IpNetwork(net) => net.is_ipv6(),
             Value::IpAddr(ip) => ip.is_ipv6(),
             Value::String(s) => s.contains(':') && !s.contains('.'),
-            Value::Map(m) => m.get("address").map(|a| is_ipv6(a)).unwrap_or(false),
+            Value::Map(m) => m.get("address").map(is_ipv6).unwrap_or(false),
             _ => false,
         }
     }
 
     fn is_ipv6_route(v: &Value) -> bool {
         match v {
-            Value::Map(m) => m.get("destination").map(|d| is_ipv6(d)).unwrap_or(false),
+            Value::Map(m) => m.get("destination").map(is_ipv6).unwrap_or(false),
             _ => false,
         }
     }

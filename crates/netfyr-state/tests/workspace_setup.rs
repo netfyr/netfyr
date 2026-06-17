@@ -320,9 +320,9 @@ fn test_workspace_uses_resolver_2() {
 // Scenario: CLI crate produces a binary that prints "netfyr"
 // ---------------------------------------------------------------------------
 
-/// AC: running `netfyr-cli` with no arguments prints help containing "netfyr" to stderr.
+/// AC: running `netfyr-cli` with no arguments prints "netfyr" to stdout.
 ///
-/// SPEC-301: clap SubcommandRequiredElseHelp writes help to stderr when no subcommand is given.
+/// SPEC-001: the stub binary prints "netfyr" to stdout (per acceptance criteria).
 ///
 /// Requires `cargo build -p netfyr-cli` to have run first.
 #[test]
@@ -345,12 +345,12 @@ fn test_cli_binary_prints_netfyr_with_no_args() {
         .output()
         .unwrap_or_else(|e| panic!("Failed to run netfyr-cli: {}", e));
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        stderr.contains("netfyr"),
-        "netfyr-cli with no arguments must print 'netfyr' to stderr, got: {:?}",
-        stderr
+        stdout.contains("netfyr"),
+        "netfyr-cli with no arguments must print 'netfyr' to stdout, got: {:?}",
+        stdout
     );
 }
 

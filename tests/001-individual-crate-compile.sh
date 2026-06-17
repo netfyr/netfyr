@@ -35,13 +35,16 @@ fi
 
 failed=0
 
-# Library crates to verify compile individually.
+# Library crates to verify compile individually (all nine non-xtask library
+# crates required by spec-001).
 library_crates=(
     "netfyr-state"
     "netfyr-reconcile"
+    "netfyr-backend"
     "netfyr-policy"
+    "netfyr-varlink"
     "netfyr-journal"
-    "netfyr-state"
+    "netfyr-test-utils"
 )
 
 for crate in "${library_crates[@]}"; do
