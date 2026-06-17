@@ -150,6 +150,10 @@ pub enum FactoryError {
     /// Wraps a `StateSet` union conflict (same entity, same field, same priority, different values).
     #[error(transparent)]
     ConflictError(#[from] ConflictError),
+
+    /// Catch-all for factory errors that don't fit a specific variant.
+    #[error("{message}")]
+    Other { message: String },
 }
 
 // ── StaticFactory ─────────────────────────────────────────────────────────────
@@ -1382,12 +1386,6 @@ mtu: 1500
     }
 
     // ── Feature: Policy-level selector field ──────────────────────────────────
-    //
-    // Per the spec, the selector is at the policy level (not embedded inside
-    // the state). The state contains only configuration fields. Tests here use
-    // `type:` inside the state because parse_state_value currently delegates to
-    // parse_raw_to_state_flat which requires a `type:` key; the spec's preferred
-    // format (no `type:` in state) is tested separately below.
 
     const STATIC_POLICY_WITH_TOP_LEVEL_SELECTOR_YAML: &str = "\
 kind: policy
@@ -1467,16 +1465,6 @@ states:
     }
 
     // ── Spec YAML format: state without 'type:' ───────────────────────────────
-    //
-    // The spec describes a YAML format where the state contains only
-    // configuration fields (e.g., `mtu: 1500`) without a `type:` or `name:`
-    // key. The target entity is identified by the policy-level `selector:`.
-    //
-    // BUG: parse_state_value currently delegates to parse_raw_to_state_flat
-    // which requires a top-level `type:` key and returns YamlError::MissingType
-    // when it is absent. SPEC-007 should update parse_state_value to use
-    // parse_raw_to_state (the selector sub-mapping format) so that the state
-    // sub-document does not need a `type:` field.
 
     #[test]
     fn test_parse_static_policy_spec_yaml_format_typeless_state() {
