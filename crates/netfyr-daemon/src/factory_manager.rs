@@ -463,6 +463,28 @@ mod tests {
         );
     }
 
+    /// After a DHCPv4 factory fails to start, produced_states() and
+    /// factory_statuses() must both be empty — no phantom factory state leaks
+    /// into the reconciliation pipeline.
+    #[tokio::test]
+    async fn test_produced_states_and_statuses_empty_after_dhcp_factory_start_fails() {
+        let mut mgr = FactoryManager::new();
+        let policies = vec![make_dhcp_policy_with_interface(
+            "dhcp-eth99999",
+            "eth99999-nonexistent-iface",
+        )];
+        // sync() succeeds at the Result level but reports the factory in the failed list.
+        let _ = mgr.sync(&policies).await;
+        assert!(
+            mgr.produced_states().is_empty(),
+            "produced_states must be empty when the DHCPv4 factory failed to start"
+        );
+        assert!(
+            mgr.factory_statuses().is_empty(),
+            "factory_statuses must be empty when the DHCPv4 factory failed to start"
+        );
+    }
+
     // ── Feature: Stop all factories ────────────────────────────────────────────
 
     /// Scenario: stop_all on empty FactoryManager succeeds.
@@ -505,5 +527,89 @@ mod tests {
             mgr.produced_states().is_empty(),
             "no factories → no produced states"
         );
+    }
+
+    // ── Feature: SPEC-407 — DHCPv4 lease expiry handling ─────────────────────
+
+    /// Scenario: "the produced state reverts to the pending state with only enabled: true"
+    ///
+    /// When a factory is in pending state (before initial lease or after
+    /// LeaseExpired), produced_states() must include a state with only
+    /// enabled=true — no addresses, routes, or dns_servers. This lets the
+    /// reconciler compute a diff that removes any previously applied address.
+    #[tokio::test]
+    async fn test_produced_states_includes_pending_state_with_no_addresses() {
+        let mut mgr = FactoryManager::new();
+        // Loopback always exists on Linux; DHCP discovery never succeeds on it.
+        // The factory enters pending state immediately (enabled=true, no addresses).
+        let policies = vec![make_dhcp_policy_with_interface("dhcp-lo-spec407a", "lo")];
+        mgr.sync(&policies).await.unwrap();
+
+        let states = mgr.produced_states();
+        assert!(
+            !states.is_empty(),
+            "produced_states must include the running factory's state even in pending mode"
+        );
+
+        let (_, state) = states
+            .into_iter()
+            .find(|(name, _)| name == "dhcp-lo-spec407a")
+            .expect("pending state for dhcp-lo-spec407a must be in produced_states");
+
+        assert_eq!(
+            state.fields.get("enabled").and_then(|fv| fv.value.as_bool()),
+            Some(true),
+            "pending state must have enabled=true so the interface stays UP during re-discovery"
+        );
+        assert!(
+            state.fields.get("addresses").is_none(),
+            "pending state must not have 'addresses' — reconciler will Remove any existing address"
+        );
+        assert!(
+            state.fields.get("routes").is_none(),
+            "pending state must not have 'routes' — reconciler will Remove the expired gateway route"
+        );
+
+        mgr.stop_all().await.unwrap();
+    }
+
+    /// Scenario: GetStatus shows has_lease=false when factory is in pending state.
+    ///
+    /// After LeaseExpired, the factory's current_state() contains only
+    /// enabled=true (no "addresses" field). factory_statuses() must reflect
+    /// this as has_lease=false, communicating that no lease is currently held.
+    #[tokio::test]
+    async fn test_factory_statuses_reports_has_lease_false_in_pending_state() {
+        let mut mgr = FactoryManager::new();
+        let policies = vec![make_dhcp_policy_with_interface("dhcp-lo-spec407b", "lo")];
+        mgr.sync(&policies).await.unwrap();
+
+        let statuses = mgr.factory_statuses();
+        assert!(!statuses.is_empty(), "factory_statuses must include the running factory");
+
+        let status = statuses
+            .into_iter()
+            .find(|s| s.interface == "lo")
+            .expect("factory status for the 'lo' interface must be present");
+
+        assert!(
+            !status.has_lease,
+            "factory in pending state (after LeaseExpired or before initial lease) \
+             must report has_lease=false — the 'addresses' field is absent"
+        );
+        assert!(
+            status.lease_ip.is_none(),
+            "factory in pending state must have no lease_ip"
+        );
+        assert!(
+            status.lease_address.is_none(),
+            "factory in pending state must have no lease_address"
+        );
+        assert!(
+            status.lease_time_secs.is_none(),
+            "factory in pending state must have no lease_time_secs"
+        );
+
+        mgr.stop_all().await.unwrap();
     }
 }

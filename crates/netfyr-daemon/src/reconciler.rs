@@ -1017,7 +1017,8 @@ mod tests {
     use super::*;
     use crate::factory_manager::FactoryManager;
     use crate::policy_store::PolicyStore;
-    use netfyr_state::{FieldValue, Provenance, State, StateMetadata, Value};
+    use netfyr_policy::{FactoryType, Policy};
+    use netfyr_state::{DiffOp, FieldValue, Provenance, Selector, State, StateMetadata, Value};
 
     // ── Feature: Reconciler initialization ────────────────────────────────────
 
@@ -2227,5 +2228,273 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Feature: SPEC-407 — DHCPv4 lease expiry handling ─────────────────────
+
+    // Helper: build a DHCPv4 policy with a named interface selector.
+    fn make_dhcp_policy(name: &str, interface: &str) -> Policy {
+        Policy {
+            name: name.to_string(),
+            factory_type: FactoryType::Dhcpv4,
+            priority: 100,
+            state: None,
+            states: None,
+            selector: Some(Selector::with_name(interface)),
+        }
+    }
+
+    // Helper: build a minimal Remove DiffOp for a named ethernet interface.
+    fn make_remove_op(iface: &str) -> DiffOp {
+        DiffOp::Remove {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name(iface),
+        }
+    }
+
+    /// dhcp_trigger_interface returns the interface name for a DhcpEvent whose
+    /// policy_name matches a DHCPv4 policy in the store.
+    #[test]
+    fn test_dhcp_trigger_interface_resolves_interface_from_policy() {
+        let store = PolicyStore::ephemeral(vec![make_dhcp_policy("my-dhcp", "veth-test")]);
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "my-dhcp".into(),
+            event_kind: "lease_expired".into(),
+        };
+        let result = dhcp_trigger_interface(&trigger, &store);
+        assert_eq!(
+            result,
+            Some("veth-test"),
+            "dhcp_trigger_interface must return the interface name from the matching policy"
+        );
+    }
+
+    /// dhcp_trigger_interface returns None for a non-DHCP trigger.
+    #[test]
+    fn test_dhcp_trigger_interface_returns_none_for_non_dhcp_trigger() {
+        let store = PolicyStore::ephemeral(vec![make_dhcp_policy("my-dhcp", "veth-test")]);
+        let result = dhcp_trigger_interface(&Trigger::DaemonStartup, &store);
+        assert!(
+            result.is_none(),
+            "dhcp_trigger_interface must return None for a non-DHCP trigger"
+        );
+    }
+
+    /// dhcp_trigger_interface returns None when the policy_name matches no policy.
+    #[test]
+    fn test_dhcp_trigger_interface_returns_none_for_unknown_policy() {
+        let store = PolicyStore::ephemeral(vec![make_dhcp_policy("my-dhcp", "veth-test")]);
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "no-such-policy".into(),
+            event_kind: "lease_expired".into(),
+        };
+        let result = dhcp_trigger_interface(&trigger, &store);
+        assert!(
+            result.is_none(),
+            "dhcp_trigger_interface must return None when policy_name does not match any policy"
+        );
+    }
+
+    /// restrict_to_dhcp_trigger keeps only the op for the triggering interface.
+    #[test]
+    fn test_restrict_to_dhcp_trigger_filters_ops_to_matching_interface() {
+        let store = PolicyStore::ephemeral(vec![make_dhcp_policy("dhcp-a", "veth-a")]);
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "dhcp-a".into(),
+            event_kind: "lease_expired".into(),
+        };
+        let diff = netfyr_state::StateDiff::new(vec![
+            make_remove_op("veth-a"),
+            make_remove_op("veth-b"),
+        ]);
+        let filtered = restrict_to_dhcp_trigger(&trigger, &store, diff);
+        assert_eq!(
+            filtered.ops().len(),
+            1,
+            "restrict_to_dhcp_trigger must keep exactly one op (for veth-a)"
+        );
+        assert_eq!(
+            filtered.ops()[0].selector().name.as_deref(),
+            Some("veth-a"),
+            "the remaining op must be for veth-a"
+        );
+    }
+
+    /// restrict_to_dhcp_trigger passes the full diff through for non-DHCP triggers.
+    #[test]
+    fn test_restrict_to_dhcp_trigger_returns_full_diff_for_non_dhcp_trigger() {
+        let store = PolicyStore::ephemeral(vec![make_dhcp_policy("dhcp-a", "veth-a")]);
+        let diff = netfyr_state::StateDiff::new(vec![
+            make_remove_op("veth-a"),
+            make_remove_op("veth-b"),
+        ]);
+        let filtered = restrict_to_dhcp_trigger(&Trigger::DaemonStartup, &store, diff);
+        assert_eq!(
+            filtered.ops().len(),
+            2,
+            "restrict_to_dhcp_trigger must pass through all ops for non-DHCP triggers"
+        );
+    }
+
+    /// reconcile_and_apply with a lease_expired trigger and empty store returns Ok.
+    #[tokio::test]
+    async fn test_reconcile_and_apply_with_lease_expired_trigger_and_empty_store() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let result = reconciler
+            .reconcile_and_apply(
+                &store,
+                &factory_manager,
+                Trigger::DhcpEvent {
+                    policy_name: "test-dhcp".into(),
+                    event_kind: "lease_expired".into(),
+                },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "reconcile_and_apply with lease_expired trigger and empty store must succeed: {:?}",
+            result.err()
+        );
+        let apply_result = result.unwrap();
+        assert!(
+            apply_result.conflicts.is_empty(),
+            "empty store must produce no conflicts"
+        );
+    }
+
+    /// reconcile_and_apply with a lease_expired trigger and a matching DHCPv4 policy
+    /// exercises the dhcp_trigger_interface and restrict_to_dhcp_trigger code paths.
+    #[tokio::test]
+    async fn test_reconcile_and_apply_with_lease_expired_trigger_and_dhcp_policy() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![make_dhcp_policy(
+            "dhcp-eth99",
+            "nonexistent-eth99",
+        )]);
+        let factory_manager = FactoryManager::new();
+        let result = reconciler
+            .reconcile_and_apply(
+                &store,
+                &factory_manager,
+                Trigger::DhcpEvent {
+                    policy_name: "dhcp-eth99".into(),
+                    event_kind: "lease_expired".into(),
+                },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "reconcile_and_apply with lease_expired trigger must succeed when factory has \
+             no produced state: {:?}",
+            result.err()
+        );
+        let apply_result = result.unwrap();
+        assert!(
+            apply_result.conflicts.is_empty(),
+            "no produced state → no conflicts"
+        );
+        assert!(
+            apply_result.report.is_success(),
+            "no diff → report must be success"
+        );
+    }
+
+    /// reconcile_and_apply with a lease_expired trigger writes a journal entry
+    /// with event_kind="lease_expired".
+    #[tokio::test]
+    async fn test_reconcile_and_apply_lease_expired_writes_journal_entry() {
+        let dir = daemon_journal_temp_dir();
+        let _lock = DAEMON_JOURNAL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe { std::env::set_var("NETFYR_JOURNAL_DIR", dir.to_str().unwrap()) };
+        let reconciler = Reconciler::new();
+        unsafe { std::env::remove_var("NETFYR_JOURNAL_DIR") };
+
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let _ = reconciler
+            .reconcile_and_apply(
+                &store,
+                &factory_manager,
+                Trigger::DhcpEvent {
+                    policy_name: "dhcp-eth0".into(),
+                    event_kind: "lease_expired".into(),
+                },
+            )
+            .await;
+
+        let journal = Journal::open(&dir).expect("journal must open for reading");
+        let entries = journal.read_recent(10).expect("read_recent must succeed");
+
+        assert!(
+            !entries.is_empty(),
+            "reconcile_and_apply with DhcpEvent (lease_expired) must write a journal entry"
+        );
+        assert!(
+            entries.iter().any(|e| {
+                matches!(
+                    &e.trigger,
+                    Trigger::DhcpEvent { event_kind, .. } if event_kind == "lease_expired"
+                )
+            }),
+            "journal must contain a DhcpEvent entry with event_kind='lease_expired'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// inject_dhcp_addresses is a no-op when effective_state has only
+    /// enabled=true for the triggering interface (pending state after LeaseExpired).
+    ///
+    /// After LeaseExpired, the factory reverts to pending state (only enabled=true,
+    /// no "addresses"). inject_dhcp_addresses must leave the diff unchanged so the
+    /// Modify that removes the expired address is preserved and applied by the reconciler.
+    #[test]
+    fn test_inject_dhcp_addresses_noop_when_effective_state_is_pending_after_lease_expiry() {
+        let store =
+            PolicyStore::ephemeral(vec![make_dhcp_policy("dhcp-veth0", "veth-dhcp0")]);
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "dhcp-veth0".into(),
+            event_kind: "lease_expired".into(),
+        };
+
+        // Pending state: only enabled=true, no addresses — matches post-LeaseExpired factory output.
+        let mut effective_state = netfyr_state::StateSet::new();
+        effective_state.insert(make_current_state(
+            "veth-dhcp0",
+            vec![("enabled", Value::Bool(true))],
+        ));
+
+        // Diff that removes addresses and routes (computed against pending desired state).
+        let ops = vec![DiffOp::Modify {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("veth-dhcp0"),
+            changed_fields: Default::default(),
+            removed_fields: vec!["addresses".to_string(), "routes".to_string()],
+        }];
+        let diff = netfyr_state::StateDiff::new(ops);
+
+        let result = inject_dhcp_addresses(&trigger, &store, &effective_state, diff);
+
+        assert_eq!(
+            result.ops().len(),
+            1,
+            "inject_dhcp_addresses must not add operations when effective state has no addresses"
+        );
+        match &result.ops()[0] {
+            DiffOp::Modify { removed_fields, .. } => {
+                assert!(
+                    removed_fields.contains(&"addresses".to_string()),
+                    "Modify removing 'addresses' must be preserved"
+                );
+                assert!(
+                    removed_fields.contains(&"routes".to_string()),
+                    "Modify removing 'routes' must be preserved"
+                );
+            }
+            other => panic!("expected Modify op, got {:?}", other),
+        }
     }
 }
