@@ -2497,4 +2497,347 @@ mod tests {
             other => panic!("expected Modify op, got {:?}", other),
         }
     }
+
+    // ── Feature: SPEC-409 — Multi-interface DHCP journal attribution ──────────
+    //
+    // When two DHCP policies are active on different interfaces simultaneously,
+    // each DHCP trigger must produce a journal entry scoped exclusively to the
+    // triggering interface. These tests verify the per-interface isolation logic
+    // at the unit level: dhcp_trigger_interface, restrict_to_dhcp_trigger,
+    // filter_diff_for_interface, and filter_state_for_interface.
+
+    /// AC: dhcp_trigger_interface resolves the correct interface when two DHCP
+    /// policies are present in the store simultaneously.
+    ///
+    /// With policies dhcp-iface0 → veth-dhcp0 and dhcp-iface2 → veth-dhcp2,
+    /// each trigger must resolve to its own interface without cross-contamination.
+    #[test]
+    fn test_dhcp_trigger_interface_resolves_correct_interface_with_two_dhcp_policies() {
+        let store = PolicyStore::ephemeral(vec![
+            make_dhcp_policy("dhcp-iface0", "veth-dhcp0"),
+            make_dhcp_policy("dhcp-iface2", "veth-dhcp2"),
+        ]);
+
+        let trigger0 = Trigger::DhcpEvent {
+            policy_name: "dhcp-iface0".into(),
+            event_kind: "lease_acquired".into(),
+        };
+        let trigger2 = Trigger::DhcpEvent {
+            policy_name: "dhcp-iface2".into(),
+            event_kind: "lease_acquired".into(),
+        };
+
+        assert_eq!(
+            dhcp_trigger_interface(&trigger0, &store),
+            Some("veth-dhcp0"),
+            "trigger for dhcp-iface0 must resolve to veth-dhcp0 even when dhcp-iface2 is also present"
+        );
+        assert_eq!(
+            dhcp_trigger_interface(&trigger2, &store),
+            Some("veth-dhcp2"),
+            "trigger for dhcp-iface2 must resolve to veth-dhcp2 even when dhcp-iface0 is also present"
+        );
+    }
+
+    /// AC: When two DHCP policies are active on different interfaces, triggering
+    /// reconciliation for veth-dhcp0 restricts the apply diff to only veth-dhcp0
+    /// operations — veth-dhcp2 ops are excluded.
+    #[test]
+    fn test_restrict_to_dhcp_trigger_with_two_interfaces_keeps_only_iface0() {
+        let store = PolicyStore::ephemeral(vec![
+            make_dhcp_policy("dhcp-iface0", "veth-dhcp0"),
+            make_dhcp_policy("dhcp-iface2", "veth-dhcp2"),
+        ]);
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "dhcp-iface0".into(),
+            event_kind: "lease_acquired".into(),
+        };
+        let diff = netfyr_state::StateDiff::new(vec![
+            make_remove_op("veth-dhcp0"),
+            make_remove_op("veth-dhcp2"),
+        ]);
+        let filtered = restrict_to_dhcp_trigger(&trigger, &store, diff);
+
+        assert_eq!(
+            filtered.ops().len(),
+            1,
+            "restrict_to_dhcp_trigger with dhcp-iface0 trigger must produce exactly 1 op"
+        );
+        assert_eq!(
+            filtered.ops()[0].selector().name.as_deref(),
+            Some("veth-dhcp0"),
+            "the surviving op must be for veth-dhcp0, not veth-dhcp2"
+        );
+    }
+
+    /// AC: When two DHCP policies are active on different interfaces, triggering
+    /// reconciliation for veth-dhcp2 restricts the apply diff to only veth-dhcp2
+    /// operations — veth-dhcp0 ops are excluded.
+    #[test]
+    fn test_restrict_to_dhcp_trigger_with_two_interfaces_keeps_only_iface2() {
+        let store = PolicyStore::ephemeral(vec![
+            make_dhcp_policy("dhcp-iface0", "veth-dhcp0"),
+            make_dhcp_policy("dhcp-iface2", "veth-dhcp2"),
+        ]);
+        let trigger = Trigger::DhcpEvent {
+            policy_name: "dhcp-iface2".into(),
+            event_kind: "lease_acquired".into(),
+        };
+        let diff = netfyr_state::StateDiff::new(vec![
+            make_remove_op("veth-dhcp0"),
+            make_remove_op("veth-dhcp2"),
+        ]);
+        let filtered = restrict_to_dhcp_trigger(&trigger, &store, diff);
+
+        assert_eq!(
+            filtered.ops().len(),
+            1,
+            "restrict_to_dhcp_trigger with dhcp-iface2 trigger must produce exactly 1 op"
+        );
+        assert_eq!(
+            filtered.ops()[0].selector().name.as_deref(),
+            Some("veth-dhcp2"),
+            "the surviving op must be for veth-dhcp2, not veth-dhcp0"
+        );
+    }
+
+    /// AC: filter_diff_for_interface (journal diff scoping) keeps only operations
+    /// for the specified interface when the diff contains operations for both
+    /// veth-dhcp0 and veth-dhcp2, preventing cross-interface mixing.
+    #[test]
+    fn test_filter_diff_for_interface_with_two_interfaces_isolates_iface0() {
+        use netfyr_reconcile::{DiffKind, DiffOperation};
+
+        let diff = ReconcileStateDiff {
+            operations: vec![
+                DiffOperation {
+                    kind: DiffKind::Add,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("veth-dhcp0"),
+                    field_changes: vec![],
+                },
+                DiffOperation {
+                    kind: DiffKind::Add,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("veth-dhcp2"),
+                    field_changes: vec![],
+                },
+            ],
+        };
+
+        let filtered = filter_diff_for_interface(&diff, "veth-dhcp0");
+
+        assert_eq!(
+            filtered.operations.len(),
+            1,
+            "journal diff filtered for veth-dhcp0 must contain exactly 1 op"
+        );
+        assert_eq!(
+            filtered.operations[0].selector.key(),
+            "veth-dhcp0",
+            "filtered journal diff must only contain veth-dhcp0 operation"
+        );
+        assert!(
+            filtered.operations.iter().all(|op| op.selector.key() == "veth-dhcp0"),
+            "no veth-dhcp2 operations must appear in the veth-dhcp0 journal diff"
+        );
+    }
+
+    /// AC: filter_diff_for_interface (journal diff scoping) keeps only operations
+    /// for veth-dhcp2 when the diff contains operations for both interfaces.
+    ///
+    /// Filtering for veth-dhcp2 must exclude veth-dhcp0 operations.
+    #[test]
+    fn test_filter_diff_for_interface_with_two_interfaces_isolates_iface2() {
+        use netfyr_reconcile::{DiffKind, DiffOperation};
+
+        let diff = ReconcileStateDiff {
+            operations: vec![
+                DiffOperation {
+                    kind: DiffKind::Add,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("veth-dhcp0"),
+                    field_changes: vec![],
+                },
+                DiffOperation {
+                    kind: DiffKind::Add,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name("veth-dhcp2"),
+                    field_changes: vec![],
+                },
+            ],
+        };
+
+        let filtered = filter_diff_for_interface(&diff, "veth-dhcp2");
+
+        assert_eq!(
+            filtered.operations.len(),
+            1,
+            "journal diff filtered for veth-dhcp2 must contain exactly 1 op"
+        );
+        assert_eq!(
+            filtered.operations[0].selector.key(),
+            "veth-dhcp2",
+            "filtered journal diff must only contain veth-dhcp2 operation"
+        );
+        assert!(
+            filtered.operations.iter().all(|op| op.selector.key() == "veth-dhcp2"),
+            "no veth-dhcp0 operations must appear in the veth-dhcp2 journal diff"
+        );
+    }
+
+    /// AC: filter_diff_for_interface returns an empty diff when no operations
+    /// match the specified interface — no cross-interface contamination.
+    #[test]
+    fn test_filter_diff_for_interface_returns_empty_when_no_ops_match_interface() {
+        use netfyr_reconcile::{DiffKind, DiffOperation};
+
+        let diff = ReconcileStateDiff {
+            operations: vec![DiffOperation {
+                kind: DiffKind::Add,
+                entity_type: "ethernet".to_string(),
+                selector: Selector::with_name("veth-dhcp0"),
+                field_changes: vec![],
+            }],
+        };
+
+        let filtered = filter_diff_for_interface(&diff, "veth-dhcp2");
+
+        assert!(
+            filtered.operations.is_empty(),
+            "filter_diff_for_interface must return empty diff when no ops match \
+             the specified interface — prevents phantom entries for the wrong interface"
+        );
+    }
+
+    /// AC: filter_state_for_interface (journal state_after scoping) keeps only
+    /// the entity for veth-dhcp0 when state contains entities for both interfaces.
+    ///
+    /// This prevents cross-interface mixing in the journal's state_after field,
+    /// ensuring each entry references only its own address range (10.99.1.x vs
+    /// 10.99.2.x in the integration test scenario).
+    #[test]
+    fn test_filter_state_for_interface_with_two_interfaces_isolates_iface0() {
+        let mut state = StateSet::new();
+        state.insert(make_current_state("veth-dhcp0", vec![("enabled", Value::Bool(true))]));
+        state.insert(make_current_state("veth-dhcp2", vec![("enabled", Value::Bool(true))]));
+
+        let filtered = filter_state_for_interface(&state, "veth-dhcp0");
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "state_after filtered for veth-dhcp0 must contain exactly 1 entity"
+        );
+        assert!(
+            filtered.get("ethernet", "veth-dhcp0").is_some(),
+            "filtered state_after must contain the veth-dhcp0 entity"
+        );
+        assert!(
+            filtered.get("ethernet", "veth-dhcp2").is_none(),
+            "filtered state_after must not contain the veth-dhcp2 entity — no cross-interface mixing"
+        );
+    }
+
+    /// AC: filter_state_for_interface (journal state_after scoping) keeps only
+    /// the entity for veth-dhcp2 when state contains entities for both interfaces.
+    ///
+    /// Filtering for veth-dhcp2 must exclude veth-dhcp0 entities.
+    #[test]
+    fn test_filter_state_for_interface_with_two_interfaces_isolates_iface2() {
+        let mut state = StateSet::new();
+        state.insert(make_current_state("veth-dhcp0", vec![("enabled", Value::Bool(true))]));
+        state.insert(make_current_state("veth-dhcp2", vec![("enabled", Value::Bool(true))]));
+
+        let filtered = filter_state_for_interface(&state, "veth-dhcp2");
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "state_after filtered for veth-dhcp2 must contain exactly 1 entity"
+        );
+        assert!(
+            filtered.get("ethernet", "veth-dhcp2").is_some(),
+            "filtered state_after must contain the veth-dhcp2 entity"
+        );
+        assert!(
+            filtered.get("ethernet", "veth-dhcp0").is_none(),
+            "filtered state_after must not contain the veth-dhcp0 entity — no cross-interface mixing"
+        );
+    }
+
+    /// AC: filter_state_for_interface returns an empty state when no entity
+    /// matches the specified interface.
+    #[test]
+    fn test_filter_state_for_interface_returns_empty_when_no_entity_matches() {
+        let mut state = StateSet::new();
+        state.insert(make_current_state("veth-dhcp0", vec![("enabled", Value::Bool(true))]));
+
+        let filtered = filter_state_for_interface(&state, "veth-dhcp2");
+
+        assert!(
+            filtered.is_empty(),
+            "filter_state_for_interface must return empty state when no entity \
+             matches the specified interface"
+        );
+    }
+
+    /// AC: No journal entry mixes changes from both interfaces.
+    ///
+    /// When two DHCP factories have both produced state, a reconcile diff would
+    /// cover both interfaces. restrict_to_dhcp_trigger ensures that:
+    /// - the trigger for veth-dhcp0 produces only veth-dhcp0 ops in the apply diff
+    /// - the trigger for veth-dhcp2 produces only veth-dhcp2 ops in the apply diff
+    ///
+    /// This is the core property that prevents journal entries from mixing changes
+    /// across interfaces, as required by the acceptance criteria.
+    #[test]
+    fn test_dhcp_trigger_isolation_prevents_cross_interface_mixing_in_apply_diff() {
+        let store = PolicyStore::ephemeral(vec![
+            make_dhcp_policy("dhcp-iface0", "veth-dhcp0"),
+            make_dhcp_policy("dhcp-iface2", "veth-dhcp2"),
+        ]);
+
+        // Trigger for dhcp-iface0: only veth-dhcp0 ops must survive.
+        let diff0 = netfyr_state::StateDiff::new(vec![
+            make_remove_op("veth-dhcp0"),
+            make_remove_op("veth-dhcp2"),
+        ]);
+        let trigger0 = Trigger::DhcpEvent {
+            policy_name: "dhcp-iface0".into(),
+            event_kind: "lease_acquired".into(),
+        };
+        let filtered0 = restrict_to_dhcp_trigger(&trigger0, &store, diff0);
+
+        for op in filtered0.ops() {
+            assert_eq!(
+                op.selector().name.as_deref(),
+                Some("veth-dhcp0"),
+                "apply diff for dhcp-iface0 trigger must contain only veth-dhcp0 ops, \
+                 found op for {:?}",
+                op.selector().name
+            );
+        }
+
+        // Trigger for dhcp-iface2: only veth-dhcp2 ops must survive.
+        let diff2 = netfyr_state::StateDiff::new(vec![
+            make_remove_op("veth-dhcp0"),
+            make_remove_op("veth-dhcp2"),
+        ]);
+        let trigger2 = Trigger::DhcpEvent {
+            policy_name: "dhcp-iface2".into(),
+            event_kind: "lease_acquired".into(),
+        };
+        let filtered2 = restrict_to_dhcp_trigger(&trigger2, &store, diff2);
+
+        for op in filtered2.ops() {
+            assert_eq!(
+                op.selector().name.as_deref(),
+                Some("veth-dhcp2"),
+                "apply diff for dhcp-iface2 trigger must contain only veth-dhcp2 ops, \
+                 found op for {:?}",
+                op.selector().name
+            );
+        }
+    }
 }
