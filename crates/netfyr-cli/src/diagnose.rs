@@ -131,21 +131,33 @@ pub async fn run_diagnose(args: DiagnoseArgs) -> Result<ExitCode> {
 
 async fn run_diagnose_daemon(client: &mut VarlinkClient, args: &DiagnoseArgs) -> Result<ExitCode> {
     let selector_name = args.selector.first().map(|(_, v)| v.clone());
-    let raw_entries = client
-        .get_history(Some(10_000), Some(args.since.clone()), None, selector_name)
-        .await
-        .context("failed to get history from daemon")?;
 
-    let all_entries: Vec<JournalEntry> = raw_entries
+    // Fetch full unfiltered history to locate the last applied reference state.
+    // The --since window only governs which events are analyzed for patterns;
+    // the desired-state baseline must be the most recent apply regardless of age.
+    let full_raw = client
+        .get_history(Some(10_000), None, None, None)
+        .await
+        .context("failed to get full history from daemon")?;
+    let full_entries: Vec<JournalEntry> = full_raw
         .into_iter()
         .map(|v| serde_json::from_value(v).context("failed to deserialize journal entry"))
         .collect::<Result<Vec<_>>>()?;
-
-    let last_applied = all_entries
+    let last_applied = full_entries
         .iter()
         .filter(|e| matches!(&e.outcome, ApplyOutcome::Applied { .. }))
         .max_by_key(|e| e.seq)
         .cloned();
+
+    // Fetch windowed history for the pattern detectors.
+    let windowed_raw = client
+        .get_history(Some(10_000), Some(args.since.clone()), None, selector_name)
+        .await
+        .context("failed to get windowed history from daemon")?;
+    let all_entries: Vec<JournalEntry> = windowed_raw
+        .into_iter()
+        .map(|v| serde_json::from_value(v).context("failed to deserialize journal entry"))
+        .collect::<Result<Vec<_>>>()?;
 
     let varlink_states = client
         .query(None)
@@ -945,7 +957,7 @@ fn detect_no_recent_activity(
     _current_state: &[SerializableState],
     entity_type: &str,
     entity_name: &str,
-    _last_applied: Option<&JournalEntry>,
+    last_applied: Option<&JournalEntry>,
 ) -> Vec<Finding> {
     // Check if entity appears anywhere in the windowed entries
     let in_window = entries.iter().any(|e| {
@@ -963,16 +975,26 @@ fn detect_no_recent_activity(
         return vec![];
     }
 
+    let mut details =
+        vec!["This entity is managed but has no activity in the scan window".to_string()];
+
+    if let Some(entry) = last_applied {
+        details.push(format!(
+            "Last seen {} (seq {})",
+            relative_time(entry.timestamp),
+            entry.seq
+        ));
+    }
+
+    details.push("Use --since with a longer duration to see historical activity".to_string());
+
     vec![Finding {
         entity_name: entity_name.to_string(),
         entity_type: entity_type.to_string(),
         severity: Severity::Info,
         pattern: PatternKind::NoRecentActivity,
         summary: "No journal entries within the current time window".to_string(),
-        details: vec![
-            "This entity is managed but has no activity in the scan window".to_string(),
-            "Use --since with a longer duration to see historical activity".to_string(),
-        ],
+        details,
         suggested_actions: vec![],
         related_entries: vec![],
     }]
@@ -2654,6 +2676,531 @@ mod tests {
             all_text.contains("addresses") || all_text.contains("10.0.1.99"),
             "details must mention address drift, got: {:?}",
             findings[0].details
+        );
+    }
+
+    // ── Drift related_entries ─────────────────────────────────────────────────────
+
+    /// AC: When drift is detected and an external change entry is present in the window,
+    /// related_entries must contain both the last applied seq AND the external change seq.
+    #[test]
+    fn test_drift_related_entries_includes_applied_seq_and_external_change_seq() {
+        let applied = make_applied_entry(
+            10,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 1500u64 }),
+            3600,
+        );
+        let ext_change = make_external_change_entry(
+            20,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64 }),
+            600,
+        );
+        let current = vec![make_ser_state(
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64 }),
+        )];
+
+        let findings =
+            detect_configuration_drift(&[ext_change], &current, "ethernet", "eth0", Some(&applied));
+
+        assert!(!findings.is_empty());
+        assert!(
+            findings[0].related_entries.contains(&10),
+            "related_entries should contain the applied seq 10, got: {:?}",
+            findings[0].related_entries
+        );
+        assert!(
+            findings[0].related_entries.contains(&20),
+            "related_entries should contain the external change seq 20, got: {:?}",
+            findings[0].related_entries
+        );
+    }
+
+    /// AC: When no external change entry is in the window, related_entries contains
+    /// only the last applied seq.
+    #[test]
+    fn test_drift_related_entries_contains_only_applied_seq_when_no_external_change() {
+        let applied = make_applied_entry(
+            42,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 1500u64 }),
+            3600,
+        );
+        let current = vec![make_ser_state(
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 9000u64 }),
+        )];
+
+        // No external change entries passed in.
+        let findings =
+            detect_configuration_drift(&[], &current, "ethernet", "eth0", Some(&applied));
+
+        assert!(!findings.is_empty());
+        assert_eq!(findings[0].related_entries, vec![42u64], "related_entries should contain only the applied seq");
+    }
+
+    // ── Text format: pattern label ────────────────────────────────────────────────
+
+    /// AC: Text output header uses spaces in pattern label (e.g. "configuration drift",
+    /// not "configuration_drift").
+    #[test]
+    fn test_format_text_pattern_label_uses_spaces_not_underscores() {
+        let finding = Finding {
+            entity_name: "eth0".to_string(),
+            entity_type: "ethernet".to_string(),
+            severity: Severity::Warning,
+            pattern: PatternKind::ConfigurationDrift,
+            summary: "drift".to_string(),
+            details: vec![],
+            suggested_actions: vec![],
+            related_entries: vec![],
+        };
+        let entity_findings =
+            vec![("ethernet".to_string(), "eth0".to_string(), vec![finding])];
+
+        let text = format_text(&entity_findings, &[]);
+
+        assert!(
+            text.contains("configuration drift"),
+            "header should use 'configuration drift' (spaces), got: {:?}",
+            &text[..text.find('\n').unwrap_or(text.len())]
+        );
+        assert!(
+            !text.contains("configuration_drift"),
+            "header must not use 'configuration_drift' (underscores) in text output"
+        );
+    }
+
+    /// AC: Text output shows "carrier loss" (with space) in header for carrier loss findings.
+    #[test]
+    fn test_format_text_carrier_loss_pattern_label_uses_spaces() {
+        let finding = Finding {
+            entity_name: "eth0".to_string(),
+            entity_type: "ethernet".to_string(),
+            severity: Severity::Critical,
+            pattern: PatternKind::CarrierLoss,
+            summary: "no carrier".to_string(),
+            details: vec![],
+            suggested_actions: vec![],
+            related_entries: vec![],
+        };
+        let entity_findings =
+            vec![("ethernet".to_string(), "eth0".to_string(), vec![finding])];
+
+        let text = format_text(&entity_findings, &[]);
+
+        assert!(
+            text.contains("carrier loss"),
+            "header should use 'carrier loss' (spaces), got header text"
+        );
+    }
+
+    // ── JSON output: healthy entities ─────────────────────────────────────────────
+
+    /// AC: JSON output for healthy entities includes all required fields (entity,
+    /// entity_type, severity, pattern, summary, details, suggested_actions, related_entries).
+    #[test]
+    fn test_format_json_healthy_entities_have_all_required_fields() {
+        let healthy = vec![(
+            "ethernet".to_string(),
+            "eth0".to_string(),
+            HealthyInfo {
+                last_apply_seq: Some(10),
+                last_apply_ago: Some("2h ago".to_string()),
+                carrier_up: Some(true),
+            },
+        )];
+
+        let json_str = format_json(&[], &healthy).expect("format_json must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_str).expect("output must be valid JSON");
+
+        assert!(parsed.is_array(), "output must be a JSON array");
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "should have one entry for the healthy entity");
+
+        let item = &arr[0];
+        assert!(item.get("entity").is_some(), "must have 'entity' field");
+        assert!(item.get("entity_type").is_some(), "must have 'entity_type' field");
+        assert!(item.get("severity").is_some(), "must have 'severity' field");
+        assert!(item.get("pattern").is_some(), "must have 'pattern' field");
+        assert!(item.get("summary").is_some(), "must have 'summary' field");
+        assert!(item.get("details").is_some(), "must have 'details' field");
+        assert!(item.get("suggested_actions").is_some(), "must have 'suggested_actions' field");
+        assert!(item.get("related_entries").is_some(), "must have 'related_entries' field");
+        assert_eq!(item["severity"].as_str(), Some("healthy"), "severity must be 'healthy'");
+        assert_eq!(item["entity"].as_str(), Some("eth0"), "entity name must match");
+    }
+
+    /// AC: JSON output healthy entity includes last apply info in summary when available.
+    #[test]
+    fn test_format_json_healthy_entity_summary_includes_last_apply_info() {
+        let healthy = vec![(
+            "ethernet".to_string(),
+            "eth0".to_string(),
+            HealthyInfo {
+                last_apply_seq: Some(42),
+                last_apply_ago: Some("3h ago".to_string()),
+                carrier_up: None,
+            },
+        )];
+
+        let json_str = format_json(&[], &healthy).expect("format_json must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        let summary = arr[0]["summary"].as_str().unwrap_or("");
+        assert!(
+            summary.contains("42") || summary.contains("3h ago"),
+            "healthy entity summary should mention last apply seq (42) or time ('3h ago'), got: {:?}",
+            summary
+        );
+    }
+
+    // ── Failed apply entity association ──────────────────────────────────────────
+
+    /// AC: A failed apply on a different entity must not produce a finding for the
+    /// entity under analysis.
+    #[test]
+    fn test_failed_apply_not_reported_for_different_entity() {
+        // Failed apply on eth1 — eth0 is analyzed.
+        let entry = make_failed_apply_entry(42, "ethernet", "eth1", 2, 1800);
+
+        let findings = detect_failed_apply(&[entry], &[], "ethernet", "eth0", None);
+
+        assert!(
+            findings.is_empty(),
+            "failed apply for eth1 must not appear in findings for eth0"
+        );
+    }
+
+    // ── DHCP lease lost details ───────────────────────────────────────────────────
+
+    /// AC: DHCP lease lost details include the policy name.
+    #[test]
+    fn test_dhcp_lease_lost_details_include_policy_name() {
+        let expire_entry = make_dhcp_event_entry(
+            51,
+            "ethernet",
+            "eth0",
+            "my-dhcp-policy",
+            "lease_expired",
+            300,
+        );
+
+        let findings = detect_dhcp_lease_lost(&[expire_entry], &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        let all_text = format!("{} {:?}", findings[0].summary, findings[0].details);
+        assert!(
+            all_text.contains("my-dhcp-policy"),
+            "details should include the policy name 'my-dhcp-policy', got: {:?}",
+            all_text
+        );
+    }
+
+    /// AC: DHCP lease lost details include timing (seq and ago).
+    #[test]
+    fn test_dhcp_lease_lost_details_include_seq_and_timing() {
+        let expire_entry = make_dhcp_event_entry(
+            51,
+            "ethernet",
+            "eth0",
+            "eth0-dhcp",
+            "lease_expired",
+            300,
+        );
+
+        let findings = detect_dhcp_lease_lost(&[expire_entry], &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        let all_text = format!("{} {:?}", findings[0].summary, findings[0].details);
+        assert!(
+            all_text.contains("51"),
+            "details should include the seq number 51, got: {:?}",
+            all_text
+        );
+        assert!(
+            all_text.contains("ago"),
+            "details should include timing ('ago'), got: {:?}",
+            all_text
+        );
+    }
+
+    // ── Carrier loss related_entries ──────────────────────────────────────────────
+
+    /// AC: Carrier loss finding includes the external change seq in related_entries.
+    #[test]
+    fn test_carrier_loss_related_entries_contains_external_change_seq() {
+        let ext_entry = make_external_change_entry(
+            49,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "carrier": false }),
+            600,
+        );
+        let current =
+            vec![make_ser_state("ethernet", "eth0", serde_json::json!({ "carrier": false }))];
+
+        let findings = detect_carrier_loss(&[ext_entry], &current, "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        assert!(
+            findings[0].related_entries.contains(&49),
+            "related_entries should contain seq 49, got: {:?}",
+            findings[0].related_entries
+        );
+    }
+
+    /// AC: Carrier loss with no window entries (carrier down predates window) returns
+    /// empty related_entries.
+    #[test]
+    fn test_carrier_loss_with_no_window_entries_has_empty_related_entries() {
+        // Carrier is down but no entries in the window record it.
+        let current =
+            vec![make_ser_state("ethernet", "eth0", serde_json::json!({ "carrier": false }))];
+
+        let findings = detect_carrier_loss(&[], &current, "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty(), "carrier loss should be reported even without window entries");
+        assert!(
+            findings[0].related_entries.is_empty(),
+            "related_entries should be empty when loss predates the window, got: {:?}",
+            findings[0].related_entries
+        );
+    }
+
+    // ── Entity sort order in run_analysis ─────────────────────────────────────────
+
+    /// AC: Findings are sorted by severity before formatting — critical appears before
+    /// warning, warning before info. This tests the sort comparator used in run_analysis.
+    #[test]
+    fn test_entity_findings_sort_by_worst_severity_descending() {
+        let make_f = |sev: Severity, name: &str| Finding {
+            entity_name: name.to_string(),
+            entity_type: "ethernet".to_string(),
+            severity: sev,
+            pattern: PatternKind::ConfigurationDrift,
+            summary: "test".to_string(),
+            details: vec![],
+            suggested_actions: vec![],
+            related_entries: vec![],
+        };
+
+        // Intentionally wrong order: warning eth1, critical eth0, info eth2
+        let mut entity_findings: Vec<(String, String, Vec<Finding>)> = vec![
+            ("ethernet".to_string(), "eth1".to_string(), vec![make_f(Severity::Warning, "eth1")]),
+            ("ethernet".to_string(), "eth0".to_string(), vec![make_f(Severity::Critical, "eth0")]),
+            ("ethernet".to_string(), "eth2".to_string(), vec![make_f(Severity::Info, "eth2")]),
+        ];
+
+        // Apply the same sort as run_analysis.
+        entity_findings.sort_by(|a, b| {
+            let worst_a =
+                a.2.iter().map(|f| &f.severity).max().cloned().unwrap_or(Severity::Healthy);
+            let worst_b =
+                b.2.iter().map(|f| &f.severity).max().cloned().unwrap_or(Severity::Healthy);
+            worst_b.cmp(&worst_a).then(a.1.cmp(&b.1))
+        });
+
+        assert_eq!(entity_findings[0].1, "eth0", "critical eth0 should be first");
+        assert_eq!(entity_findings[1].1, "eth1", "warning eth1 should be second");
+        assert_eq!(entity_findings[2].1, "eth2", "info eth2 should be third");
+    }
+
+    /// AC: Within the same severity, entities are sorted alphabetically by name.
+    #[test]
+    fn test_entity_findings_same_severity_sorted_alphabetically() {
+        let make_f = |name: &str| Finding {
+            entity_name: name.to_string(),
+            entity_type: "ethernet".to_string(),
+            severity: Severity::Warning,
+            pattern: PatternKind::ConfigurationDrift,
+            summary: "test".to_string(),
+            details: vec![],
+            suggested_actions: vec![],
+            related_entries: vec![],
+        };
+
+        let mut entity_findings: Vec<(String, String, Vec<Finding>)> = vec![
+            ("ethernet".to_string(), "eth2".to_string(), vec![make_f("eth2")]),
+            ("ethernet".to_string(), "eth0".to_string(), vec![make_f("eth0")]),
+            ("ethernet".to_string(), "eth1".to_string(), vec![make_f("eth1")]),
+        ];
+
+        entity_findings.sort_by(|a, b| {
+            let worst_a =
+                a.2.iter().map(|f| &f.severity).max().cloned().unwrap_or(Severity::Healthy);
+            let worst_b =
+                b.2.iter().map(|f| &f.severity).max().cloned().unwrap_or(Severity::Healthy);
+            worst_b.cmp(&worst_a).then(a.1.cmp(&b.1))
+        });
+
+        assert_eq!(entity_findings[0].1, "eth0", "same severity: alphabetically first");
+        assert_eq!(entity_findings[1].1, "eth1");
+        assert_eq!(entity_findings[2].1, "eth2");
+    }
+
+    // ── No recent activity: last-seen time ────────────────────────────────────────
+
+    /// AC: Entity has no recent entries — output mentions when the last entry was recorded.
+    ///
+    /// BUG: The current implementation does not include last-seen timestamp in the
+    /// details. The `_last_applied` parameter is accepted but ignored; it should be
+    /// used to show "last seen X ago" for the entity. The details only contain generic
+    /// messages ("No journal entries within the current time window" and
+    /// "Use --since with a longer duration...").
+    #[test]
+    fn test_no_recent_activity_details_should_mention_last_seen_time() {
+        let applied = make_applied_entry(
+            10,
+            "ethernet",
+            "eth0",
+            serde_json::json!({ "mtu": 1500u64 }),
+            7200, // 2 hours ago
+        );
+
+        // Entity is in last_applied but not in the windowed entries.
+        let findings = detect_no_recent_activity(&[], &[], "ethernet", "eth0", Some(&applied));
+
+        assert!(!findings.is_empty(), "should produce a no-recent-activity finding");
+        // AC says: "And the output mentions when the last entry was recorded"
+        // Bug: current implementation ignores _last_applied; details contain only generic text.
+        // Expected: details should include something like "2h ago" or "last seen".
+        let details_text = findings[0].details.join(" ");
+        assert!(
+            details_text.contains("ago") || details_text.contains("last seen") || details_text.contains("2h"),
+            "details should mention when the last entry was recorded (e.g. '2h ago'); \
+             current implementation ignores _last_applied and produces generic messages. \
+             Got details: {:?}",
+            findings[0].details
+        );
+    }
+
+    // ── Empty journal message ─────────────────────────────────────────────────────
+
+    /// AC: When the journal is empty, diagnose outputs "No journal entries found.
+    /// Run `netfyr apply` first." and exits with code 0.
+    /// Note: message content is verified in integration tests; this unit test verifies
+    /// the exit code from run_analysis with empty data.
+    #[test]
+    fn test_run_analysis_empty_data_exit_code_is_success() {
+        let data = CollectedData {
+            entries: vec![],
+            current_state: vec![],
+            managed_entities: vec![],
+            last_applied_entry: None,
+        };
+
+        let result = run_analysis(data, &text_args());
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            ExitCode::SUCCESS,
+            "empty journal must exit 0 (not an error condition)"
+        );
+    }
+
+    // ── Recurring flaps: entry count threshold ────────────────────────────────────
+
+    /// AC: Exactly 4 external change entries (above threshold of >3) with oscillation
+    /// DO trigger the flap detector.
+    #[test]
+    fn test_recurring_flaps_triggered_with_exactly_four_changes_with_oscillation() {
+        let entries = vec![
+            make_external_change_entry(
+                10, "ethernet", "eth0", serde_json::json!({ "carrier": false }), 1800,
+            ),
+            make_external_change_entry(
+                11, "ethernet", "eth0", serde_json::json!({ "carrier": true }), 1500,
+            ),
+            make_external_change_entry(
+                12, "ethernet", "eth0", serde_json::json!({ "carrier": false }), 1200,
+            ),
+            make_external_change_entry(
+                13, "ethernet", "eth0", serde_json::json!({ "carrier": true }), 900,
+            ),
+        ];
+
+        let findings = detect_recurring_flaps(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty(), "4 changes with oscillation should trigger flap detection");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(matches!(findings[0].pattern, PatternKind::RecurringFlaps));
+    }
+
+    /// AC: Recurring flap finding includes all related entry seqs.
+    #[test]
+    fn test_recurring_flaps_related_entries_contains_all_external_change_seqs() {
+        let entries = vec![
+            make_external_change_entry(
+                10, "ethernet", "eth0", serde_json::json!({ "carrier": false }), 1800,
+            ),
+            make_external_change_entry(
+                11, "ethernet", "eth0", serde_json::json!({ "carrier": true }), 1500,
+            ),
+            make_external_change_entry(
+                12, "ethernet", "eth0", serde_json::json!({ "carrier": false }), 1200,
+            ),
+            make_external_change_entry(
+                13, "ethernet", "eth0", serde_json::json!({ "carrier": true }), 900,
+            ),
+            make_external_change_entry(
+                14, "ethernet", "eth0", serde_json::json!({ "carrier": false }), 600,
+            ),
+        ];
+
+        let findings = detect_recurring_flaps(&entries, &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        for seq in [10u64, 11, 12, 13, 14] {
+            assert!(
+                findings[0].related_entries.contains(&seq),
+                "related_entries should contain seq {}, got: {:?}",
+                seq,
+                findings[0].related_entries
+            );
+        }
+    }
+
+    // ── Failed apply details ──────────────────────────────────────────────────────
+
+    /// AC: Failed apply finding contains failure count in details.
+    #[test]
+    fn test_failed_apply_details_include_failure_count() {
+        let entry = make_failed_apply_entry(42, "ethernet", "eth0", 3, 1800);
+
+        let findings = detect_failed_apply(&[entry], &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        let all_text = format!("{} {:?}", findings[0].summary, findings[0].details);
+        assert!(
+            all_text.contains("3"),
+            "details should include the failure count (3), got: {:?}",
+            all_text
+        );
+    }
+
+    /// AC: Failed apply finding's suggested action includes the seq number.
+    #[test]
+    fn test_failed_apply_suggested_action_includes_seq_number() {
+        let entry = make_failed_apply_entry(99, "ethernet", "eth0", 1, 1800);
+
+        let findings = detect_failed_apply(&[entry], &[], "ethernet", "eth0", None);
+
+        assert!(!findings.is_empty());
+        let actions = findings[0].suggested_actions.join(" ");
+        assert!(
+            actions.contains("99"),
+            "suggested action should reference seq 99, got: {:?}",
+            actions
         );
     }
 }
