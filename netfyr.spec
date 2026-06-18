@@ -109,6 +109,8 @@ target/release/netfyr-daemon --help > /dev/null
 %dir %{_sysconfdir}/netfyr
 %dir %{_sysconfdir}/netfyr/policies
 %{_datadir}/bash-completion/completions/netfyr
+%dir %{_docdir}/%{name}
+%dir %{_docdir}/%{name}/examples
 %{_docdir}/%{name}/examples/policies/
 
 %files daemon
