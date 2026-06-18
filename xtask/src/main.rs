@@ -194,6 +194,14 @@ fn append_examples(buf: &mut Vec<u8>, subcommand: Option<&str>) -> std::io::Resu
             writeln!(buf, "netfyr history --since 1h --trigger apply")?;
             writeln!(buf, ".fi")?;
             writeln!(buf, ".RE")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, "Show the 5 most recent entries with full timestamps:")?;
+            writeln!(buf, ".PP")?;
+            writeln!(buf, ".RS 4")?;
+            writeln!(buf, ".nf")?;
+            writeln!(buf, "netfyr history -n 5 --absolute-timestamps")?;
+            writeln!(buf, ".fi")?;
+            writeln!(buf, ".RE")?;
         }
         Some("revert") => {
             writeln!(buf, "Revert to the state recorded in journal entry 42:")?;
@@ -2956,5 +2964,165 @@ mod tests {
             section.contains("priority: 200") || section.contains("priority: 100"),
             "PRIORITY OVERRIDE must show concrete priority values"
         );
+    }
+
+    // ── Hand-written file non-overwrite ───────────────────────────────────────
+
+    /// AC: Generate all man pages — does not overwrite hand-written netfyr.yaml.5.
+    /// The idempotency test covers daemon.8 and examples.7; this test covers yaml.5.
+    #[test]
+    fn test_generate_man_pages_does_not_overwrite_netfyr_yaml_5() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir.join("../man/netfyr.yaml.5");
+        let before = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read man/netfyr.yaml.5: {e}"));
+
+        generate_man_pages().expect("generate_man_pages must succeed");
+
+        let after = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read man/netfyr.yaml.5 after generation: {e}"));
+
+        assert_eq!(
+            before, after,
+            "generate_man_pages() must not modify the hand-maintained man/netfyr.yaml.5"
+        );
+    }
+
+    // ── Stay in sync with CLI — dynamic clap reflection ──────────────────────
+
+    /// AC: Man pages stay in sync with CLI — all clap subcommands have a .1 man page.
+    /// If a new subcommand is added to Cli, `cargo xtask man` must produce a file for it.
+    #[test]
+    fn test_all_clap_subcommands_have_generated_man_pages() {
+        use clap::CommandFactory;
+        let cmd = netfyr_cli::Cli::command();
+        for subcmd in cmd.get_subcommands() {
+            let name = subcmd.get_name();
+            let filename = format!("netfyr-{name}.1");
+            assert!(
+                man_page_path_exists(&filename),
+                "man/{filename} must exist for the '{name}' clap subcommand (run `cargo xtask man`)"
+            );
+        }
+    }
+
+    /// AC: Man pages stay in sync with CLI — netfyr.1 mentions every subcommand
+    /// name defined in the Cli struct.
+    #[test]
+    fn test_netfyr_1_mentions_every_clap_subcommand() {
+        use clap::CommandFactory;
+        let content = read_generated_man_page("netfyr.1");
+        let cmd = netfyr_cli::Cli::command();
+        for subcmd in cmd.get_subcommands() {
+            let name = subcmd.get_name();
+            assert!(
+                content.contains(name),
+                "netfyr.1 must mention the '{name}' subcommand (it is defined in Cli but missing from the page)"
+            );
+        }
+    }
+
+    /// AC: Man pages stay in sync with CLI — netfyr-apply.1 OPTIONS section
+    /// contains every long flag defined in the clap apply subcommand.
+    ///
+    /// If a new flag is added to ApplyArgs in clap, re-running `cargo xtask man`
+    /// must include it in the generated page.
+    #[test]
+    fn test_netfyr_apply_1_options_contain_all_clap_flags() {
+        use clap::CommandFactory;
+        let content = read_generated_man_page("netfyr-apply.1");
+        let cmd = netfyr_cli::Cli::command();
+        let apply_cmd = cmd
+            .find_subcommand("apply")
+            .expect("apply subcommand must be registered in Cli");
+
+        for arg in apply_cmd.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                // Skip flags injected by clap itself that don't appear in man pages.
+                if long == "help" || long == "version" {
+                    continue;
+                }
+                assert!(
+                    content.contains(long),
+                    "netfyr-apply.1 must document the --{long} flag \
+                     (defined in clap but missing from the generated page)"
+                );
+            }
+        }
+    }
+
+    /// AC: Man pages stay in sync with CLI — netfyr-history.1 OPTIONS section
+    /// contains every long flag defined in the clap history subcommand.
+    #[test]
+    fn test_netfyr_history_1_options_contain_all_clap_flags() {
+        use clap::CommandFactory;
+        let content = read_generated_man_page("netfyr-history.1");
+        let cmd = netfyr_cli::Cli::command();
+        let sub = cmd
+            .find_subcommand("history")
+            .expect("history subcommand must be registered in Cli");
+
+        for arg in sub.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                if long == "help" || long == "version" {
+                    continue;
+                }
+                assert!(
+                    content.contains(long),
+                    "netfyr-history.1 must document the --{long} flag \
+                     (defined in clap but missing from the generated page)"
+                );
+            }
+        }
+    }
+
+    /// AC: Man pages stay in sync with CLI — netfyr-show.1 OPTIONS section
+    /// contains every long flag defined in the clap show subcommand.
+    #[test]
+    fn test_netfyr_show_1_options_contain_all_clap_flags() {
+        use clap::CommandFactory;
+        let content = read_generated_man_page("netfyr-show.1");
+        let cmd = netfyr_cli::Cli::command();
+        let sub = cmd
+            .find_subcommand("show")
+            .expect("show subcommand must be registered in Cli");
+
+        for arg in sub.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                if long == "help" || long == "version" {
+                    continue;
+                }
+                assert!(
+                    content.contains(long),
+                    "netfyr-show.1 must document the --{long} flag \
+                     (defined in clap but missing from the generated page)"
+                );
+            }
+        }
+    }
+
+    /// AC: Man pages stay in sync with CLI — netfyr-revert.1 OPTIONS section
+    /// contains every long flag defined in the clap revert subcommand.
+    #[test]
+    fn test_netfyr_revert_1_options_contain_all_clap_flags() {
+        use clap::CommandFactory;
+        let content = read_generated_man_page("netfyr-revert.1");
+        let cmd = netfyr_cli::Cli::command();
+        let sub = cmd
+            .find_subcommand("revert")
+            .expect("revert subcommand must be registered in Cli");
+
+        for arg in sub.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                if long == "help" || long == "version" {
+                    continue;
+                }
+                assert!(
+                    content.contains(long),
+                    "netfyr-revert.1 must document the --{long} flag \
+                     (defined in clap but missing from the generated page)"
+                );
+            }
+        }
     }
 }
