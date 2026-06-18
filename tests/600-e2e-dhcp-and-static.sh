@@ -1,5 +1,16 @@
 #!/bin/bash
-# 600-e2e-dhcp-and-static.sh -- End-to-end: DHCP and static policies on separate interfaces coexist.
+# 600-e2e-dhcp-and-static.sh -- Cross-cutting: DHCP and static policies coexist
+# on separate interfaces without mutual interference.
+#
+# Exercises: static policy reconciliation, DHCP factory, journal, history CLI.
+#
+# Scenario:
+#   - veth-static0/veth-static1: statically configured (mtu=1400, 10.99.0.1/24)
+#   - veth-dhcp0/veth-dhcp1: DHCP-configured; dnsmasq on veth-dhcp1 serves
+#     addresses in 10.99.1.100-10.99.1.200
+#   - Both policies are applied simultaneously; the test verifies that each
+#     interface gets only its own configuration and that the journal records a
+#     dhcp-acquire entry.
 #
 # Requires: unshare, ip (iproute2), dnsmasq
 # Usage:
@@ -19,22 +30,25 @@ fi
 
 require_binaries
 netns_setup "$@"
+
+# ---------- Inside the namespace ----------
+
 daemon_test_setup
 setup_journal
 
-# Static interface pair.
+# Static interface pair: veth-static0 (managed), veth-static1 (peer).
 create_veth veth-static0 veth-static1
 
-# DHCP interface pair: veth-dhcp1 is the server side.
+# DHCP interface pair: veth-dhcp0 (managed client), veth-dhcp1 (server peer).
+# Assign the server IP and start dnsmasq; PIDs are tracked by _daemon_test_cleanup.
 create_veth veth-dhcp0 veth-dhcp1
 add_address veth-dhcp1 10.99.1.1/24
-
-# Start dnsmasq DHCP server on the server-side interface.
 start_dnsmasq veth-dhcp1 10.99.1.1 10.99.1.100 10.99.1.200 120
 
 start_daemon
 
-# Write two policy files: static for veth-static0 and DHCPv4 for veth-dhcp0.
+# ── Write and apply policies ─────────────────────────────────────────────────
+
 APPLY_DIR="$TMPDIR_TEST/apply-policies"
 mkdir -p "$APPLY_DIR"
 
@@ -67,28 +81,45 @@ if [[ $APPLY_EXIT -ne 0 ]]; then
     exit 1
 fi
 
-# Wait up to 10 seconds for the DHCP lease to appear on veth-dhcp0.
+# ── Wait for DHCP lease (up to 10 s) ────────────────────────────────────────
+
 wait_for_address veth-dhcp0 "10.99.1." 10
 
-# Verify the static interface is correctly configured.
+# ── Verify static interface: mtu=1400 and address 10.99.0.1/24 ───────────────
+
 assert_mtu veth-static0 1400
 assert_has_address veth-static0 "10.99.0.1"
 
-# Verify the DHCP interface acquired an address in the expected range.
+# ── Verify DHCP interface: address in the 10.99.1.0/24 range ────────────────
+
 assert_has_address veth-dhcp0 "10.99.1."
 
-# Cross-contamination checks: static address must not be on the DHCP interface and vice versa.
+# ── Verify no cross-interface interference ───────────────────────────────────
+
+# The static address must not appear on the DHCP interface.
 assert_not_has_address veth-dhcp0 "10.99.0."
+
+# The DHCP-acquired address range must not appear on the static interface.
 assert_not_has_address veth-static0 "10.99.1."
 
-# Give daemon time to finish reconciliation and journal writes.
+# The static policy's MTU (1400) must not have bled onto the DHCP interface.
+DHCP_LINK_OUTPUT=$(ip link show veth-dhcp0 2>&1)
+if echo "$DHCP_LINK_OUTPUT" | grep -q "mtu 1400"; then
+    echo "FAIL: 600-e2e-dhcp-and-static: veth-dhcp0 unexpectedly has mtu 1400 (static MTU bled onto DHCP interface)" >&2
+    echo "      ip link output: $DHCP_LINK_OUTPUT" >&2
+    exit 1
+fi
+
+# ── Verify history shows a dhcp-acquire entry ────────────────────────────────
+
+# Give the daemon time to finish writing the journal entry after applying the
+# DHCP state to netlink.
 sleep 2
 
-# Verify the DHCP lease event was recorded in the journal with trigger "dhcp-acquire".
 HISTORY_OUTPUT=$(NO_COLOR=1 "$NETFYR_BIN" history -n 5 2>&1)
 if ! echo "$HISTORY_OUTPUT" | grep -qF "dhcp-acquire"; then
-    echo "FAIL: 600-e2e-dhcp-and-static: history does not contain dhcp-acquire trigger" >&2
-    echo "      output: $HISTORY_OUTPUT" >&2
+    echo "FAIL: 600-e2e-dhcp-and-static: netfyr history -n 5 does not contain 'dhcp-acquire' in TRIGGER column" >&2
+    echo "      history output: $HISTORY_OUTPUT" >&2
     exit 1
 fi
 
