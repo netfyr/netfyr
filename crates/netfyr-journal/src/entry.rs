@@ -272,6 +272,133 @@ mod tests {
         }
     }
 
+    /// AC: Revert entry contains correct metadata.
+    ///
+    /// Creates a revert journal entry as run_revert_standalone would, then
+    /// verifies trigger, diff, state_after, active_policies, and outcome.
+    #[test]
+    fn test_revert_journal_entry_contains_correct_metadata() {
+        let target_state_after = SerializableStateSet {
+            entities: vec![SerializableState {
+                entity_type: "ethernet".to_string(),
+                selector_name: "eth0".to_string(),
+                fields: serde_json::json!({ "mtu": 1400u64 }),
+            }],
+        };
+
+        let diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![SerializableFieldChange {
+                    field_name: "mtu".to_string(),
+                    change_kind: "set".to_string(),
+                    current: Some(serde_json::json!(1300u64)),
+                    desired: Some(serde_json::json!(1400u64)),
+                    outcome: None,
+                }],
+            }],
+        };
+
+        // Build the revert entry the same way run_revert_standalone does.
+        let revert_entry = JournalEntry {
+            seq: 0,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-21T12:00:00Z")
+                .unwrap()
+                .into(),
+            trigger: Trigger::Revert { target_seq: 5 },
+            active_policies: vec![],
+            diff,
+            state_after: target_state_after,
+            outcome: ApplyOutcome::Applied { succeeded: 1, failed: 0, skipped: 0 },
+        };
+
+        let json = serde_json::to_string(&revert_entry).expect("serialization must succeed");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialization must succeed");
+
+        // AC: trigger is "revert" with target_seq=5.
+        assert_eq!(
+            value["trigger"]["type"].as_str(),
+            Some("revert"),
+            "revert entry trigger.type must be 'revert'"
+        );
+        assert_eq!(
+            value["trigger"]["target_seq"].as_u64(),
+            Some(5),
+            "revert entry trigger.target_seq must be 5"
+        );
+
+        // AC: diff shows the changes from current state to the target.
+        let ops = value["diff"]["operations"]
+            .as_array()
+            .expect("diff.operations must be array");
+        assert_eq!(ops.len(), 1, "diff must have 1 operation");
+        assert_eq!(
+            ops[0]["kind"].as_str(),
+            Some("modify"),
+            "diff operation must be 'modify'"
+        );
+        assert_eq!(ops[0]["entity_name"].as_str(), Some("eth0"));
+        let field_changes = ops[0]["field_changes"]
+            .as_array()
+            .expect("field_changes must be array");
+        assert_eq!(
+            field_changes[0]["field_name"].as_str(),
+            Some("mtu"),
+            "field change must be for 'mtu'"
+        );
+        assert_eq!(
+            field_changes[0]["current"].as_u64(),
+            Some(1300),
+            "current mtu must be 1300"
+        );
+        assert_eq!(
+            field_changes[0]["desired"].as_u64(),
+            Some(1400),
+            "desired mtu must be 1400"
+        );
+
+        // AC: state_after matches the target entry's state_after.
+        let entities = value["state_after"]["entities"]
+            .as_array()
+            .expect("state_after.entities must be array");
+        assert_eq!(entities.len(), 1, "state_after must have 1 entity");
+        assert_eq!(entities[0]["selector_name"].as_str(), Some("eth0"));
+        assert_eq!(
+            entities[0]["fields"]["mtu"].as_u64(),
+            Some(1400),
+            "state_after mtu must be 1400 (the target)"
+        );
+
+        // AC: active_policies is empty in daemon-free revert mode.
+        let policies = value["active_policies"]
+            .as_array()
+            .expect("active_policies must be array");
+        assert!(
+            policies.is_empty(),
+            "daemon-free revert entry must have empty active_policies"
+        );
+
+        // AC: outcome reflects the apply result.
+        assert_eq!(
+            value["outcome"]["kind"].as_str(),
+            Some("applied"),
+            "revert outcome kind must be 'applied'"
+        );
+        assert_eq!(
+            value["outcome"]["succeeded"].as_u64(),
+            Some(1),
+            "revert outcome succeeded must be 1"
+        );
+        assert_eq!(
+            value["outcome"]["failed"].as_u64(),
+            Some(0),
+            "revert outcome failed must be 0"
+        );
+    }
+
     /// AC: ExternalChange trigger contains changed_entities list.
     #[test]
     fn test_external_change_trigger_contains_changed_entities() {
