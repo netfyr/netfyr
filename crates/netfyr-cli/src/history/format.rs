@@ -384,8 +384,23 @@ fn format_scalar_field_diff(
             let desired = opt_json_compact(&fc.desired);
             let old_line = format!("-{}: {}", fc.field_name, current);
             let new_line = format!("+{}: {}", fc.field_name, desired);
-            out.push_str(&format!("      {}\n", old_line.red()));
-            out.push_str(&format!("      {}{}\n", new_line.green(), ann));
+            match annotation {
+                Some("skipped") | Some("failed") => {
+                    // The new value was never applied; suppress the +new line so the
+                    // operator is not misled into thinking the desired value took effect.
+                    out.push_str(&format!("      {}{}\n", old_line.red(), ann));
+                }
+                Some("applied") => {
+                    // In a mixed-outcome context, confirm what was actually set and
+                    // suppress the -old line (less relevant once the change landed).
+                    out.push_str(&format!("      {}{}\n", new_line.green(), ann));
+                }
+                _ => {
+                    // No annotation (all succeeded or unannotated): standard unified-diff.
+                    out.push_str(&format!("      {}\n", old_line.red()));
+                    out.push_str(&format!("      {}{}\n", new_line.green(), ann));
+                }
+            }
         }
         "unset" => {
             let current = opt_json_compact(&fc.current);
