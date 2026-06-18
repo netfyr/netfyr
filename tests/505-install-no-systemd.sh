@@ -32,9 +32,6 @@ for bin in netfyr netfyr-daemon; do
 done
 # dist/ is NOT provided: with --no-systemd the install block is skipped, so
 # the systemd unit files are never accessed.
-# Symlink examples/ to avoid the script exiting 1 from its last summary line
-# when EXAMPLES_DIR does not exist (bug in install.sh — verify phase handles it).
-ln -s "$PROJECT_ROOT/examples" "$FAKE_PROJECT/examples"
 
 DEST="$TMPDIR_TEST/dest"
 SYSTEMDDIR="$TMPDIR_TEST/systemd"

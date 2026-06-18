@@ -133,9 +133,19 @@ echo "Done."
 echo ""
 echo "Installed:"
 echo "  netfyr         -> $BINDIR/netfyr"
-[[ $INSTALL_DAEMON -eq 1 ]]      && echo "  netfyr-daemon  -> $BINDIR/netfyr-daemon"
-[[ -d "$MAN_DIR" ]]               && echo "  man pages      -> $MANDIR/"
-[[ $INSTALL_COMPLETIONS -eq 1 ]]  && echo "  completions    -> $COMPLETIONDIR/netfyr"
-[[ $INSTALL_DAEMON -eq 1 && $INSTALL_SYSTEMD -eq 1 ]] && echo "  systemd units  -> $SYSTEMDDIR/"
+if [[ $INSTALL_DAEMON -eq 1 ]]; then
+    echo "  netfyr-daemon  -> $BINDIR/netfyr-daemon"
+fi
+if [[ -d "$MAN_DIR" ]]; then
+    echo "  man pages      -> $MANDIR/"
+fi
+if [[ $INSTALL_COMPLETIONS -eq 1 ]]; then
+    echo "  completions    -> $COMPLETIONDIR/netfyr"
+fi
+if [[ $INSTALL_DAEMON -eq 1 && $INSTALL_SYSTEMD -eq 1 ]]; then
+    echo "  systemd units  -> $SYSTEMDDIR/"
+fi
 echo "  config dir     -> $SYSCONFDIR/netfyr/"
-[[ -d "$EXAMPLES_DIR" ]]          && echo "  examples       -> $DOCDIR/examples/policies/"
+if [[ -d "$EXAMPLES_DIR" ]]; then
+    echo "  examples       -> $DOCDIR/examples/policies/"
+fi

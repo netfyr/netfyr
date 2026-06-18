@@ -33,10 +33,6 @@ done
 
 # Symlink dist/ so systemd unit files are available (daemon+systemd both default to enabled).
 ln -s "$PROJECT_ROOT/dist"     "$FAKE_PROJECT/dist"
-# Symlink examples/ so the script's last line doesn't return 1. Without examples/,
-# the final `[[ -d "$EXAMPLES_DIR" ]] && echo ...` makes the script exit 1 —
-# a bug in install.sh that the verify phase should address.
-ln -s "$PROJECT_ROOT/examples" "$FAKE_PROJECT/examples"
 
 DEST="$TMPDIR_TEST/dest"
 SYSTEMDDIR="$TMPDIR_TEST/systemd"

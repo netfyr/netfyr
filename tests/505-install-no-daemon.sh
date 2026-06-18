@@ -32,9 +32,6 @@ chmod 0755 "$FAKE_PROJECT/target/release/netfyr"
 # Symlink the real man/ directory so the script installs sections 1/5/7 and we
 # can verify section 8 is absent.
 ln -s "$PROJECT_ROOT/man"      "$FAKE_PROJECT/man"
-# Symlink examples/ to avoid the script exiting 1 from its last summary line
-# when EXAMPLES_DIR does not exist (bug in install.sh — verify phase handles it).
-ln -s "$PROJECT_ROOT/examples" "$FAKE_PROJECT/examples"
 
 DEST="$TMPDIR_TEST/dest"
 SYSTEMDDIR="$TMPDIR_TEST/systemd"

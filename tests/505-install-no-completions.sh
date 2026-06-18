@@ -31,9 +31,6 @@ done
 
 # Systemd units are installed by default (daemon + systemd enabled); provide dist/.
 ln -s "$PROJECT_ROOT/dist"     "$FAKE_PROJECT/dist"
-# Symlink examples/ to avoid the script exiting 1 from its last summary line
-# when EXAMPLES_DIR does not exist (bug in install.sh — verify phase handles it).
-ln -s "$PROJECT_ROOT/examples" "$FAKE_PROJECT/examples"
 
 DEST="$TMPDIR_TEST/dest"
 SYSTEMDDIR="$TMPDIR_TEST/systemd"
