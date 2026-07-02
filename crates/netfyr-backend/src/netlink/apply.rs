@@ -34,7 +34,10 @@ const DEFAULT_ROUTE_METRIC: u32 = 100;
 /// Fields this backend can write. Any field not in this set is read-only and
 /// will be skipped with reason "read-only field" (defensive check — SPEC-203
 /// should exclude read-only fields from the diff before they reach here).
-const WRITABLE_FIELDS: &[&str] = &["mtu", "enabled", "addresses", "routes"];
+///
+/// Both old flat names ("addresses", "routes") and new sub-object names
+/// ("ipv4", "ipv6") are writable to support backward compatibility.
+const WRITABLE_FIELDS: &[&str] = &["mtu", "enabled", "addresses", "routes", "ipv4", "ipv6"];
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
@@ -550,29 +553,31 @@ async fn apply_modify_fields(
 
     // ── Phase 2: Addresses ────────────────────────────────────────────────────
 
-    let addr_in_changed = changed_fields.contains_key("addresses");
-    let addr_in_removed = removed_fields.iter().any(|f| f == "addresses");
+    let addr_in_changed = changed_fields.contains_key("addresses")
+        || changed_fields
+            .get("ipv4")
+            .and_then(|fv| fv.value.as_map())
+            .map(|m| m.contains_key("addresses"))
+            .unwrap_or(false)
+        || changed_fields
+            .get("ipv6")
+            .and_then(|fv| fv.value.as_map())
+            .map(|m| m.contains_key("addresses"))
+            .unwrap_or(false);
+    let addr_in_removed =
+        removed_fields.iter().any(|f| f == "addresses" || f == "ipv4" || f == "ipv6");
 
     if addr_in_changed || addr_in_removed {
         // Full desired address list; empty when field is being removed.
         // Keep original Value items so we can extract lifetimes when adding.
-        let desired_items: Vec<&Value> = if let Some(fv) = changed_fields.get("addresses") {
-            fv.value.as_list().map(|list| list.iter().collect()).unwrap_or_default()
+        let desired_items: Vec<&Value> = if addr_in_changed {
+            extract_desired_address_items(changed_fields)
         } else {
             vec![]
         };
         let desired_addrs: Vec<String> = desired_items.iter().filter_map(|v| addr_to_cidr(v)).collect();
 
-        let current_addrs: Vec<String> = current_state
-            .fields
-            .get("addresses")
-            .and_then(|fv| fv.value.as_list())
-            .map(|list| {
-                list.iter()
-                    .filter_map(addr_to_cidr)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let current_addrs: Vec<String> = extract_current_addresses(current_state);
 
         let to_add: Vec<(usize, &String)> = desired_addrs
             .iter()
@@ -719,23 +724,29 @@ async fn apply_modify_fields(
 
     // ── Phase 3: Routes ───────────────────────────────────────────────────────
 
-    let route_in_changed = changed_fields.contains_key("routes");
-    let route_in_removed = removed_fields.iter().any(|f| f == "routes");
+    let route_in_changed = changed_fields.contains_key("routes")
+        || changed_fields
+            .get("ipv4")
+            .and_then(|fv| fv.value.as_map())
+            .map(|m| m.contains_key("routes"))
+            .unwrap_or(false)
+        || changed_fields
+            .get("ipv6")
+            .and_then(|fv| fv.value.as_map())
+            .map(|m| m.contains_key("routes"))
+            .unwrap_or(false);
+    let route_in_removed =
+        removed_fields.iter().any(|f| f == "routes" || f == "ipv4" || f == "ipv6");
 
     if route_in_changed || route_in_removed {
         // Full desired route list; empty when field is being removed.
-        let desired_routes: Vec<Value> = if let Some(fv) = changed_fields.get("routes") {
-            fv.value.as_list().cloned().unwrap_or_default()
+        let desired_routes: Vec<Value> = if route_in_changed {
+            extract_desired_routes(changed_fields)
         } else {
             vec![]
         };
 
-        let current_routes: Vec<Value> = current_state
-            .fields
-            .get("routes")
-            .and_then(|fv| fv.value.as_list())
-            .cloned()
-            .unwrap_or_default();
+        let current_routes: Vec<Value> = extract_current_routes(current_state);
 
         let to_add: Vec<&Value> = desired_routes
             .iter()
@@ -1207,6 +1218,94 @@ fn addr_valid_lft(v: &Value) -> Option<u32> {
 
 fn addr_preferred_lft(v: &Value) -> Option<u32> {
     v.as_map()?.get("preferred_lft")?.as_u64().map(|n| n as u32)
+}
+
+/// Extract desired address `Value` items from changed_fields, handling both the
+/// old flat format (`addresses: [...]`) and the new sub-object format
+/// (`ipv4: {addresses: [...]}, ipv6: {addresses: [...]}`).
+fn extract_desired_address_items(
+    changed_fields: &IndexMap<String, FieldValue>,
+) -> Vec<&Value> {
+    if let Some(fv) = changed_fields.get("addresses") {
+        return fv.value.as_list().map(|l| l.iter().collect()).unwrap_or_default();
+    }
+    let mut result = Vec::new();
+    for family in &["ipv4", "ipv6"] {
+        if let Some(fv) = changed_fields.get(*family) {
+            if let Some(map) = fv.value.as_map() {
+                if let Some(addrs_val) = map.get("addresses") {
+                    if let Some(list) = addrs_val.as_list() {
+                        result.extend(list.iter());
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Extract current addresses from state, handling both flat and sub-object formats.
+fn extract_current_addresses(state: &State) -> Vec<String> {
+    if let Some(fv) = state.fields.get("addresses") {
+        return fv
+            .value
+            .as_list()
+            .map(|list| list.iter().filter_map(addr_to_cidr).collect())
+            .unwrap_or_default();
+    }
+    let mut result = Vec::new();
+    for family in &["ipv4", "ipv6"] {
+        if let Some(fv) = state.fields.get(*family) {
+            if let Some(map) = fv.value.as_map() {
+                if let Some(addrs_val) = map.get("addresses") {
+                    if let Some(list) = addrs_val.as_list() {
+                        result.extend(list.iter().filter_map(addr_to_cidr));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Extract desired routes from changed_fields, handling both flat and sub-object formats.
+fn extract_desired_routes(changed_fields: &IndexMap<String, FieldValue>) -> Vec<Value> {
+    if let Some(fv) = changed_fields.get("routes") {
+        return fv.value.as_list().cloned().unwrap_or_default();
+    }
+    let mut result = Vec::new();
+    for family in &["ipv4", "ipv6"] {
+        if let Some(fv) = changed_fields.get(*family) {
+            if let Some(map) = fv.value.as_map() {
+                if let Some(routes_val) = map.get("routes") {
+                    if let Some(list) = routes_val.as_list() {
+                        result.extend(list.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Extract current routes from state, handling both flat and sub-object formats.
+fn extract_current_routes(state: &State) -> Vec<Value> {
+    if let Some(fv) = state.fields.get("routes") {
+        return fv.value.as_list().cloned().unwrap_or_default();
+    }
+    let mut result = Vec::new();
+    for family in &["ipv4", "ipv6"] {
+        if let Some(fv) = state.fields.get(*family) {
+            if let Some(map) = fv.value.as_map() {
+                if let Some(routes_val) = map.get("routes") {
+                    if let Some(list) = routes_val.as_list() {
+                        result.extend(list.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
 fn is_link_local(cidr: &str) -> bool {

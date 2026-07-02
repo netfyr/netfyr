@@ -49,9 +49,9 @@ output=$("$NETFYR_BIN" query \
     --selector name=veth-test0 \
     --output json)
 
-# Assert: the "routes" key is present.
-if ! echo "$output" | grep -q '"routes"'; then
-    echo "FAIL: 102-query-kernel-routes-excluded: output does not contain 'routes' field" >&2
+# Assert: the "ipv4" sub-object is present.
+if ! echo "$output" | grep -q '"ipv4"'; then
+    echo "FAIL: 102-query-kernel-routes-excluded: output does not contain 'ipv4' sub-object" >&2
     echo "Output: $output" >&2
     exit 1
 fi
@@ -65,8 +65,8 @@ if ! echo "$output" | grep -q '10\.77\.0\.0/24'; then
 fi
 
 # Assert: the kernel-managed connected route (10.88.0.0/24) is NOT present in routes.
-# The address 10.88.0.1/24 will appear in "addresses", but the network 10.88.0.0/24
-# (the kernel-installed connected route) should be absent from "routes".
+# The address 10.88.0.1/24 will appear in "ipv4.addresses", but the network 10.88.0.0/24
+# (the kernel-installed connected route) should be absent from "ipv4.routes".
 if echo "$output" | grep -q '10\.88\.0\.0/24'; then
     echo "FAIL: 102-query-kernel-routes-excluded: kernel route 10.88.0.0/24 appears in output but should be excluded" >&2
     echo "Output: $output" >&2

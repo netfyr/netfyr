@@ -15,11 +15,13 @@ use netlink_packet_route::route::{
 use rtnetlink::Handle;
 use tracing::warn;
 
+use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
+
 use crate::BackendError;
 use super::query::{
-    build_discovered_selector, read_sysfs_driver,
-    read_sysfs_is_wifi, read_sysfs_pci_path, read_sysfs_speed,
-    read_sysfs_wifi_frequency, read_sysfs_wifi_mode, read_sysfs_wifi_ssid,
+    build_discovered_selector, read_dns_servers, read_procfs_addr_gen_mode,
+    read_procfs_dad_transmits, read_sysfs_driver, read_sysfs_is_wifi, read_sysfs_pci_path,
+    read_sysfs_speed, read_sysfs_wifi_frequency, read_sysfs_wifi_mode, read_sysfs_wifi_ssid,
 };
 
 // ── Exclusion list ────────────────────────────────────────────────────────────
@@ -243,12 +245,54 @@ fn build_wifi_sub_object(name: &str) -> Option<FieldValue> {
 
 // ── Address dump ─────────────────────────────────────────────────────────────
 
-/// Dump all addresses from the kernel and return a map from interface index to
-/// CIDR strings (e.g., `"10.0.1.50/24"`).
-async fn dump_addresses(
-    handle: &Handle,
-) -> Result<HashMap<u32, Vec<String>>, BackendError> {
-    let mut map: HashMap<u32, Vec<String>> = HashMap::new();
+struct AddressDump {
+    ipv4: HashMap<u32, Vec<String>>,
+    ipv6: HashMap<u32, Vec<Value>>,
+}
+
+/// Classify the DAD (Duplicate Address Detection) state of an IPv6 address.
+///
+/// Checks the 32-bit `IFA_FLAGS` attribute first (authoritative on modern
+/// kernels), then falls back to the 8-bit header flags field.
+fn classify_dad_state(
+    attributes: &[AddressAttribute],
+    header_flags: &AddressHeaderFlags,
+) -> &'static str {
+    for attr in attributes {
+        if let AddressAttribute::Flags(flags) = attr {
+            if flags.contains(AddressFlags::Dadfailed) {
+                return "dadfailed";
+            }
+            if flags.contains(AddressFlags::Tentative) {
+                return "tentative";
+            }
+            if flags.contains(AddressFlags::Deprecated) {
+                return "deprecated";
+            }
+            return "preferred";
+        }
+    }
+    if header_flags.contains(AddressHeaderFlags::Dadfailed) {
+        return "dadfailed";
+    }
+    if header_flags.contains(AddressHeaderFlags::Tentative) {
+        return "tentative";
+    }
+    if header_flags.contains(AddressHeaderFlags::Deprecated) {
+        return "deprecated";
+    }
+    "preferred"
+}
+
+/// Dump all addresses from the kernel, split by address family.
+///
+/// IPv4 addresses are stored as CIDR strings. IPv6 addresses are stored as
+/// `Value::Map { address: CIDR, dad_state: "preferred"|"tentative"|... }`.
+async fn dump_addresses(handle: &Handle) -> Result<AddressDump, BackendError> {
+    let mut result = AddressDump {
+        ipv4: HashMap::new(),
+        ipv6: HashMap::new(),
+    };
 
     let mut stream = handle.address().get().execute();
     while let Some(msg) = stream.try_next().await.map_err(|e| BackendError::QueryFailed {
@@ -256,44 +300,63 @@ async fn dump_addresses(
         source: Box::new(e),
     })? {
         let family = msg.header.family;
-        if family != netlink_packet_route::AddressFamily::Inet
-            && family != netlink_packet_route::AddressFamily::Inet6
-        {
-            continue;
-        }
-
         let index = msg.header.index;
         let prefix_len = msg.header.prefix_len;
 
-        for attr in &msg.attributes {
-            if let netlink_packet_route::address::AddressAttribute::Address(ip) = attr {
-                let cidr = format!("{ip}/{prefix_len}");
-                map.entry(index).or_default().push(cidr);
+        match family {
+            netlink_packet_route::AddressFamily::Inet => {
+                for attr in &msg.attributes {
+                    if let AddressAttribute::Address(ip) = attr {
+                        let cidr = format!("{ip}/{prefix_len}");
+                        result.ipv4.entry(index).or_default().push(cidr);
+                    }
+                }
             }
+            netlink_packet_route::AddressFamily::Inet6 => {
+                let dad_state = classify_dad_state(&msg.attributes, &msg.header.flags);
+                for attr in &msg.attributes {
+                    if let AddressAttribute::Address(ip) = attr {
+                        let cidr = format!("{ip}/{prefix_len}");
+                        let mut map = IndexMap::new();
+                        map.insert("address".to_string(), Value::String(cidr));
+                        map.insert("dad_state".to_string(), Value::String(dad_state.to_owned()));
+                        result.ipv6.entry(index).or_default().push(Value::Map(map));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    Ok(map)
+    Ok(result)
 }
 
 // ── Route dump ────────────────────────────────────────────────────────────────
 
-/// Dump IPv4 and IPv6 routes and return a map from output interface index to
-/// route `Value::Map` objects.
+struct RouteDump {
+    ipv4: HashMap<u32, Vec<Value>>,
+    ipv6: HashMap<u32, Vec<Value>>,
+}
+
+/// Dump non-kernel routes from the kernel, split by address family.
 ///
-/// Only unicast routes (RTN_UNICAST) are included. Routes with no output
-/// interface (`RTA_OIF`) — e.g., local/blackhole routes — are skipped.
+/// Kernel-managed routes (proto kernel) are excluded. The protocol field is
+/// stripped from all returned route maps so values match policy-produced state.
 async fn dump_routes(
     handle: &Handle,
     known_indices: &std::collections::HashSet<u32>,
-) -> Result<HashMap<u32, Vec<Value>>, BackendError> {
-    let mut map: HashMap<u32, Vec<Value>> = HashMap::new();
+) -> Result<RouteDump, BackendError> {
+    let mut result = RouteDump {
+        ipv4: HashMap::new(),
+        ipv6: HashMap::new(),
+    };
 
     let families = [
-        netlink_packet_route::AddressFamily::Inet,
-        netlink_packet_route::AddressFamily::Inet6,
+        (netlink_packet_route::AddressFamily::Inet, true),
+        (netlink_packet_route::AddressFamily::Inet6, false),
     ];
-    for family in families {
+
+    for (family, is_ipv4) in families {
         let mut route_msg = RouteMessage::default();
         route_msg.header.address_family = family;
 
@@ -302,16 +365,28 @@ async fn dump_routes(
             entity_type: "interface".to_string(),
             source: Box::new(e),
         })? {
-            if let Some(route_val) = parse_route_message(&msg, known_indices) {
-                let oif = extract_oif(&msg);
-                if let Some(idx) = oif {
-                    map.entry(idx).or_default().push(route_val);
+            if msg.header.protocol == RouteProtocol::Kernel {
+                continue;
+            }
+
+            if let Some(mut route_val) = parse_route_message(&msg, known_indices) {
+                let oif = match extract_oif(&msg) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                if let Value::Map(ref mut m) = route_val {
+                    m.shift_remove("protocol");
+                }
+                if is_ipv4 {
+                    result.ipv4.entry(oif).or_default().push(route_val);
+                } else {
+                    result.ipv6.entry(oif).or_default().push(route_val);
                 }
             }
         }
     }
 
-    Ok(map)
+    Ok(result)
 }
 
 fn extract_oif(msg: &RouteMessage) -> Option<u32> {
@@ -1009,6 +1084,139 @@ mod tests {
         assert_eq!(map["table"].as_u64(), Some(100), "table must survive stripping");
         assert_eq!(map["tos"].as_u64(), Some(8), "tos must survive stripping");
     }
+
+    // ── classify_dad_state ────────────────────────────────────────────────────────
+
+    /// Scenario: Query reports IPv6 DAD state on addresses — "preferred" state.
+    /// An address whose IFA_FLAGS attribute has no special flags has completed DAD
+    /// successfully; classify_dad_state must return "preferred".
+    #[test]
+    fn test_classify_dad_state_preferred_with_empty_ifa_flags() {
+        use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
+        let attrs = vec![AddressAttribute::Flags(AddressFlags::empty())];
+        let header_flags = AddressHeaderFlags::empty();
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "preferred",
+            "empty IFA_FLAGS must produce 'preferred' DAD state"
+        );
+    }
+
+    /// When IFA_FLAGS has the Tentative flag set, DAD is in progress; the address
+    /// has not yet been confirmed as unique on the link.
+    #[test]
+    fn test_classify_dad_state_tentative_from_ifa_flags() {
+        use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
+        let attrs = vec![AddressAttribute::Flags(AddressFlags::Tentative)];
+        let header_flags = AddressHeaderFlags::empty();
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "tentative",
+            "Tentative IFA_FLAGS must produce 'tentative' DAD state"
+        );
+    }
+
+    /// When IFA_FLAGS has the Dadfailed flag set, a duplicate was detected on the link.
+    #[test]
+    fn test_classify_dad_state_dadfailed_from_ifa_flags() {
+        use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
+        let attrs = vec![AddressAttribute::Flags(AddressFlags::Dadfailed)];
+        let header_flags = AddressHeaderFlags::empty();
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "dadfailed",
+            "Dadfailed IFA_FLAGS must produce 'dadfailed' DAD state"
+        );
+    }
+
+    /// When IFA_FLAGS has the Deprecated flag set, the address is deprecated —
+    /// usable for existing connections but not for new ones.
+    #[test]
+    fn test_classify_dad_state_deprecated_from_ifa_flags() {
+        use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
+        let attrs = vec![AddressAttribute::Flags(AddressFlags::Deprecated)];
+        let header_flags = AddressHeaderFlags::empty();
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "deprecated",
+            "Deprecated IFA_FLAGS must produce 'deprecated' DAD state"
+        );
+    }
+
+    /// IFA_FLAGS attribute takes precedence over header flags.
+    /// When IFA_FLAGS says "preferred" (no special flags) but the 8-bit header
+    /// flag says "tentative", the header flag must be ignored.
+    /// This tests the spec rule: "Check the 32-bit IFA_FLAGS attribute first
+    /// (authoritative on modern kernels), then fall back to the 8-bit header field."
+    #[test]
+    fn test_classify_dad_state_ifa_flags_overrides_header() {
+        use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags};
+        let attrs = vec![AddressAttribute::Flags(AddressFlags::empty())];
+        let header_flags = AddressHeaderFlags::Tentative;
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "preferred",
+            "IFA_FLAGS attribute must override header flags when present"
+        );
+    }
+
+    /// Fallback to header flags when no IFA_FLAGS attribute is present.
+    /// On older kernels that omit the IFA_FLAGS netlink attribute, the 8-bit
+    /// header flags field is the only source of DAD state.
+    /// Header flag Tentative → "tentative".
+    #[test]
+    fn test_classify_dad_state_fallback_to_header_tentative() {
+        use netlink_packet_route::address::{AddressAttribute, AddressHeaderFlags};
+        let attrs: Vec<AddressAttribute> = vec![];
+        let header_flags = AddressHeaderFlags::Tentative;
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "tentative",
+            "fallback: header Tentative flag must produce 'tentative'"
+        );
+    }
+
+    /// Fallback to header flags when no IFA_FLAGS attribute is present.
+    /// Header flag Dadfailed → "dadfailed".
+    #[test]
+    fn test_classify_dad_state_fallback_to_header_dadfailed() {
+        use netlink_packet_route::address::{AddressAttribute, AddressHeaderFlags};
+        let attrs: Vec<AddressAttribute> = vec![];
+        let header_flags = AddressHeaderFlags::Dadfailed;
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "dadfailed",
+            "fallback: header Dadfailed flag must produce 'dadfailed'"
+        );
+    }
+
+    /// Fallback to header flags when no IFA_FLAGS attribute is present.
+    /// Header flag Deprecated → "deprecated".
+    #[test]
+    fn test_classify_dad_state_fallback_to_header_deprecated() {
+        use netlink_packet_route::address::{AddressAttribute, AddressHeaderFlags};
+        let attrs: Vec<AddressAttribute> = vec![];
+        let header_flags = AddressHeaderFlags::Deprecated;
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "deprecated",
+            "fallback: header Deprecated flag must produce 'deprecated'"
+        );
+    }
+
+    /// Fallback to header flags when no IFA_FLAGS attribute is present.
+    /// Empty header flags → "preferred" (the default / normal state).
+    #[test]
+    fn test_classify_dad_state_fallback_empty_header_returns_preferred() {
+        use netlink_packet_route::address::{AddressAttribute, AddressHeaderFlags};
+        let attrs: Vec<AddressAttribute> = vec![];
+        let header_flags = AddressHeaderFlags::empty();
+        assert_eq!(
+            classify_dad_state(&attrs, &header_flags),
+            "preferred",
+            "fallback: empty header flags must produce 'preferred'"
+        );
+    }
 }
 
 // ── Main query function ───────────────────────────────────────────────────────
@@ -1126,13 +1334,16 @@ pub async fn query_interfaces(
     let known_indices: std::collections::HashSet<u32> =
         matched_links.iter().map(|l| l.index).collect();
 
-    // ── Step 5: Dump addresses ─────────────────────────────────────────────────
-    let addr_map = dump_addresses(handle).await?;
+    // ── Step 5: Read DNS servers (global — read once before the link loop) ────
+    let dns_servers = read_dns_servers();
 
-    // ── Step 6: Dump routes ────────────────────────────────────────────────────
-    let route_map = dump_routes(handle, &known_indices).await?;
+    // ── Step 6: Dump addresses ─────────────────────────────────────────────────
+    let addr_dump = dump_addresses(handle).await?;
 
-    // ── Step 7: Assemble State objects ────────────────────────────────────────
+    // ── Step 7: Dump routes ────────────────────────────────────────────────────
+    let route_dump = dump_routes(handle, &known_indices).await?;
+
+    // ── Step 8: Assemble State objects ────────────────────────────────────────
     let mut state_set = StateSet::new();
 
     for link in matched_links {
@@ -1184,8 +1395,9 @@ pub async fn query_interfaces(
             }
         }
 
-        // Addresses
-        let addr_list: Vec<Value> = addr_map
+        // IPv4 sub-object: addresses (CIDRs), routes, dns_servers.
+        let ipv4_addrs: Vec<Value> = addr_dump
+            .ipv4
             .get(&link.index)
             .map(|addrs| {
                 addrs
@@ -1198,33 +1410,54 @@ pub async fn query_interfaces(
                     .collect()
             })
             .unwrap_or_default();
-        fields.insert("addresses".to_string(), kernel_default(Value::List(addr_list)));
-
-        // Routes — exclude kernel-managed routes (proto kernel) and strip
-        // the protocol field so values match policy-produced desired state.
-        let route_list: Vec<Value> = route_map
+        let ipv4_routes: Vec<Value> = route_dump
+            .ipv4
             .get(&link.index)
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| {
-                r.as_map()
-                    .and_then(|m| m.get("protocol"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s != "kernel")
-                    .unwrap_or(true)
-            })
-            .map(|r| {
-                match r {
-                    Value::Map(mut m) => {
-                        m.shift_remove("protocol");
-                        Value::Map(m)
-                    }
-                    other => other,
-                }
-            })
+            .unwrap_or_default();
+        let ipv4_dns: Vec<Value> = dns_servers
+            .0
+            .iter()
+            .map(|ip| Value::IpAddr(*ip))
             .collect();
-        fields.insert("routes".to_string(), kernel_default(Value::List(route_list)));
+        let mut ipv4_map = IndexMap::new();
+        ipv4_map.insert("addresses".to_string(), Value::List(ipv4_addrs));
+        ipv4_map.insert("routes".to_string(), Value::List(ipv4_routes));
+        if !ipv4_dns.is_empty() {
+            ipv4_map.insert("dns_servers".to_string(), Value::List(ipv4_dns));
+        }
+        fields.insert("ipv4".to_string(), kernel_default(Value::Map(ipv4_map)));
+
+        // IPv6 sub-object: addresses (maps with dad_state), routes, dns_servers,
+        // link_local (addr_gen_mode), dad_transmits.
+        let ipv6_addrs: Vec<Value> = addr_dump
+            .ipv6
+            .get(&link.index)
+            .cloned()
+            .unwrap_or_default();
+        let ipv6_routes: Vec<Value> = route_dump
+            .ipv6
+            .get(&link.index)
+            .cloned()
+            .unwrap_or_default();
+        let ipv6_dns: Vec<Value> = dns_servers
+            .1
+            .iter()
+            .map(|ip| Value::IpAddr(*ip))
+            .collect();
+        let mut ipv6_map = IndexMap::new();
+        ipv6_map.insert("addresses".to_string(), Value::List(ipv6_addrs));
+        ipv6_map.insert("routes".to_string(), Value::List(ipv6_routes));
+        if !ipv6_dns.is_empty() {
+            ipv6_map.insert("dns_servers".to_string(), Value::List(ipv6_dns));
+        }
+        if let Some(link_local) = read_procfs_addr_gen_mode(&link.name) {
+            ipv6_map.insert("link_local".to_string(), Value::String(link_local));
+        }
+        if let Some(dad_tx) = read_procfs_dad_transmits(&link.name) {
+            ipv6_map.insert("dad_transmits".to_string(), Value::U64(dad_tx));
+        }
+        fields.insert("ipv6".to_string(), kernel_default(Value::Map(ipv6_map)));
 
         let state = State {
             entity_type: detected_type.to_string(),

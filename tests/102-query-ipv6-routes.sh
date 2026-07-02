@@ -1,7 +1,7 @@
 #!/bin/bash
 # 102-query-ipv6-routes.sh
 # Integration test: Query an interface with an IPv6 route and verify
-# the query output includes the IPv6 route with a "destination" field.
+# the query output includes the IPv6 route in the "ipv6" sub-object.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=helpers.sh
@@ -31,8 +31,8 @@ QUERY_OUTPUT=$("$NETFYR_BIN" query \
     --selector name=veth-test0 \
     --output json)
 
-if ! echo "$QUERY_OUTPUT" | grep -q '"routes"'; then
-    echo "FAIL: 102-query-ipv6-routes: output does not contain 'routes' field" >&2
+if ! echo "$QUERY_OUTPUT" | grep -q '"ipv6"'; then
+    echo "FAIL: 102-query-ipv6-routes: output does not contain 'ipv6' sub-object" >&2
     echo "      Output: $QUERY_OUTPUT" >&2
     exit 1
 fi

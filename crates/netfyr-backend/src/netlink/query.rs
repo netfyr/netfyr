@@ -112,6 +112,54 @@ pub fn read_sysfs_wifi_frequency(_name: &str) -> Option<u64> {
     None
 }
 
+/// Read the IPv6 address generation mode from procfs.
+///
+/// `/proc/sys/net/ipv6/conf/<name>/addr_gen_mode`: 0 → "eui64", 1 → "none".
+/// Returns `None` on read/parse failure or unknown value.
+pub fn read_procfs_addr_gen_mode(name: &str) -> Option<String> {
+    let path = format!("/proc/sys/net/ipv6/conf/{name}/addr_gen_mode");
+    let content = std::fs::read_to_string(&path).ok()?;
+    match content.trim() {
+        "0" => Some("eui64".to_owned()),
+        "1" => Some("none".to_owned()),
+        _ => None,
+    }
+}
+
+/// Read the number of DAD NS probes from procfs.
+///
+/// `/proc/sys/net/ipv6/conf/<name>/dad_transmits`. Returns `None` on failure.
+pub fn read_procfs_dad_transmits(name: &str) -> Option<u64> {
+    let path = format!("/proc/sys/net/ipv6/conf/{name}/dad_transmits");
+    let content = std::fs::read_to_string(&path).ok()?;
+    content.trim().parse().ok()
+}
+
+/// Read DNS servers from `/etc/resolv.conf`, split by address family.
+///
+/// Returns `(ipv4_servers, ipv6_servers)`. Returns empty vectors if the file
+/// doesn't exist, can't be read, or contains no valid nameserver lines.
+pub fn read_dns_servers() -> (Vec<std::net::IpAddr>, Vec<std::net::IpAddr>) {
+    parse_resolv_conf(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default())
+}
+
+fn parse_resolv_conf(content: &str) -> (Vec<std::net::IpAddr>, Vec<std::net::IpAddr>) {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("nameserver") {
+            if let Ok(ip) = rest.trim().parse::<std::net::IpAddr>() {
+                match ip {
+                    std::net::IpAddr::V4(_) => ipv4.push(ip),
+                    std::net::IpAddr::V6(_) => ipv6.push(ip),
+                }
+            }
+        }
+    }
+    (ipv4, ipv6)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -460,6 +508,110 @@ mod tests {
             assert!(
                 result.is_none(),
                 "read_sysfs_wifi_frequency({name}) stub must return None until nl80211 is implemented"
+            );
+        }
+    }
+
+    // ── parse_resolv_conf ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_resolv_conf_empty_returns_empty() {
+        let (v4, v6) = parse_resolv_conf("");
+        assert!(v4.is_empty());
+        assert!(v6.is_empty());
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_ipv4_nameservers() {
+        let content = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+        let (v4, v6) = parse_resolv_conf(content);
+        assert_eq!(v4.len(), 2);
+        assert!(v6.is_empty());
+        assert_eq!(v4[0].to_string(), "8.8.8.8");
+        assert_eq!(v4[1].to_string(), "1.1.1.1");
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_ipv6_nameservers() {
+        let content = "nameserver 2001:4860:4860::8888\n";
+        let (v4, v6) = parse_resolv_conf(content);
+        assert!(v4.is_empty());
+        assert_eq!(v6.len(), 1);
+        assert_eq!(v6[0].to_string(), "2001:4860:4860::8888");
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_mixed_families() {
+        let content = "nameserver 8.8.8.8\nnameserver 2001:db8::1\nnameserver 1.1.1.1\n";
+        let (v4, v6) = parse_resolv_conf(content);
+        assert_eq!(v4.len(), 2);
+        assert_eq!(v6.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_ignores_non_nameserver_lines() {
+        let content = "# comment\ndomain example.com\nnameserver 8.8.8.8\nsearch example.com\n";
+        let (v4, v6) = parse_resolv_conf(content);
+        assert_eq!(v4.len(), 1);
+        assert!(v6.is_empty());
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_ignores_invalid_ip() {
+        let content = "nameserver not-an-ip\nnameserver 8.8.8.8\n";
+        let (v4, v6) = parse_resolv_conf(content);
+        assert_eq!(v4.len(), 1, "invalid IP must be ignored");
+        assert!(v6.is_empty());
+    }
+
+    // ── read_procfs_addr_gen_mode ─────────────────────────────────────────────────
+
+    /// Scenario: Query reports IPv6 link_local method.
+    /// read_procfs_addr_gen_mode returns None for a nonexistent interface because
+    /// /proc/sys/net/ipv6/conf/<name>/addr_gen_mode does not exist.
+    #[test]
+    fn test_read_procfs_addr_gen_mode_nonexistent_interface_returns_none() {
+        let result = read_procfs_addr_gen_mode("interface_that_does_not_exist_xyzzy_99");
+        assert!(
+            result.is_none(),
+            "non-existent interface must return None for addr_gen_mode"
+        );
+    }
+
+    /// read_procfs_addr_gen_mode returns None for multiple nonexistent interface names.
+    #[test]
+    fn test_read_procfs_addr_gen_mode_various_fake_names_return_none() {
+        for name in &["eth0_fake_procfs_99", "enp0s3_fake_procfs", "wlan0_fake_procfs"] {
+            let result = read_procfs_addr_gen_mode(name);
+            assert!(
+                result.is_none(),
+                "read_procfs_addr_gen_mode({name}) must return None when procfs file absent"
+            );
+        }
+    }
+
+    // ── read_procfs_dad_transmits ─────────────────────────────────────────────────
+
+    /// Scenario: Query reports IPv6 dad_transmits.
+    /// read_procfs_dad_transmits returns None for a nonexistent interface because
+    /// /proc/sys/net/ipv6/conf/<name>/dad_transmits does not exist.
+    #[test]
+    fn test_read_procfs_dad_transmits_nonexistent_interface_returns_none() {
+        let result = read_procfs_dad_transmits("interface_that_does_not_exist_xyzzy_99");
+        assert!(
+            result.is_none(),
+            "non-existent interface must return None for dad_transmits"
+        );
+    }
+
+    /// read_procfs_dad_transmits returns None for multiple nonexistent interface names.
+    #[test]
+    fn test_read_procfs_dad_transmits_various_fake_names_return_none() {
+        for name in &["eth0_fake_procfs_99", "enp0s3_fake_procfs", "wlan0_fake_procfs"] {
+            let result = read_procfs_dad_transmits(name);
+            assert!(
+                result.is_none(),
+                "read_procfs_dad_transmits({name}) must return None when procfs file absent"
             );
         }
     }

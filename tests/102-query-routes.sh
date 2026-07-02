@@ -1,7 +1,7 @@
 #!/bin/bash
 # 102-query-routes.sh
-# Integration test: Query an ethernet interface and verify the "routes" field is
-# present in the output and contains a non-kernel static route.
+# Integration test: Query an ethernet interface and verify the "ipv4" sub-object
+# is present and contains a non-kernel static route.
 # Mapped to spec acceptance scenario: "Query ethernet interface includes routes".
 #
 # Note: the kernel-connected route (10.99.0.0/24, proto kernel) is intentionally
@@ -43,9 +43,9 @@ output=$("$NETFYR_BIN" query \
     --selector name=veth-test0 \
     --output json)
 
-# Assert: "routes" key is present in the output.
-if ! echo "$output" | grep -q '"routes"'; then
-    echo "FAIL: 102-query-routes: output does not contain 'routes' field" >&2
+# Assert: "ipv4" sub-object is present in the output.
+if ! echo "$output" | grep -q '"ipv4"'; then
+    echo "FAIL: 102-query-routes: output does not contain 'ipv4' sub-object" >&2
     echo "Output: $output" >&2
     exit 1
 fi
