@@ -110,13 +110,17 @@ check_contains "docs/workflows.md" 'DHCP|dhcp' \
     "contains sequence diagram for DHCP lease lifecycle"
 check_contains "docs/workflows.md" '[Ll]ease' \
     "DHCP section describes lease lifecycle"
+check_contains "docs/workflows.md" '[Ii]pv6.*[Aa]uto|[Ii]pv6[Aa]uto|ipv6auto' \
+    "contains sequence diagram for ipv6auto lifecycle"
+check_contains "docs/workflows.md" '[Dd][Hh][Cc][Pp][Vv]6|dhcpv6' \
+    "contains sequence diagram for DHCPv6 client lifecycle"
 
 # Count sequence diagrams
 SEQ_COUNT=$(count_matches "docs/workflows.md" 'sequenceDiagram')
-if [[ "${SEQ_COUNT}" -ge 6 ]]; then
-    pass "docs/workflows.md: has at least 6 sequenceDiagram blocks (found ${SEQ_COUNT})"
+if [[ "${SEQ_COUNT}" -ge 8 ]]; then
+    pass "docs/workflows.md: has at least 8 sequenceDiagram blocks (found ${SEQ_COUNT})"
 else
-    fail "docs/workflows.md: expected at least 6 sequenceDiagram blocks, found ${SEQ_COUNT}"
+    fail "docs/workflows.md: expected at least 8 sequenceDiagram blocks, found ${SEQ_COUNT}"
 fi
 
 echo ""

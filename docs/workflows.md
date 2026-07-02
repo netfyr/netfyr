@@ -260,3 +260,109 @@ sequenceDiagram
         Client->>Server: DHCPRELEASE
     end
 ```
+
+## IPv6 auto-configuration lifecycle
+
+When an interface has IPv6 enabled, the `Ipv6AutoFactory` handles SLAAC (stateless address auto-configuration) by listening for Router Advertisement (ICMPv6 type 134) events via netlink. It extracts prefix information, computes EUI-64 addresses, parses RDNSS/DNSSL/PREF64 options, manages address lifetimes, and conditionally starts a DHCPv6 factory based on the M-flag (managed addresses) or O-flag (other configuration) carried in the RA.
+
+```mermaid
+sequenceDiagram
+    participant Daemon as netfyr-daemon
+    participant Factory as Ipv6AutoFactory
+    participant Kernel as Linux Kernel
+    participant Reconciler
+    participant Dhcpv6 as Dhcpv6Factory
+
+    Daemon->>Factory: start(interface, selector)
+    Factory->>Kernel: Subscribe to RA events<br/>(RTNLGRP_IPV6_IFADDR, ICMPv6 multicast)
+
+    Kernel-->>Factory: Router Advertisement received
+
+    Factory->>Factory: Extract prefix info (prefix, valid_lft, preferred_lft)
+    Factory->>Factory: Compute EUI-64 address from prefix + interface MAC
+    Factory->>Factory: Parse RDNSS option (recursive DNS servers)
+    Factory->>Factory: Parse DNSSL option (DNS search list)
+    Factory->>Factory: Parse PREF64 option (NAT64 prefix)
+    Factory->>Factory: Check M-flag and O-flag
+
+    alt M-flag set (managed address config)
+        Factory->>Dhcpv6: start(interface, mode=Stateful)
+    else O-flag set (other config)
+        Factory->>Dhcpv6: start(interface, mode=Stateless)
+    end
+
+    rect rgb(230, 240, 255)
+        Note over Factory,Dhcpv6: DHCPv6 sub-sequence (see DHCPv6 client lifecycle below)
+        Dhcpv6->>Kernel: Send Solicit or Information-Request
+        Kernel-->>Dhcpv6: Advertise or Reply (via server)
+        Dhcpv6-->>Factory: DHCPv6 state (addresses, DNS, domains)
+    end
+
+    Factory->>Factory: Merge SLAAC-derived state with DHCPv6-derived state
+    Factory-->>Daemon: FactoryEvent::StateUpdated(merged_state)
+    Daemon->>Reconciler: reconcile_and_apply()
+
+    loop RA refresh
+        Kernel-->>Factory: New Router Advertisement
+        Factory->>Factory: Update lifetimes, add/remove prefixes
+        Factory-->>Daemon: FactoryEvent::StateUpdated
+        Daemon->>Reconciler: reconcile_and_apply()
+    end
+
+    alt Shutdown
+        Daemon->>Factory: stop()
+        Factory->>Dhcpv6: stop()
+        Factory->>Kernel: Unsubscribe from RA events
+    end
+```
+
+## DHCPv6 client lifecycle
+
+DHCPv6 is triggered by the `Ipv6AutoFactory` based on M/O flags in Router Advertisements. The factory requires a link-local address on the interface as a prerequisite before initiating any DHCPv6 exchange. Stateful mode (M-flag) acquires addresses and configuration; stateless mode (O-flag) acquires only configuration such as DNS servers and domain search lists.
+
+```mermaid
+sequenceDiagram
+    participant Factory as Ipv6AutoFactory
+    participant Dhcpv6 as Dhcpv6Factory
+    participant Client as DHCPv6 Client Task
+    participant Server as DHCPv6 Server
+    participant Reconciler
+
+    Factory->>Dhcpv6: start(interface, mode)
+    Dhcpv6->>Dhcpv6: Wait for link-local address on interface
+    Dhcpv6->>Dhcpv6: Generate or load DUID (DUID-LLT or DUID-EN)
+    Dhcpv6->>Client: Spawn tokio task
+
+    alt Stateful mode (M-flag set)
+        Client->>Server: Solicit (with IA_NA option)
+        Server-->>Client: Advertise (with address offers)
+        Client->>Server: Request (preferred address)
+        Server-->>Client: Reply (addresses, DNS servers, domain list)
+        Client->>Dhcpv6: LeaseAcquired(addresses, dns, domains, T1, T2, valid_lft)
+
+        loop Renewal at T1
+            Client->>Server: Renew
+            Server-->>Client: Reply (refreshed lifetimes)
+            Client->>Dhcpv6: LeaseRenewed
+        end
+
+        loop Rebind at T2 (if renewal fails)
+            Client->>Server: Rebind (to any available server)
+            Server-->>Client: Reply
+            Client->>Dhcpv6: LeaseRenewed
+        end
+    else Stateless mode (O-flag set)
+        Client->>Server: Information-Request
+        Server-->>Client: Reply (DNS servers, domain list, NTP — no addresses)
+        Client->>Dhcpv6: ConfigAcquired(dns, domains)
+    end
+
+    Dhcpv6->>Dhcpv6: Convert lease/config to State
+    Dhcpv6-->>Factory: DHCPv6-derived state
+
+    alt Shutdown
+        Dhcpv6->>Client: Cancel task
+        Client->>Server: Release (stateful mode only)
+        Dhcpv6->>Factory: Notify stopped
+    end
+```
