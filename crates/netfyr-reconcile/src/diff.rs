@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use netfyr_state::{FieldValue, SchemaRegistry, Selector, StateSet, Value, values_eq_for_field};
+use netfyr_state::{EntitySchema, FieldValue, SchemaRegistry, Selector, StateSet, Value, values_eq_for_field};
 use serde::Serialize;
 
 use crate::{EntityKey, FieldName};
@@ -143,6 +143,152 @@ impl StateDiff {
     }
 }
 
+// ── Sub-object diffing helpers ────────────────────────────────────────────────
+
+fn is_sub_object_field(entity_schema: &EntitySchema, field_name: &str) -> bool {
+    entity_schema.has_sub_fields(field_name)
+        && entity_schema.field_info(field_name).map(|i| i.writable).unwrap_or(false)
+}
+
+fn expand_sub_object_as_set(
+    parent_name: &str,
+    desired_parent_fv: &FieldValue,
+    entity_schema: &EntitySchema,
+    field_changes: &mut Vec<FieldChange>,
+    has_real_change: &mut bool,
+) {
+    let desired_map = match &desired_parent_fv.value {
+        Value::Map(m) => m,
+        _ => return,
+    };
+    for sub_name in entity_schema.sub_field_names(parent_name) {
+        let info = match entity_schema.sub_field_info(parent_name, sub_name) {
+            Some(i) => i,
+            None => continue,
+        };
+        if !info.writable {
+            continue;
+        }
+        if let Some(sv) = desired_map.get(sub_name) {
+            field_changes.push(FieldChange {
+                field_name: format!("{parent_name}.{sub_name}"),
+                change: FieldChangeKind::Set {
+                    current: None,
+                    desired: FieldValue { value: sv.clone(), provenance: desired_parent_fv.provenance.clone() },
+                },
+            });
+            *has_real_change = true;
+        }
+    }
+}
+
+fn expand_sub_object_as_unset(
+    parent_name: &str,
+    actual_parent_fv: &FieldValue,
+    entity_schema: &EntitySchema,
+    field_changes: &mut Vec<FieldChange>,
+) {
+    let actual_map = match &actual_parent_fv.value {
+        Value::Map(m) => m,
+        _ => return,
+    };
+    for sub_name in entity_schema.sub_field_names(parent_name) {
+        let info = match entity_schema.sub_field_info(parent_name, sub_name) {
+            Some(i) => i,
+            None => continue,
+        };
+        if !info.writable {
+            continue;
+        }
+        if let Some(sv) = actual_map.get(sub_name) {
+            if matches!(sv, Value::List(v) if v.is_empty()) {
+                continue;
+            }
+            field_changes.push(FieldChange {
+                field_name: format!("{parent_name}.{sub_name}"),
+                change: FieldChangeKind::Unset {
+                    current: FieldValue { value: sv.clone(), provenance: actual_parent_fv.provenance.clone() },
+                },
+            });
+        }
+    }
+}
+
+fn diff_sub_object(
+    parent_name: &str,
+    desired_parent_fv: &FieldValue,
+    actual_parent_fv: &FieldValue,
+    entity_schema: &EntitySchema,
+    field_changes: &mut Vec<FieldChange>,
+    has_real_change: &mut bool,
+) {
+    let desired_map = match &desired_parent_fv.value {
+        Value::Map(m) => m,
+        _ => return,
+    };
+    let actual_map = match &actual_parent_fv.value {
+        Value::Map(m) => m,
+        _ => return,
+    };
+    for sub_name in entity_schema.sub_field_names(parent_name) {
+        let info = match entity_schema.sub_field_info(parent_name, sub_name) {
+            Some(i) => i,
+            None => continue,
+        };
+        if !info.writable {
+            continue;
+        }
+        let dotted = format!("{parent_name}.{sub_name}");
+        match (desired_map.get(sub_name), actual_map.get(sub_name)) {
+            (Some(dv), Some(av)) => {
+                if values_eq_for_field(dv, av, &info.comparison_keys) {
+                    field_changes.push(FieldChange {
+                        field_name: dotted,
+                        change: FieldChangeKind::Unchanged {
+                            value: FieldValue { value: dv.clone(), provenance: desired_parent_fv.provenance.clone() },
+                        },
+                    });
+                } else {
+                    field_changes.push(FieldChange {
+                        field_name: dotted,
+                        change: FieldChangeKind::Set {
+                            current: Some(FieldValue { value: av.clone(), provenance: actual_parent_fv.provenance.clone() }),
+                            desired: FieldValue { value: dv.clone(), provenance: desired_parent_fv.provenance.clone() },
+                        },
+                    });
+                    *has_real_change = true;
+                }
+            }
+            (Some(dv), None) => {
+                field_changes.push(FieldChange {
+                    field_name: dotted,
+                    change: FieldChangeKind::Set {
+                        current: None,
+                        desired: FieldValue { value: dv.clone(), provenance: desired_parent_fv.provenance.clone() },
+                    },
+                });
+                *has_real_change = true;
+            }
+            (None, Some(av)) => {
+                if info.keep_when_absent {
+                    continue;
+                }
+                if matches!(av, Value::List(v) if v.is_empty()) {
+                    continue;
+                }
+                field_changes.push(FieldChange {
+                    field_name: dotted,
+                    change: FieldChangeKind::Unset {
+                        current: FieldValue { value: av.clone(), provenance: actual_parent_fv.provenance.clone() },
+                    },
+                });
+                *has_real_change = true;
+            }
+            (None, None) => {}
+        }
+    }
+}
+
 // ── generate_diff ─────────────────────────────────────────────────────────────
 
 /// Generates a [`StateDiff`] by comparing `desired` state against `actual` state.
@@ -208,14 +354,30 @@ pub fn generate_diff(
             // Entity present in both — compare field by field.
             let mut field_changes: Vec<FieldChange> = Vec::new();
             let mut has_real_change = false;
+            let entity_schema = schema.get_schema(&entity_type);
 
             // Walk desired fields: compare against actual.
             for (field_name, desired_fv) in &desired_state.fields {
-                let cmp_keys = schema
-                    .field_info(&entity_type, field_name)
-                    .map(|info| info.comparison_keys)
-                    .unwrap_or_default();
+                // Check if this is a writable sub-object that needs per-sub-field diffing.
+                let is_sub_obj = entity_schema
+                    .is_some_and(|es| is_sub_object_field(es, field_name));
+
                 if let Some(actual_fv) = actual_state.fields.get(field_name) {
+                    if is_sub_obj {
+                        diff_sub_object(
+                            field_name,
+                            desired_fv,
+                            actual_fv,
+                            entity_schema.unwrap(),
+                            &mut field_changes,
+                            &mut has_real_change,
+                        );
+                        continue;
+                    }
+                    let cmp_keys = schema
+                        .field_info(&entity_type, field_name)
+                        .map(|info| info.comparison_keys)
+                        .unwrap_or_default();
                     if values_eq_for_field(&desired_fv.value, &actual_fv.value, &cmp_keys) {
                         // Same value — Unchanged (for context in reports).
                         field_changes.push(FieldChange {
@@ -235,6 +397,16 @@ pub fn generate_diff(
                     }
                 } else {
                     // Field in desired but not actual — field is being added.
+                    if is_sub_obj {
+                        expand_sub_object_as_set(
+                            field_name,
+                            desired_fv,
+                            entity_schema.unwrap(),
+                            &mut field_changes,
+                            &mut has_real_change,
+                        );
+                        continue;
+                    }
                     // Skip non-writable fields: they cannot be applied by the
                     // backend so reporting them as changes is misleading
                     // (e.g. dns_servers from a DHCP lease).
@@ -301,14 +473,25 @@ pub fn generate_diff(
             }
         } else {
             // Entity in desired but absent from actual → Add.
-            let field_changes = desired_state
-                .fields
-                .iter()
-                .map(|(name, fv)| FieldChange {
-                    field_name: name.clone(),
-                    change: FieldChangeKind::Set { current: None, desired: fv.clone() },
-                })
-                .collect();
+            let entity_schema = schema.get_schema(&entity_type);
+            let mut field_changes: Vec<FieldChange> = Vec::new();
+            let mut _has_real = true;
+            for (name, fv) in &desired_state.fields {
+                if entity_schema.is_some_and(|es| is_sub_object_field(es, name)) {
+                    expand_sub_object_as_set(
+                        name,
+                        fv,
+                        entity_schema.unwrap(),
+                        &mut field_changes,
+                        &mut _has_real,
+                    );
+                } else {
+                    field_changes.push(FieldChange {
+                        field_name: name.clone(),
+                        change: FieldChangeKind::Set { current: None, desired: fv.clone() },
+                    });
+                }
+            }
 
             operations.push(DiffOperation {
                 kind: DiffKind::Add,
@@ -335,14 +518,33 @@ pub fn generate_diff(
         }
 
         let actual_state = actual.get(&entity_type, &selector_key).expect("key from entities()");
-        let field_changes = actual_state
-            .fields
-            .iter()
-            .map(|(name, fv)| FieldChange {
-                field_name: name.clone(),
-                change: FieldChangeKind::Unset { current: fv.clone() },
-            })
-            .collect();
+        let entity_schema = schema.get_schema(&entity_type);
+        let mut field_changes: Vec<FieldChange> = Vec::new();
+        for (name, fv) in &actual_state.fields {
+            if entity_schema.is_some_and(|es| is_sub_object_field(es, name)) {
+                expand_sub_object_as_unset(
+                    name,
+                    fv,
+                    entity_schema.unwrap(),
+                    &mut field_changes,
+                );
+            } else {
+                // Skip read-only fields — they are informational values
+                // populated by the backend (carrier, mac, driver, name, etc.)
+                // and must never appear as Unset changes in Remove operations.
+                let is_read_only = entity_schema
+                    .and_then(|es| es.field_info(name))
+                    .map(|info| !info.writable)
+                    .unwrap_or(false);
+                if is_read_only {
+                    continue;
+                }
+                field_changes.push(FieldChange {
+                    field_name: name.clone(),
+                    change: FieldChangeKind::Unset { current: fv.clone() },
+                });
+            }
+        }
 
         operations.push(DiffOperation {
             kind: DiffKind::Remove,
@@ -1279,6 +1481,489 @@ mod tests {
         assert!(
             matches!(lacp_change, FieldChangeKind::Unset { .. }),
             "unknown entity type field must be Unset (treated as writable)"
+        );
+    }
+
+    // ── Helpers for ipv4 / ipv6 sub-object tests ──────────────────────────────
+
+    /// Converts a YAML string into a `Value`. Used to construct complex sub-objects
+    /// without importing `indexmap` directly in test code.
+    fn yaml_val(yaml: &str) -> Value {
+        use netfyr_state::yaml::deserialize_value;
+        let sv: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid yaml");
+        deserialize_value(&sv).expect("valid Value")
+    }
+
+    // ── Criterion 1: Add with ipv4 sub-object uses dotted field names ─────────
+
+    #[test]
+    fn test_add_with_ipv4_sub_object_field_changes_use_dotted_names() {
+        // Criterion 1: desired has ipv4 sub-object; the Add operation must emit
+        // "ipv4.addresses" (dotted), not a bare "ipv4" blob.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+            ],
+        ));
+        let actual = StateSet::new();
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have exactly one operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Add);
+
+        // mtu: Set(None → 1500)
+        let mtu = find_change(op, "mtu").expect("mtu must have a change");
+        assert!(matches!(mtu, FieldChangeKind::Set { current: None, .. }), "{mtu:?}");
+
+        // ipv4.addresses: Set(None → [...]) — dotted field name, not "ipv4" blob
+        let addrs = find_change(op, "ipv4.addresses").expect("ipv4.addresses must have a change");
+        assert!(
+            matches!(addrs, FieldChangeKind::Set { current: None, .. }),
+            "ipv4.addresses must be Set{{current: None}} for Add operations, got: {addrs:?}"
+        );
+    }
+
+    // ── Criterion 2: Remove with ipv4 sub-object uses dotted field names ──────
+
+    #[test]
+    fn test_remove_with_ipv4_sub_object_field_changes_use_dotted_names() {
+        // Criterion 2: actual has ipv4 sub-object; Remove must emit ipv4.addresses Unset
+        // (dotted name), not "ipv4" blob.
+        let desired = StateSet::new();
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed: std::collections::HashSet<(String, String)> =
+            [("ethernet".to_string(), "eth0".to_string())].into_iter().collect();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have exactly one operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Remove);
+
+        // mtu: Unset(1500)
+        let mtu = find_change(op, "mtu").expect("mtu must have a change");
+        assert!(matches!(mtu, FieldChangeKind::Unset { .. }), "{mtu:?}");
+
+        // ipv4.addresses: Unset — dotted field name
+        let addrs = find_change(op, "ipv4.addresses").expect("ipv4.addresses must have a change");
+        assert!(
+            matches!(addrs, FieldChangeKind::Unset { .. }),
+            "ipv4.addresses must be Unset in Remove operations, got: {addrs:?}"
+        );
+    }
+
+    // ── Criterion 4: Modify — ipv4.addresses shows Unchanged when same ─────────
+
+    #[test]
+    fn test_modify_with_same_ipv4_addresses_shows_unchanged_for_ipv4_addresses() {
+        // Criterion 4: mtu differs but ipv4.addresses is identical in both states →
+        // Modify operation for mtu, ipv4.addresses shows as Unchanged (for context).
+        let ipv4 = yaml_val("addresses:\n  - \"10.0.1.50/24\"");
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("mtu", Value::U64(9000)), ("ipv4", ipv4.clone())],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("mtu", Value::U64(1500)), ("ipv4", ipv4)],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1);
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Modify);
+
+        // mtu: Set(Some(1500) → 9000)
+        let mtu = find_change(op, "mtu").expect("mtu must have a change");
+        match mtu {
+            FieldChangeKind::Set { current: Some(old), desired } => {
+                assert_eq!(old.value, Value::U64(1500), "old mtu must be 1500");
+                assert_eq!(desired.value, Value::U64(9000), "new mtu must be 9000");
+            }
+            other => panic!("Expected Set{{current: Some(1500), desired: 9000}}, got {other:?}"),
+        }
+
+        // ipv4.addresses: Unchanged (same in both — shown as context only)
+        let addrs = find_change(op, "ipv4.addresses").expect("ipv4.addresses must have a change");
+        assert!(
+            matches!(addrs, FieldChangeKind::Unchanged { .. }),
+            "ipv4.addresses must be Unchanged when identical in both states, got: {addrs:?}"
+        );
+    }
+
+    // ── Criterion 6: ipv4 sub-object added to entity — dotted Set change ──────
+
+    #[test]
+    fn test_ipv4_sub_object_added_to_entity_generates_set_with_none_current() {
+        // Criterion 6: desired has ipv4 sub-object, actual entity has no ipv4 field.
+        // The resulting Modify operation must have ipv4.addresses Set(None → [...]).
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+            ],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have one Modify operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Modify);
+
+        // ipv4.addresses: Set(None → [...]) — sub-field was absent from actual
+        let addrs = find_change(op, "ipv4.addresses").expect("ipv4.addresses must have a change");
+        assert!(
+            matches!(addrs, FieldChangeKind::Set { current: None, .. }),
+            "newly added ipv4.addresses must be Set with current=None, got: {addrs:?}"
+        );
+
+        // mtu: Unchanged
+        let mtu = find_change(op, "mtu").expect("mtu must have a change");
+        assert!(
+            matches!(mtu, FieldChangeKind::Unchanged { .. }),
+            "unchanged mtu must be Unchanged, got: {mtu:?}"
+        );
+    }
+
+    // ── Criterion 7: explicit empty ipv4={} removes existing addresses ─────────
+
+    #[test]
+    fn test_explicit_empty_ipv4_sub_object_removes_existing_addresses() {
+        // Criterion 7: desired has ipv4={} (explicitly empty map), actual has
+        // ipv4={addresses: [...]}. The diff must emit ipv4.addresses Unset.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ipv4", yaml_val("{}")), // explicit empty map
+            ],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have one Modify operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Modify);
+
+        // ipv4.addresses: Unset — ipv4={} explicitly manages IPv4, removing sub-fields
+        let addrs = find_change(op, "ipv4.addresses").expect("ipv4.addresses must have a change");
+        assert!(
+            matches!(addrs, FieldChangeKind::Unset { .. }),
+            "ipv4.addresses must be Unset when desired has explicit empty ipv4={{}}, got: {addrs:?}"
+        );
+
+        // mtu: Unchanged
+        let mtu = find_change(op, "mtu").expect("mtu must have a change");
+        assert!(
+            matches!(mtu, FieldChangeKind::Unchanged { .. }),
+            "unchanged mtu must be Unchanged, got: {mtu:?}"
+        );
+    }
+
+    // ── Criterion 21: ipv6 sub-object address change generates Modify ─────────
+
+    #[test]
+    fn test_ipv6_sub_object_address_change_generates_modify_with_ipv6_addresses_field() {
+        // Criterion 21: desired and actual have different ipv6.addresses →
+        // Modify operation with ipv6.addresses Set(Some([2001:db8::2]) → [2001:db8::1]).
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val("addresses:\n  - \"2001:db8::1/64\""))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val("addresses:\n  - \"2001:db8::2/64\""))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have one Modify operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Modify, "operation must be Modify");
+
+        // ipv6.addresses: Set(Some([2001:db8::2/64]) → [2001:db8::1/64])
+        let addrs = find_change(op, "ipv6.addresses").expect("ipv6.addresses must have a change");
+        match addrs {
+            FieldChangeKind::Set { current: Some(old), desired: new } => {
+                assert!(
+                    old.value.to_string().contains("db8::2"),
+                    "old ipv6.addresses must contain 2001:db8::2/64, got: {:?}", old.value
+                );
+                assert!(
+                    new.value.to_string().contains("db8::1"),
+                    "new ipv6.addresses must contain 2001:db8::1/64, got: {:?}", new.value
+                );
+            }
+            other => panic!(
+                "Expected Set{{current: Some(_), desired: _}} for ipv6.addresses, got: {other:?}"
+            ),
+        }
+    }
+
+    // ── Criterion 22: absent ipv6 in desired keeps existing IPv6 config ───────
+
+    #[test]
+    fn test_absent_ipv6_in_desired_does_not_remove_existing_ipv6_config() {
+        // Criterion 22: ipv6 has x-netfyr-keep-when-absent: true.
+        // desired has ipv4 only; actual has both ipv4 and ipv6 → diff must be empty.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\""))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+                ("ipv6", yaml_val("addresses:\n  - \"2001:db8::1/64\"")),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "absent ipv6 in desired must not remove existing IPv6 config \
+             (ipv6 has keep-when-absent: true), got {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Criterion 23: explicit empty ipv6={} removes existing IPv6 addresses ──
+
+    #[test]
+    fn test_explicit_empty_ipv6_sub_object_removes_existing_ipv6_addresses() {
+        // Criterion 23: desired has ipv6={} (explicitly empty), actual has
+        // ipv6={addresses: [...]}. The diff must emit ipv6.addresses Unset.
+        // Contrast with criterion 22: absent ipv6 keeps existing, ipv6={} removes.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+                ("ipv6", yaml_val("{}")), // explicit empty map
+            ],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![
+                ("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\"")),
+                ("ipv6", yaml_val("addresses:\n  - \"2001:db8::1/64\"")),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 1, "should have one Modify operation");
+        let op = &diff.operations[0];
+        assert_eq!(op.kind, DiffKind::Modify);
+
+        let addrs = find_change(op, "ipv6.addresses").expect("ipv6.addresses must have a change");
+        assert!(
+            matches!(addrs, FieldChangeKind::Unset { .. }),
+            "explicit empty ipv6={{}} must generate Unset for ipv6.addresses, got: {addrs:?}"
+        );
+    }
+
+    // ── Criterion 17 sub-fields: ipv4.dns_servers is excluded from diff ───────
+
+    #[test]
+    fn test_ipv4_dns_servers_in_actual_sub_object_excluded_from_diff() {
+        // Criterion 17: ipv4.dns_servers has x-netfyr-writable: false.
+        // When actual has dns_servers but desired doesn't, no Unset is generated.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\""))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv4", yaml_val(
+                "addresses:\n  - \"10.0.1.50/24\"\ndns_servers:\n  - \"8.8.8.8\""
+            ))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "ipv4.dns_servers is read-only (x-netfyr-writable: false) and must not \
+             generate any diff operation, got {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Criterion 17 sub-fields: ipv6.dns_servers is excluded from diff ───────
+
+    #[test]
+    fn test_ipv6_dns_servers_in_actual_sub_object_excluded_from_diff() {
+        // Criterion 17: ipv6.dns_servers has x-netfyr-writable: false.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val("addresses:\n  - \"2001:db8::1/64\""))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val(
+                "addresses:\n  - \"2001:db8::1/64\"\ndns_servers:\n  - \"2001:db8::53\""
+            ))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "ipv6.dns_servers is read-only and must not generate any diff, \
+             got {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Criterion 17 sub-fields: ipv6.dns_search is excluded from diff ────────
+
+    #[test]
+    fn test_ipv6_dns_search_in_actual_sub_object_excluded_from_diff() {
+        // Criterion 17: ipv6.dns_search has x-netfyr-writable: false.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val("addresses:\n  - \"2001:db8::1/64\""))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val(
+                "addresses:\n  - \"2001:db8::1/64\"\ndns_search:\n  - \"example.com\""
+            ))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "ipv6.dns_search is read-only and must not generate any diff, \
+             got {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Criterion 17 sub-fields: ipv6.nat64_prefix is excluded from diff ──────
+
+    #[test]
+    fn test_ipv6_nat64_prefix_in_actual_sub_object_excluded_from_diff() {
+        // Criterion 17: ipv6.nat64_prefix has x-netfyr-writable: false.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val("addresses:\n  - \"2001:db8::1/64\""))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv6", yaml_val(
+                "addresses:\n  - \"2001:db8::1/64\"\nnat64_prefix: \"64:ff9b::/96\""
+            ))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "ipv6.nat64_prefix is read-only and must not generate any diff, \
+             got {} operation(s)",
+            diff.len()
+        );
+    }
+
+    // ── Criterion 19 via sub-object path: comparison keys in ipv4.addresses ───
+
+    #[test]
+    fn test_comparison_keys_in_ipv4_sub_object_treats_matching_address_key_as_unchanged() {
+        // Criterion 19 exercising the diff_sub_object code path (not the flat-field path).
+        // desired: ipv4.addresses = [{address: "10.0.1.50/24", valid_lft: 1800}]
+        // actual:  ipv4.addresses = [{address: "10.0.1.50/24", valid_lft: 3600}]
+        // Because the ipv4.addresses schema declares x-netfyr-comparison-keys=["address"],
+        // only the "address" key is compared — valid_lft difference must be ignored.
+        let desired_ipv4 = yaml_val(
+            "addresses:\n  - address: \"10.0.1.50/24\"\n    valid_lft: 1800"
+        );
+        let actual_ipv4 = yaml_val(
+            "addresses:\n  - address: \"10.0.1.50/24\"\n    valid_lft: 3600"
+        );
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("ipv4", desired_ipv4)]));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("ipv4", actual_ipv4)]));
+
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "ipv4.addresses with matching 'address' key but different valid_lft must \
+             produce no diff via the sub-object path (comparison_keys=[\"address\"]), \
+             got {} operation(s)",
+            diff.len()
         );
     }
 }

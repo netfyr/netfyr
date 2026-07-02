@@ -98,40 +98,93 @@ impl DiffReport {
             match op.kind {
                 DiffKind::Add => {
                     lines.push(format!("+ {} {}", op.entity_type, selector_key));
+                    let mut emitted: HashSet<String> = HashSet::new();
                     for change in &op.field_changes {
                         if let FieldChangeKind::Set { desired, .. } = &change.change {
-                            lines.push(format!("+   {}: {}", change.field_name, desired.value));
+                            if let Some((prefix, subname)) = change.field_name.split_once('.') {
+                                if emitted.insert(prefix.to_string()) {
+                                    lines.push(format!("+   {}:", prefix));
+                                }
+                                lines.push(format!("+     {}: {}", subname, desired.value));
+                            } else {
+                                lines.push(format!("+   {}: {}", change.field_name, desired.value));
+                            }
                         }
                     }
                 }
                 DiffKind::Remove => {
                     lines.push(format!("- {} {}", op.entity_type, selector_key));
+                    let mut emitted: HashSet<String> = HashSet::new();
                     for change in &op.field_changes {
                         if let FieldChangeKind::Unset { current } = &change.change {
-                            lines.push(format!("-   {}: {}", change.field_name, current.value));
+                            if let Some((prefix, subname)) = change.field_name.split_once('.') {
+                                if emitted.insert(prefix.to_string()) {
+                                    lines.push(format!("-   {}:", prefix));
+                                }
+                                lines.push(format!("-     {}: {}", subname, current.value));
+                            } else {
+                                lines.push(format!("-   {}: {}", change.field_name, current.value));
+                            }
                         }
                     }
                 }
                 DiffKind::Modify => {
                     lines.push(format!("~ {} {}", op.entity_type, selector_key));
+                    let mut emitted: HashSet<String> = HashSet::new();
                     for change in &op.field_changes {
+                        let is_sub = change.field_name.contains('.');
                         match &change.change {
                             FieldChangeKind::Set { current: Some(old), desired: new } => {
-                                if matches!(&old.value, Value::List(_)) || matches!(&new.value, Value::List(_)) {
-                                    format_value_list_diff(&mut lines, &change.field_name, &old.value, &new.value);
+                                if is_sub {
+                                    let (prefix, subname) = change.field_name.split_once('.').unwrap();
+                                    if emitted.insert(prefix.to_string()) {
+                                        lines.push(format!("    {}:", prefix));
+                                    }
+                                    if matches!(&old.value, Value::List(_)) || matches!(&new.value, Value::List(_)) {
+                                        format_value_list_diff(&mut lines, subname, &old.value, &new.value, "      ");
+                                    } else {
+                                        lines.push(format!("      -{}: {}", subname, old.value));
+                                        lines.push(format!("      +{}: {}", subname, new.value));
+                                    }
+                                } else if matches!(&old.value, Value::List(_)) || matches!(&new.value, Value::List(_)) {
+                                    format_value_list_diff(&mut lines, &change.field_name, &old.value, &new.value, "    ");
                                 } else {
                                     lines.push(format!("    -{}: {}", change.field_name, old.value));
                                     lines.push(format!("    +{}: {}", change.field_name, new.value));
                                 }
                             }
                             FieldChangeKind::Set { current: None, desired: new } => {
-                                lines.push(format!("+   {}: {}", change.field_name, new.value));
+                                if is_sub {
+                                    let (prefix, subname) = change.field_name.split_once('.').unwrap();
+                                    if emitted.insert(prefix.to_string()) {
+                                        lines.push(format!("    {}:", prefix));
+                                    }
+                                    lines.push(format!("+     {}: {}", subname, new.value));
+                                } else {
+                                    lines.push(format!("+   {}: {}", change.field_name, new.value));
+                                }
                             }
                             FieldChangeKind::Unset { current } => {
-                                lines.push(format!("-   {}: {}", change.field_name, current.value));
+                                if is_sub {
+                                    let (prefix, subname) = change.field_name.split_once('.').unwrap();
+                                    if emitted.insert(prefix.to_string()) {
+                                        lines.push(format!("    {}:", prefix));
+                                    }
+                                    lines.push(format!("-     {}: {}", subname, current.value));
+                                } else {
+                                    lines.push(format!("-   {}: {}", change.field_name, current.value));
+                                }
                             }
                             FieldChangeKind::Unchanged { value } => {
-                                lines.push(format!("    {}: {}", change.field_name, value.value));
+                                if is_sub {
+                                    let (prefix, subname) = change.field_name.split_once('.').unwrap();
+                                    if emitted.insert(prefix.to_string()) {
+                                        lines.push(format!("    {}:", prefix));
+                                    }
+                                    lines.push(format!("      {}: {}", subname, value.value));
+                                } else {
+                                    lines.push(format!("    {}: {}", change.field_name, value.value));
+                                }
                             }
                         }
                     }
@@ -168,20 +221,20 @@ impl DiffReport {
     }
 }
 
-fn format_value_list_diff(lines: &mut Vec<String>, field_name: &str, old: &Value, new: &Value) {
+fn format_value_list_diff(lines: &mut Vec<String>, field_name: &str, old: &Value, new: &Value, indent: &str) {
     let empty = Vec::new();
     let old_items = match old { Value::List(v) => v.as_slice(), _ => &empty };
     let new_items = match new { Value::List(v) => v.as_slice(), _ => &empty };
 
-    lines.push(format!("    {}:", field_name));
+    lines.push(format!("{indent}{}:", field_name));
     for item in new_items {
         if !old_items.contains(item) {
-            lines.push(format!("      +{}", format_value_element(item)));
+            lines.push(format!("  {indent}+{}", format_value_element(item)));
         }
     }
     for item in old_items {
         if !new_items.contains(item) {
-            lines.push(format!("      -{}", format_value_element(item)));
+            lines.push(format!("  {indent}-{}", format_value_element(item)));
         }
     }
 }
@@ -845,6 +898,112 @@ mod tests {
         assert!(
             parsed.get("operations").is_some(),
             "JSON output must have 'operations' field"
+        );
+    }
+
+    // ── Helpers for ipv4 / ipv6 sub-object tests ──────────────────────────────
+
+    fn yaml_val(yaml: &str) -> Value {
+        use netfyr_state::yaml::deserialize_value;
+        let sv: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid yaml");
+        deserialize_value(&sv).expect("valid Value")
+    }
+
+    // ── Criterion 12: format_text Add with ipv4 sub-object shows indented block
+
+    #[test]
+    fn test_format_text_add_with_ipv4_sub_object_shows_indented_sub_object() {
+        // Criterion 12: when an entity is added and it has an ipv4 sub-object,
+        // format_text must emit "+   ipv4:" as a header and "+     addresses: ..."
+        // with the sub-field further indented, NOT a raw "ipv4: {addresses: [...]}" blob.
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv4", yaml_val("addresses:\n  - \"10.0.1.50/24\""))],
+        ));
+        let actual = StateSet::new();
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+        let text = report.format_text();
+
+        // Add header
+        assert!(text.contains("+ ethernet eth0"), "must show Add header: {text:?}");
+
+        // Sub-object group header "+   ipv4:"  (+ + 3 spaces + "ipv4:")
+        assert!(
+            text.contains("+   ipv4:"),
+            "format_text for Add must emit '+   ipv4:' sub-object header, got: {text:?}"
+        );
+
+        // Sub-field "+     addresses: ..." (+ + 5 spaces + "addresses:")
+        assert!(
+            text.contains("+     addresses:"),
+            "format_text for Add must emit '+     addresses:' sub-field, got: {text:?}"
+        );
+
+        // The whole IPv4 address must appear somewhere in the output
+        assert!(
+            text.contains("10.0.1.50/24"),
+            "format_text for Add must include the IPv4 address value, got: {text:?}"
+        );
+    }
+
+    // ── Criterion 15: format_text Modify ipv4 list diff shows sub-object indent
+
+    #[test]
+    fn test_format_text_modify_ipv4_addresses_list_diff_shows_sub_object_indentation() {
+        // Criterion 15: when an entity is modified and ipv4.addresses changes,
+        // format_text must emit the addresses as a per-element diff under "    ipv4:".
+        // The list diff section uses "      addresses:" as the sub-field header,
+        // then "        +<new>" and "        -<old>" for element changes.
+        let old_addr = "10.0.1.99/24";
+        let new_addr = "10.0.1.51/24";
+
+        let mut desired = StateSet::new();
+        desired.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv4", yaml_val(&format!("addresses:\n  - \"{new_addr}\"")))],
+        ));
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet", "eth0",
+            vec![("ipv4", yaml_val(&format!("addresses:\n  - \"{old_addr}\"")))],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+        let text = report.format_text();
+
+        // Modify header
+        assert!(text.contains("~ ethernet eth0"), "must show Modify header: {text:?}");
+
+        // Sub-object group header "    ipv4:"  (4 spaces)
+        assert!(
+            text.contains("    ipv4:"),
+            "format_text for Modify must emit '    ipv4:' sub-object header, got: {text:?}"
+        );
+
+        // List diff sub-field "      addresses:"  (6 spaces)
+        assert!(
+            text.contains("      addresses:"),
+            "format_text for Modify must emit '      addresses:' list diff header, got: {text:?}"
+        );
+
+        // Added element "        +10.0.1.51/24"  (8 spaces + "+")
+        assert!(
+            text.contains(&format!("        +{new_addr}")),
+            "format_text must show added address as '        +{new_addr}', got: {text:?}"
+        );
+
+        // Removed element "        -10.0.1.99/24"  (8 spaces + "-")
+        assert!(
+            text.contains(&format!("        -{old_addr}")),
+            "format_text must show removed address as '        -{old_addr}', got: {text:?}"
         );
     }
 }

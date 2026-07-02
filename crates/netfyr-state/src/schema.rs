@@ -187,6 +187,19 @@ impl EntitySchema {
     pub fn field_names(&self) -> Vec<&str> {
         self.fields.keys().map(String::as_str).collect()
     }
+
+    /// Returns `true` if the given top-level field has named sub-properties.
+    pub fn has_sub_fields(&self, parent: &str) -> bool {
+        self.sub_fields.contains_key(parent)
+    }
+
+    /// Returns the sub-property names for a top-level Object-type field.
+    pub fn sub_field_names(&self, parent: &str) -> Vec<&str> {
+        self.sub_fields
+            .get(parent)
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
 }
 
 // ── SchemaRegistry ────────────────────────────────────────────────────────────
