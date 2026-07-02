@@ -78,4 +78,50 @@ mod tests {
         let m = StateMetadata::new();
         assert!(!format!("{:?}", m).is_empty());
     }
+
+    // ── Scenario: StateMetadata generates unique IDs ──────────────────────────
+
+    #[test]
+    fn test_state_metadata_new_generates_unique_id_fields() {
+        let m1 = StateMetadata::new();
+        let m2 = StateMetadata::new();
+        assert_ne!(m1.id, m2.id, "Two StateMetadata instances must have different id values");
+        assert_ne!(
+            m1.timeline_id,
+            m2.timeline_id,
+            "Two StateMetadata instances must have different timeline_id values"
+        );
+    }
+
+    #[test]
+    fn test_state_metadata_new_ids_are_uuidv7() {
+        let m = StateMetadata::new();
+        // UUIDv7 has version nibble = 7.
+        assert_eq!(m.id.get_version_num(), 7, "id must be a UUIDv7");
+        assert_eq!(m.timeline_id.get_version_num(), 7, "timeline_id must be a UUIDv7");
+    }
+
+    #[test]
+    fn test_state_metadata_new_created_at_is_recent() {
+        let before = Utc::now();
+        let m = StateMetadata::new();
+        let after = Utc::now();
+        assert!(
+            m.created_at >= before && m.created_at <= after,
+            "created_at must be within the current second; got {:?}",
+            m.created_at
+        );
+    }
+
+    #[test]
+    fn test_state_metadata_new_labels_is_empty() {
+        let m = StateMetadata::new();
+        assert!(m.labels.is_empty(), "labels must start as an empty HashMap");
+    }
+
+    #[test]
+    fn test_state_metadata_new_description_is_none() {
+        let m = StateMetadata::new();
+        assert!(m.description.is_none(), "description must start as None");
+    }
 }

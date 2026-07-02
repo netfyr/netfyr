@@ -1,8 +1,8 @@
 use indexmap::IndexMap;
-use ipnetwork::IpNetwork;
+use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The set of possible field values in a network entity's configuration.
 ///
@@ -137,6 +137,30 @@ impl From<IpAddr> for Value {
 impl From<IpNetwork> for Value {
     fn from(net: IpNetwork) -> Self {
         Value::IpNetwork(net)
+    }
+}
+
+impl From<Ipv4Addr> for Value {
+    fn from(addr: Ipv4Addr) -> Self {
+        Value::IpAddr(IpAddr::V4(addr))
+    }
+}
+
+impl From<Ipv6Addr> for Value {
+    fn from(addr: Ipv6Addr) -> Self {
+        Value::IpAddr(IpAddr::V6(addr))
+    }
+}
+
+impl From<Ipv4Network> for Value {
+    fn from(net: Ipv4Network) -> Self {
+        Value::IpNetwork(IpNetwork::V4(net))
+    }
+}
+
+impl From<Ipv6Network> for Value {
+    fn from(net: Ipv6Network) -> Self {
+        Value::IpNetwork(IpNetwork::V6(net))
     }
 }
 
@@ -298,5 +322,213 @@ mod tests {
         // Spec says From<Ipv4Network>; implementation provides From<IpNetwork>.
         let net: IpNetwork = "192.168.0.0/16".parse().unwrap();
         assert!(matches!(Value::from(net), Value::IpNetwork(_)));
+    }
+
+    // ── Scenario: Value From trait conversions work for IPv4 and IPv6 ─────────
+
+    #[test]
+    fn test_value_from_str_ref_produces_string_variant() {
+        let v = Value::from("hello");
+        assert_eq!(v, Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_value_from_u64_produces_u64_variant() {
+        let v = Value::from(42u64);
+        assert_eq!(v, Value::U64(42));
+    }
+
+    #[test]
+    fn test_value_from_bool_produces_bool_variant() {
+        let v = Value::from(true);
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_value_from_ipv4_addr_produces_ipaddr_v4() {
+        use std::net::IpAddr;
+        let addr = Ipv4Addr::new(10, 0, 1, 1);
+        let v = Value::from(addr);
+        assert_eq!(v, Value::IpAddr(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1))));
+    }
+
+    #[test]
+    fn test_value_from_ipv6_addr_produces_ipaddr_v6() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let v = Value::from(addr);
+        assert_eq!(
+            v,
+            Value::IpAddr(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
+        );
+    }
+
+    #[test]
+    fn test_value_from_ipv4_network_produces_ipnetwork_v4() {
+        use ipnetwork::Ipv4Network;
+        let net = Ipv4Network::new(Ipv4Addr::new(10, 0, 1, 0), 24).unwrap();
+        let v = Value::from(net);
+        match &v {
+            Value::IpNetwork(IpNetwork::V4(n)) => {
+                assert_eq!(n.ip(), Ipv4Addr::new(10, 0, 1, 0));
+                assert_eq!(n.prefix(), 24);
+            }
+            other => panic!("expected IpNetwork::V4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_value_from_ipv6_network_produces_ipnetwork_v6() {
+        use ipnetwork::Ipv6Network;
+        use std::net::Ipv6Addr;
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let net = Ipv6Network::new(addr, 32).unwrap();
+        let v = Value::from(net);
+        match &v {
+            Value::IpNetwork(IpNetwork::V6(n)) => {
+                assert_eq!(n.prefix(), 32);
+            }
+            other => panic!("expected IpNetwork::V6, got {:?}", other),
+        }
+    }
+
+    // ── Scenario: Value enum supports all required types ─────────────────────
+
+    #[test]
+    fn test_value_all_variants_can_be_constructed() {
+        use ipnetwork::{Ipv4Network, Ipv6Network};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let ipv4: IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
+        let ipv6: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into();
+        let ipv4_net: IpNetwork =
+            IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 0, 1, 0), 24).unwrap());
+        let ipv6_net: IpNetwork =
+            IpNetwork::V6(Ipv6Network::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32).unwrap());
+        let mut map = IndexMap::new();
+        map.insert("key".to_string(), Value::String("val".to_string()));
+
+        let variants = vec![
+            Value::String("eth0".to_string()),
+            Value::U64(1500),
+            Value::I64(-1),
+            Value::Bool(true),
+            Value::IpAddr(ipv4),
+            Value::IpAddr(ipv6),
+            Value::IpNetwork(ipv4_net),
+            Value::IpNetwork(ipv6_net),
+            Value::List(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+            ]),
+            Value::Map(map),
+        ];
+
+        for v in &variants {
+            // each value must be cloneable, debuggable, and equal to itself
+            let cloned = v.clone();
+            assert_eq!(v, &cloned, "Clone must equal original for {:?}", v);
+            assert!(!format!("{:?}", v).is_empty(), "Debug must produce non-empty string");
+        }
+    }
+
+    #[test]
+    fn test_value_ipv6_addr_json_round_trip() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let ip: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into();
+        let v = Value::IpAddr(ip);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    #[test]
+    fn test_value_ipv6_network_json_round_trip() {
+        use ipnetwork::{IpNetwork, Ipv6Network};
+        use std::net::Ipv6Addr;
+        let net: IpNetwork =
+            IpNetwork::V6(Ipv6Network::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32).unwrap());
+        let v = Value::IpNetwork(net);
+        let json = serde_json::to_string(&v).expect("must serialize");
+        let restored: Value = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(v, restored);
+    }
+
+    // ── Scenario: Value typed accessors return correct results ────────────────
+
+    #[test]
+    fn test_value_as_u64_returns_some_for_u64_variant() {
+        let v = Value::U64(1500);
+        assert_eq!(v.as_u64(), Some(1500));
+    }
+
+    #[test]
+    fn test_value_as_str_returns_none_for_u64_variant() {
+        let v = Value::U64(1500);
+        assert_eq!(v.as_str(), None);
+    }
+
+    #[test]
+    fn test_value_as_bool_returns_none_for_u64_variant() {
+        let v = Value::U64(1500);
+        assert_eq!(v.as_bool(), None);
+    }
+
+    #[test]
+    fn test_value_as_str_returns_some_for_string_variant() {
+        let v = Value::String("eth0".to_string());
+        assert_eq!(v.as_str(), Some("eth0"));
+    }
+
+    #[test]
+    fn test_value_as_u64_returns_none_for_string_variant() {
+        let v = Value::String("eth0".to_string());
+        assert_eq!(v.as_u64(), None);
+    }
+
+    #[test]
+    fn test_value_as_bool_returns_some_for_bool_variant() {
+        let v = Value::Bool(true);
+        assert_eq!(v.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_value_as_ip_addr_returns_some_for_ipaddr_variant() {
+        let ip: std::net::IpAddr = Ipv4Addr::new(10, 0, 1, 1).into();
+        let v = Value::IpAddr(ip);
+        assert!(v.as_ip_addr().is_some());
+    }
+
+    #[test]
+    fn test_value_as_ip_network_returns_some_for_ipnetwork_variant() {
+        let net: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        let v = Value::IpNetwork(net);
+        assert!(v.as_ip_network().is_some());
+    }
+
+    #[test]
+    fn test_value_as_list_returns_some_for_list_variant() {
+        let v = Value::List(vec![Value::String("a".to_string())]);
+        assert!(v.as_list().is_some());
+    }
+
+    #[test]
+    fn test_value_as_map_returns_some_for_map_variant() {
+        let mut map = IndexMap::new();
+        map.insert("k".to_string(), Value::Bool(false));
+        let v = Value::Map(map);
+        assert!(v.as_map().is_some());
+    }
+
+    #[test]
+    fn test_value_as_i64_returns_some_for_i64_variant() {
+        let v = Value::I64(-42);
+        assert_eq!(v.as_i64(), Some(-42));
+    }
+
+    #[test]
+    fn test_value_as_i64_returns_none_for_u64_variant() {
+        let v = Value::U64(42);
+        assert_eq!(v.as_i64(), None);
     }
 }
