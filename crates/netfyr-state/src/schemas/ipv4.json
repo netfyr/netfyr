@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ipv4",
+  "description": "IPv4 configuration fragment — defines a single top-level 'ipv4' property",
+  "type": "object",
+  "properties": {
+    "ipv4": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "IPv4 configuration",
+      "x-netfyr-writable": true,
+      "x-netfyr-keep-when-absent": true,
+      "properties": {
+        "addresses": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["address"],
+                "properties": {
+                  "address": {
+                    "type": "string",
+                    "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"
+                  },
+                  "valid_lft": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Valid lifetime in seconds"
+                  },
+                  "preferred_lft": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Preferred lifetime in seconds"
+                  }
+                }
+              }
+            ]
+          },
+          "description": "IPv4 addresses assigned to the interface",
+          "x-netfyr-writable": true,
+          "x-netfyr-comparison-keys": ["address"]
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["destination"],
+            "properties": {
+              "destination": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$",
+                "description": "Route destination in CIDR format"
+              },
+              "gateway": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F:.]+$",
+                "description": "Gateway IP address"
+              },
+              "metric": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Route metric (lower is preferred)"
+              },
+              "protocol": {
+                "type": "string",
+                "description": "Route protocol (kernel, static, dhcp, etc.)"
+              },
+              "mtu": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Route MTU in bytes"
+              },
+              "table": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295,
+                "description": "Routing table ID (default 254 = main)"
+              },
+              "tos": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255,
+                "description": "Type of Service (TOS/DSCP) filter"
+              }
+            }
+          },
+          "description": "IPv4 routes via this interface",
+          "x-netfyr-writable": true
+        },
+        "dns_servers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "IPv4 DNS server addresses",
+          "x-netfyr-writable": false
+        }
+      }
+    }
+  }
+}

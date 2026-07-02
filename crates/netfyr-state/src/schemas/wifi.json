@@ -4,7 +4,7 @@
   "description": "WiFi interface entity",
   "type": "object",
   "additionalProperties": false,
-  "x-netfyr-inherit": ["ip", "link"],
+  "x-netfyr-inherit": ["ipv4", "ipv6", "link"],
   "properties": {
     "wifi": {
       "type": "object",

@@ -14,7 +14,8 @@ use std::fmt;
 // The compiler will error here if the file does not exist.
 const ETHERNET_SCHEMA: &str = include_str!("schemas/ethernet.json");
 const WIFI_SCHEMA: &str = include_str!("schemas/wifi.json");
-const IP_SCHEMA: &str = include_str!("schemas/ip.json");
+const IPV4_SCHEMA: &str = include_str!("schemas/ipv4.json");
+const IPV6_SCHEMA: &str = include_str!("schemas/ipv6.json");
 const LINK_SCHEMA: &str = include_str!("schemas/link.json");
 
 // ── FieldType ─────────────────────────────────────────────────────────────────
@@ -156,20 +157,33 @@ impl std::error::Error for ValidationErrors {}
 pub struct EntitySchema {
     /// Pre-compiled JSON Schema validator for efficient repeated validation.
     validator: jsonschema::Validator,
-    /// Parsed field metadata indexed by field name.
+    /// Parsed field metadata indexed by field name (top-level properties only).
     fields: HashMap<String, FieldSchemaInfo>,
+    /// Parsed sub-property metadata for Object-type top-level fields.
+    ///
+    /// Keyed by parent field name → child field name → metadata. Populated for
+    /// any top-level field with `"type": "object"` that has `"properties"`.
+    /// Used by `SchemaRegistry::field_info()` and `comparison_keys()` to
+    /// provide backward-compatible lookup of fields that moved into sub-objects
+    /// (e.g., `addresses` and `routes` moved into `ipv4`/`ipv6`).
+    sub_fields: HashMap<String, HashMap<String, FieldSchemaInfo>>,
     /// Raw JSON Schema value kept alive so the validator's borrows remain valid.
     #[allow(dead_code)]
     raw: serde_json::Value,
 }
 
 impl EntitySchema {
-    /// Returns metadata for a specific field, or `None` if not in this schema.
+    /// Returns metadata for a specific top-level field, or `None` if not in this schema.
     pub fn field_info(&self, field: &str) -> Option<&FieldSchemaInfo> {
         self.fields.get(field)
     }
 
-    /// Returns all field names declared in this schema.
+    /// Returns metadata for a sub-property of an Object-type top-level field.
+    pub fn sub_field_info(&self, parent: &str, child: &str) -> Option<&FieldSchemaInfo> {
+        self.sub_fields.get(parent)?.get(child)
+    }
+
+    /// Returns all top-level field names declared in this schema.
     pub fn field_names(&self) -> Vec<&str> {
         self.fields.keys().map(String::as_str).collect()
     }
@@ -337,9 +351,25 @@ impl SchemaRegistry {
 
     /// Returns metadata for a specific field in an entity type.
     ///
-    /// Returns `None` if the entity type or field is not registered.
+    /// Checks top-level fields first. If not found, falls back to searching
+    /// sub-properties of Object-type fields — this backward-compatible fallback
+    /// allows callers like the diff engine to look up `"addresses"` or `"routes"`
+    /// by name even after they moved into `ipv4`/`ipv6` sub-objects.
+    ///
+    /// Returns `None` if the entity type or field is not found anywhere.
     pub fn field_info(&self, entity_type: &str, field: &str) -> Option<FieldSchemaInfo> {
-        self.schemas.get(entity_type)?.fields.get(field).cloned()
+        let schema = self.schemas.get(entity_type)?;
+        // Top-level lookup (fast path).
+        if let Some(info) = schema.fields.get(field) {
+            return Some(info.clone());
+        }
+        // Fallback: search sub-fields across all Object-type top-level properties.
+        for sub_map in schema.sub_fields.values() {
+            if let Some(info) = sub_map.get(field) {
+                return Some(info.clone());
+            }
+        }
+        None
     }
 
     /// Returns the comparison keys for a list field in an entity type.
@@ -348,13 +378,22 @@ impl SchemaRegistry {
     /// in its schema; returns `None` if the entity type or field is not found,
     /// or if the field has no comparison keys. Callers that receive `None`
     /// should fall back to full-value equality.
+    ///
+    /// Applies the same backward-compatible sub-field fallback as
+    /// [`field_info`](Self::field_info).
     pub fn comparison_keys(&self, entity_type: &str, field_name: &str) -> Option<Vec<String>> {
-        let keys = &self.schemas.get(entity_type)?.fields.get(field_name)?.comparison_keys;
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.clone())
+        let schema = self.schemas.get(entity_type)?;
+        // Top-level lookup.
+        if let Some(info) = schema.fields.get(field_name) {
+            return if info.comparison_keys.is_empty() { None } else { Some(info.comparison_keys.clone()) };
         }
+        // Fallback: search sub-fields.
+        for sub_map in schema.sub_fields.values() {
+            if let Some(info) = sub_map.get(field_name) {
+                return if info.comparison_keys.is_empty() { None } else { Some(info.comparison_keys.clone()) };
+            }
+        }
+        None
     }
 }
 
@@ -368,7 +407,7 @@ impl Default for SchemaRegistry {
 
 fn load_fragments() -> HashMap<String, serde_json::Value> {
     let mut fragments = HashMap::new();
-    for (name, src) in [("ip", IP_SCHEMA), ("link", LINK_SCHEMA)] {
+    for (name, src) in [("ipv4", IPV4_SCHEMA), ("ipv6", IPV6_SCHEMA), ("link", LINK_SCHEMA)] {
         let val: serde_json::Value = serde_json::from_str(src)
             .unwrap_or_else(|e| panic!("embedded {name} fragment is malformed JSON: {e}"));
         fragments.insert(name.to_string(), val);
@@ -425,7 +464,8 @@ fn load_entity_schema(
     let validator = jsonschema::validator_for(&resolved)
         .unwrap_or_else(|e| panic!("embedded {name} schema is invalid JSON Schema: {e}"));
     let fields = parse_field_metadata(&resolved);
-    EntitySchema { validator, fields, raw: resolved }
+    let sub_fields = parse_sub_field_metadata(&resolved);
+    EntitySchema { validator, fields, sub_fields, raw: resolved }
 }
 
 /// Converts `State.fields` to a JSON object suitable for schema validation.
@@ -549,6 +589,34 @@ fn parse_field_metadata(schema: &serde_json::Value) -> HashMap<String, FieldSche
     fields
 }
 
+/// Parses sub-property metadata for all Object-type top-level properties.
+///
+/// For each top-level property with `"type": "object"` that has nested
+/// `"properties"`, calls [`parse_field_metadata`] on the sub-schema and stores
+/// the result keyed by `parent_name → child_name → FieldSchemaInfo`.
+fn parse_sub_field_metadata(schema: &serde_json::Value) -> HashMap<String, HashMap<String, FieldSchemaInfo>> {
+    let mut sub_fields: HashMap<String, HashMap<String, FieldSchemaInfo>> = HashMap::new();
+
+    let properties = match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return sub_fields,
+    };
+
+    for (field_name, field_schema) in properties {
+        let is_object = field_schema.get("type").and_then(|t| t.as_str()) == Some("object");
+        let has_props = field_schema.get("properties").is_some();
+
+        if is_object && has_props {
+            let sub = parse_field_metadata(field_schema);
+            if !sub.is_empty() {
+                sub_fields.insert(field_name.clone(), sub);
+            }
+        }
+    }
+
+    sub_fields
+}
+
 /// Determines the [`FieldType`] from a JSON Schema property definition.
 fn parse_field_type(field_schema: &serde_json::Value) -> FieldType {
     match field_schema.get("type").and_then(|t| t.as_str()) {
@@ -584,17 +652,45 @@ fn run_custom_checks(state: &State) -> Vec<ValidationError> {
     }
 }
 
-/// Custom validation for the `addresses` field of an entity:
+/// Custom validation for address fields:
 /// - Rejects duplicate CIDR strings with a `ConstraintViolation` error.
 ///
-/// Only runs when `addresses` is present and is a `Value::List`; if it has the
-/// wrong type, JSON Schema already emitted a type error — no cascading errors.
+/// Checks addresses in nested `ipv4.addresses` and `ipv6.addresses` sub-objects,
+/// and also the flat top-level `addresses` field for backward compatibility with
+/// states produced by the current backend (which has not yet been restructured).
 fn check_addresses(state: &State) -> Vec<ValidationError> {
-    let addresses = match state.fields.get("addresses").map(|fv| &fv.value) {
-        Some(Value::List(items)) => items,
-        _ => return Vec::new(),
-    };
+    let mut errors = Vec::new();
 
+    // Nested ipv4.addresses (new format).
+    if let Some(fv) = state.fields.get("ipv4") {
+        if let Value::Map(ipv4_map) = &fv.value {
+            if let Some(Value::List(addresses)) = ipv4_map.get("addresses") {
+                errors.extend(check_address_list(addresses, "ipv4.addresses"));
+            }
+        }
+    }
+
+    // Nested ipv6.addresses (new format).
+    if let Some(fv) = state.fields.get("ipv6") {
+        if let Value::Map(ipv6_map) = &fv.value {
+            if let Some(Value::List(addresses)) = ipv6_map.get("addresses") {
+                errors.extend(check_address_list(addresses, "ipv6.addresses"));
+            }
+        }
+    }
+
+    // Flat top-level addresses (backward compat with backend-produced states).
+    if let Some(fv) = state.fields.get("addresses") {
+        if let Value::List(addresses) = &fv.value {
+            errors.extend(check_address_list(addresses, "addresses"));
+        }
+    }
+
+    errors
+}
+
+/// Checks a slice of address items for duplicates and returns any errors found.
+fn check_address_list(addresses: &[Value], field_prefix: &str) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut reported_dup: HashSet<String> = HashSet::new();
@@ -611,7 +707,7 @@ fn check_addresses(state: &State) -> Vec<ValidationError> {
 
         if !seen.insert(addr.clone()) && reported_dup.insert(addr.clone()) {
             errors.push(ValidationError {
-                field: "addresses".into(),
+                field: field_prefix.to_string(),
                 message: format!("duplicate address \"{addr}\""),
                 kind: ValidationErrorKind::ConstraintViolation,
             });
@@ -725,10 +821,8 @@ mod tests {
             "ethernet",
             vec![
                 ("mtu", Value::U64(1500)),
-                (
-                    "addresses",
-                    Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
-                ),
+                ("ipv4", make_map(&[("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())]))])),
+                ("ipv6", make_map(&[("addresses", Value::List(vec![Value::String("2001:db8::50/64".to_string())]))])),
             ],
         );
         assert!(registry.validate(&state).is_ok(), "valid ethernet state should pass validation");
@@ -955,7 +1049,7 @@ mod tests {
     fn test_route_object_validation_passes() {
         let registry = SchemaRegistry::new();
         let route = make_route(Some("0.0.0.0/0"), Some("10.0.1.1"), Some(100));
-        let state = make_state("ethernet", vec![("routes", Value::List(vec![route]))]);
+        let state = make_state("ethernet", vec![("ipv4", make_map(&[("routes", Value::List(vec![route]))]))]);
         assert!(
             registry.validate(&state).is_ok(),
             "valid route object should pass validation"
@@ -967,7 +1061,7 @@ mod tests {
     fn test_route_with_only_destination_passes() {
         let registry = SchemaRegistry::new();
         let route = make_route(Some("192.168.1.0/24"), None, None);
-        let state = make_state("ethernet", vec![("routes", Value::List(vec![route]))]);
+        let state = make_state("ethernet", vec![("ipv4", make_map(&[("routes", Value::List(vec![route]))]))]);
         assert!(
             registry.validate(&state).is_ok(),
             "route with only destination should pass (gateway and metric are optional)"
@@ -979,7 +1073,7 @@ mod tests {
     fn test_route_without_destination_is_rejected() {
         let registry = SchemaRegistry::new();
         let route = make_route(None, Some("10.0.1.1"), None);
-        let state = make_state("ethernet", vec![("routes", Value::List(vec![route]))]);
+        let state = make_state("ethernet", vec![("ipv4", make_map(&[("routes", Value::List(vec![route]))]))]);
         let result = registry.validate(&state);
         assert!(result.is_err(), "route without 'destination' should fail validation");
     }
@@ -989,7 +1083,7 @@ mod tests {
     fn test_route_without_destination_error_kind_is_missing_required() {
         let registry = SchemaRegistry::new();
         let route = make_route(None, Some("10.0.1.1"), None);
-        let state = make_state("ethernet", vec![("routes", Value::List(vec![route]))]);
+        let state = make_state("ethernet", vec![("ipv4", make_map(&[("routes", Value::List(vec![route]))]))]);
         let errs = registry.validate(&state).unwrap_err();
         let has_missing = errs
             .errors()
@@ -1002,18 +1096,16 @@ mod tests {
         );
     }
 
-    /// Scenario: Route without required destination — error references routes[0].destination
+    /// Scenario: Route without required destination — error references ipv4.routes[0].destination
     ///
-    /// NOTE: The spec requires the error field to be "routes[0].destination".
     /// The jsonschema crate reports `required` errors at the parent object path
-    /// (`/routes/0` → `routes[0]`), not at the missing property path. If this
-    /// assertion fails, the field path conversion needs to append the missing
-    /// property name for Required errors.
+    /// (`/ipv4/routes/0` → `ipv4.routes[0]`). Our Required error handler appends the
+    /// missing property name so the final path is "ipv4.routes[0].destination".
     #[test]
     fn test_route_without_destination_error_references_destination() {
         let registry = SchemaRegistry::new();
         let route = make_route(None, Some("10.0.1.1"), None);
-        let state = make_state("ethernet", vec![("routes", Value::List(vec![route]))]);
+        let state = make_state("ethernet", vec![("ipv4", make_map(&[("routes", Value::List(vec![route]))]))]);
         let errs = registry.validate(&state).unwrap_err();
         let missing_err = errs
             .errors()
@@ -1021,8 +1113,8 @@ mod tests {
             .find(|e| e.kind == ValidationErrorKind::MissingRequired)
             .expect("should have a MissingRequired error");
         assert_eq!(
-            missing_err.field, "routes[0].destination",
-            "MissingRequired error field should be 'routes[0].destination' per spec"
+            missing_err.field, "ipv4.routes[0].destination",
+            "MissingRequired error field should be 'ipv4.routes[0].destination'"
         );
     }
 
@@ -1169,7 +1261,7 @@ mod tests {
         assert!(!info.writable, "ethernet sub-object should be read-only (x-netfyr-writable: false)");
     }
 
-    /// routes field is writable
+    /// routes field is writable (via sub-field fallback to ipv4.routes)
     #[test]
     fn test_field_info_routes_is_writable() {
         let registry = SchemaRegistry::new();
@@ -1178,7 +1270,7 @@ mod tests {
         assert!(info.writable, "routes should be writable (x-netfyr-writable: true)");
     }
 
-    /// addresses field has comparison_keys = ["address"]
+    /// addresses field has comparison_keys = ["address"] (via sub-field fallback)
     #[test]
     fn test_field_info_addresses_has_comparison_keys() {
         let registry = SchemaRegistry::new();
@@ -1311,11 +1403,11 @@ mod tests {
         let state = make_state(
             "ethernet",
             vec![(
-                "addresses",
-                Value::List(vec![
+                "ipv4",
+                make_map(&[("addresses", Value::List(vec![
                     Value::String("10.0.1.50/24".to_string()),
                     Value::String("10.0.1.50/24".to_string()),
-                ]),
+                ]))]),
             )],
         );
         assert!(
@@ -1324,28 +1416,28 @@ mod tests {
         );
     }
 
-    /// Scenario: Duplicate addresses — error kind is ConstraintViolation for field "addresses"
+    /// Scenario: Duplicate addresses — error kind is ConstraintViolation for field "ipv4.addresses"
     #[test]
     fn test_duplicate_addresses_error_kind_is_constraint_violation() {
         let registry = SchemaRegistry::new();
         let state = make_state(
             "ethernet",
             vec![(
-                "addresses",
-                Value::List(vec![
+                "ipv4",
+                make_map(&[("addresses", Value::List(vec![
                     Value::String("10.0.1.50/24".to_string()),
                     Value::String("10.0.1.50/24".to_string()),
-                ]),
+                ]))]),
             )],
         );
         let errs = registry.validate(&state).unwrap_err();
         let has_constraint = errs
             .errors()
             .iter()
-            .any(|e| e.field == "addresses" && e.kind == ValidationErrorKind::ConstraintViolation);
+            .any(|e| e.field == "ipv4.addresses" && e.kind == ValidationErrorKind::ConstraintViolation);
         assert!(
             has_constraint,
-            "expected ConstraintViolation for 'addresses', got: {:?}",
+            "expected ConstraintViolation for 'ipv4.addresses', got: {:?}",
             errs.errors()
         );
     }
@@ -1357,19 +1449,19 @@ mod tests {
         let state = make_state(
             "ethernet",
             vec![(
-                "addresses",
-                Value::List(vec![
+                "ipv4",
+                make_map(&[("addresses", Value::List(vec![
                     Value::String("10.0.1.50/24".to_string()),
                     Value::String("10.0.1.50/24".to_string()),
-                ]),
+                ]))]),
             )],
         );
         let errs = registry.validate(&state).unwrap_err();
         let dup_err = errs
             .errors()
             .iter()
-            .find(|e| e.field == "addresses" && e.kind == ValidationErrorKind::ConstraintViolation)
-            .expect("should have a ConstraintViolation for 'addresses'");
+            .find(|e| e.field == "ipv4.addresses" && e.kind == ValidationErrorKind::ConstraintViolation)
+            .expect("should have a ConstraintViolation for 'ipv4.addresses'");
         assert!(
             dup_err.message.contains("10.0.1.50/24"),
             "error message should mention the duplicate address '10.0.1.50/24', got: {}",
@@ -1384,11 +1476,11 @@ mod tests {
         let state = make_state(
             "ethernet",
             vec![(
-                "addresses",
-                Value::List(vec![
+                "ipv4",
+                make_map(&[("addresses", Value::List(vec![
                     Value::String("10.0.1.50/24".to_string()),
                     Value::String("10.0.1.51/24".to_string()),
-                ]),
+                ]))]),
             )],
         );
         assert!(
@@ -1397,20 +1489,20 @@ mod tests {
         );
     }
 
-    /// Scenario: IPv6 addresses are accepted
+    /// Scenario: IPv6 addresses are accepted in the ipv6 sub-object
     #[test]
     fn test_ipv6_address_is_accepted() {
         let registry = SchemaRegistry::new();
         let state = make_state(
             "ethernet",
             vec![(
-                "addresses",
-                Value::List(vec![Value::String("fe80::1/64".to_string())]),
+                "ipv6",
+                make_map(&[("addresses", Value::List(vec![Value::String("2001:db8::50/64".to_string())]))]),
             )],
         );
         assert!(
             registry.validate(&state).is_ok(),
-            "IPv6 address in 'addresses' should be accepted"
+            "IPv6 address in 'ipv6.addresses' sub-object should be accepted"
         );
     }
 
@@ -1424,11 +1516,11 @@ mod tests {
         addr_map.insert("preferred_lft".to_string(), Value::U64(1800));
         let state = make_state(
             "ethernet",
-            vec![("addresses", Value::List(vec![Value::Map(addr_map)]))],
+            vec![("ipv4", make_map(&[("addresses", Value::List(vec![Value::Map(addr_map)]))]))],
         );
         assert!(
             registry.validate(&state).is_ok(),
-            "map-format address with lifetimes should be accepted"
+            "map-format address with lifetimes should be accepted in ipv4.addresses"
         );
     }
 
@@ -1444,13 +1536,13 @@ mod tests {
         m2.insert("valid_lft".to_string(), Value::U64(7200));
         let state = make_state(
             "ethernet",
-            vec![("addresses", Value::List(vec![Value::Map(m1), Value::Map(m2)]))],
+            vec![("ipv4", make_map(&[("addresses", Value::List(vec![Value::Map(m1), Value::Map(m2)]))]))],
         );
         let result = registry.validate(&state);
         assert!(result.is_err(), "duplicate map-format addresses should be rejected");
     }
 
-    /// Scenario: Route with mtu, table, tos is accepted by schema
+    /// Scenario: Route with mtu, table, tos is accepted inside ipv4 sub-object
     #[test]
     fn test_route_with_mtu_table_tos_accepted() {
         let registry = SchemaRegistry::new();
@@ -1463,11 +1555,11 @@ mod tests {
         route.insert("tos".to_string(), Value::U64(16));
         let state = make_state(
             "ethernet",
-            vec![("routes", Value::List(vec![Value::Map(route)]))],
+            vec![("ipv4", make_map(&[("routes", Value::List(vec![Value::Map(route)]))]))],
         );
         assert!(
             registry.validate(&state).is_ok(),
-            "route with mtu/table/tos should be accepted"
+            "route with mtu/table/tos should be accepted inside ipv4 sub-object"
         );
     }
 
@@ -1548,16 +1640,15 @@ mod tests {
         fields.sort();
 
         let expected = vec![
-            "addresses",
             "carrier",
-            "dns_servers",
             "driver",
             "enabled",
             "ethernet",
+            "ipv4",
+            "ipv6",
             "mac",
             "mtu",
             "name",
-            "routes",
             "type",
         ];
 
@@ -1580,7 +1671,7 @@ mod tests {
             .collect();
         writable.sort();
 
-        let expected = vec!["addresses", "enabled", "mtu", "routes"];
+        let expected = vec!["enabled", "ipv4", "ipv6", "mtu"];
 
         assert_eq!(
             writable, expected,
@@ -1601,7 +1692,7 @@ mod tests {
             .collect();
         readonly.sort();
 
-        let expected = vec!["carrier", "dns_servers", "driver", "ethernet", "mac", "name", "type"];
+        let expected = vec!["carrier", "driver", "ethernet", "mac", "name", "type"];
 
         assert_eq!(
             readonly, expected,
@@ -1829,7 +1920,7 @@ mod tests {
             "wifi",
             vec![
                 ("mtu", Value::U64(1500)),
-                ("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())])),
+                ("ipv4", make_map(&[("addresses", Value::List(vec![Value::String("10.0.1.50/24".to_string())]))])),
             ],
         );
         assert!(registry.validate(&state).is_ok(), "valid wifi state should pass validation");
@@ -2061,16 +2152,15 @@ mod tests {
         fields.sort();
 
         let expected = vec![
-            "addresses",
             "carrier",
-            "dns_servers",
             "driver",
             "enabled",
             "ethernet",
+            "ipv4",
+            "ipv6",
             "mac",
             "mtu",
             "name",
-            "routes",
             "type",
         ];
 
@@ -2079,8 +2169,8 @@ mod tests {
             "ethernet schema fields diverged from the SPEC-006 pinned set.\n\
              If you added or removed a field in the JSON schema, update this test \
              AND the corresponding backend query/apply code.\n\
-             NOTE: 'speed' is a sub-property inside the 'ethernet' object, not a \
-             top-level field."
+             NOTE: 'ipv4' and 'ipv6' are sub-objects; their sub-properties (addresses, \
+             routes, dns_servers) are not top-level fields."
         );
     }
 
@@ -2096,7 +2186,7 @@ mod tests {
             .collect();
         writable.sort();
 
-        let expected = vec!["addresses", "enabled", "mtu", "routes"];
+        let expected = vec!["enabled", "ipv4", "ipv6", "mtu"];
 
         assert_eq!(
             writable, expected,
@@ -2120,7 +2210,6 @@ mod tests {
 
         let expected = vec![
             "carrier",
-            "dns_servers",
             "driver",
             "ethernet",
             "mac",
@@ -2145,15 +2234,14 @@ mod tests {
         fields.sort();
 
         let expected = vec![
-            "addresses",
             "carrier",
-            "dns_servers",
             "driver",
             "enabled",
+            "ipv4",
+            "ipv6",
             "mac",
             "mtu",
             "name",
-            "routes",
             "type",
             "wifi",
         ];
@@ -2178,7 +2266,7 @@ mod tests {
             .collect();
         writable.sort();
 
-        let expected = vec!["addresses", "enabled", "mtu", "routes"];
+        let expected = vec!["enabled", "ipv4", "ipv6", "mtu"];
 
         assert_eq!(
             writable, expected,
@@ -2202,7 +2290,6 @@ mod tests {
 
         let expected = vec![
             "carrier",
-            "dns_servers",
             "driver",
             "mac",
             "name",
@@ -2226,12 +2313,12 @@ mod tests {
             "wifi",
             vec![
                 ("mtu", Value::U64(1500)),
-                ("addresses", Value::List(vec![Value::String("192.168.1.10/24".to_string())])),
+                ("ipv4", make_map(&[("addresses", Value::List(vec![Value::String("192.168.1.10/24".to_string())]))])),
             ],
         );
         assert!(
             registry.validate_writable(&state).is_ok(),
-            "wifi state with only writable fields (mtu, addresses) should pass validate_writable"
+            "wifi state with only writable fields (mtu, ipv4.addresses) should pass validate_writable"
         );
     }
 
@@ -2244,6 +2331,219 @@ mod tests {
             keys,
             Some(vec!["address".to_string()]),
             "comparison_keys(\"wifi\", \"addresses\") must return Some([\"address\"])"
+        );
+    }
+
+    // ── Feature: IPv6-specific fields ─────────────────────────────────────────
+
+    /// Scenario: IPv6 link_local valid enum value "eui64" is accepted
+    #[test]
+    fn test_ipv6_link_local_valid_enum_accepted() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[("link_local", Value::String("eui64".to_string()))]))],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "ipv6.link_local = \"eui64\" should be accepted"
+        );
+    }
+
+    /// Scenario: IPv6 link_local valid enum value "none" is accepted
+    #[test]
+    fn test_ipv6_link_local_none_enum_accepted() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[("link_local", Value::String("none".to_string()))]))],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "ipv6.link_local = \"none\" should be accepted"
+        );
+    }
+
+    /// Scenario: Invalid ipv6 link_local value is rejected with ConstraintViolation
+    #[test]
+    fn test_ipv6_link_local_invalid_enum_rejected() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[("link_local", Value::String("random".to_string()))]))],
+        );
+        let result = registry.validate(&state);
+        assert!(result.is_err(), "ipv6.link_local = \"random\" should be rejected");
+        let errs = result.unwrap_err();
+        let has_constraint = errs
+            .errors()
+            .iter()
+            .any(|e| e.field.contains("link_local") && e.kind == ValidationErrorKind::ConstraintViolation);
+        assert!(
+            has_constraint,
+            "expected ConstraintViolation for ipv6.link_local with invalid enum value, got: {:?}",
+            errs.errors()
+        );
+    }
+
+    /// Scenario: IPv6 dad_transmits integer field is accepted
+    #[test]
+    fn test_ipv6_dad_transmits_accepted() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[
+                ("link_local", Value::String("eui64".to_string())),
+                ("dad_transmits", Value::U64(1)),
+            ]))],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "ipv6.dad_transmits = 1 should be accepted"
+        );
+    }
+
+    /// Scenario: IPv6 map-format addresses with DAD state are accepted
+    #[test]
+    fn test_ipv6_dad_state_in_map_address_accepted() {
+        let registry = SchemaRegistry::new();
+        let mut addr_map = IndexMap::new();
+        addr_map.insert("address".to_string(), Value::String("2001:db8::1/64".to_string()));
+        addr_map.insert("valid_lft".to_string(), Value::U64(86400));
+        addr_map.insert("preferred_lft".to_string(), Value::U64(14400));
+        addr_map.insert("dad_state".to_string(), Value::String("preferred".to_string()));
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[("addresses", Value::List(vec![Value::Map(addr_map)]))]))],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "IPv6 map-format address with dad_state should be accepted"
+        );
+    }
+
+    /// Scenario: IPv6 route validation within the ipv6 sub-object passes
+    #[test]
+    fn test_ipv6_route_validation_within_sub_object() {
+        let registry = SchemaRegistry::new();
+        let route = make_route(Some("2001:db8::/32"), Some("fe80::1"), Some(100));
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[("routes", Value::List(vec![route]))]))],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "IPv6 route inside ipv6 sub-object should pass validation"
+        );
+    }
+
+    /// Scenario: IPv6 route without required destination is rejected
+    #[test]
+    fn test_ipv6_route_without_destination_rejected() {
+        let registry = SchemaRegistry::new();
+        let route = make_route(None, Some("fe80::1"), None);
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[("routes", Value::List(vec![route]))]))],
+        );
+        let result = registry.validate(&state);
+        assert!(result.is_err(), "IPv6 route without destination should be rejected");
+        let errs = result.unwrap_err();
+        let has_missing = errs
+            .errors()
+            .iter()
+            .any(|e| e.kind == ValidationErrorKind::MissingRequired);
+        assert!(
+            has_missing,
+            "expected MissingRequired for missing IPv6 route destination, got: {:?}",
+            errs.errors()
+        );
+    }
+
+    /// Scenario: field_info for ipv4 returns Object type, writable, keep_when_absent
+    #[test]
+    fn test_field_info_ipv4_is_object_writable_keep_when_absent() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("ethernet", "ipv4")
+            .expect("field_info(\"ethernet\", \"ipv4\") should return Some");
+        assert_eq!(info.field_type, FieldType::Object, "ipv4 field should have FieldType::Object");
+        assert!(info.writable, "ipv4 field should be writable");
+        assert!(info.keep_when_absent, "ipv4 field should have keep_when_absent = true");
+    }
+
+    /// Scenario: field_info for ipv6 returns Object type, writable, keep_when_absent
+    #[test]
+    fn test_field_info_ipv6_is_object_writable_keep_when_absent() {
+        let registry = SchemaRegistry::new();
+        let info = registry
+            .field_info("ethernet", "ipv6")
+            .expect("field_info(\"ethernet\", \"ipv6\") should return Some");
+        assert_eq!(info.field_type, FieldType::Object, "ipv6 field should have FieldType::Object");
+        assert!(info.writable, "ipv6 field should be writable");
+        assert!(info.keep_when_absent, "ipv6 field should have keep_when_absent = true");
+    }
+
+    /// Scenario: sub_field_info for ipv4.addresses returns comparison_keys and writable
+    #[test]
+    fn test_sub_field_info_ipv4_addresses() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let info = schema
+            .sub_field_info("ipv4", "addresses")
+            .expect("sub_field_info(\"ipv4\", \"addresses\") should return Some");
+        assert_eq!(
+            info.comparison_keys,
+            vec!["address".to_string()],
+            "ipv4.addresses should have comparison_keys=[\"address\"]"
+        );
+        assert!(info.writable, "ipv4.addresses should be writable");
+    }
+
+    /// Scenario: sub_field_info for ipv6.link_local returns writable and keep_when_absent
+    #[test]
+    fn test_sub_field_info_ipv6_link_local() {
+        let registry = SchemaRegistry::new();
+        let schema = registry.get_schema("ethernet").expect("ethernet schema must exist");
+        let info = schema
+            .sub_field_info("ipv6", "link_local")
+            .expect("sub_field_info(\"ipv6\", \"link_local\") should return Some");
+        assert!(info.writable, "ipv6.link_local should be writable");
+        assert!(info.keep_when_absent, "ipv6.link_local should have keep_when_absent = true");
+    }
+
+    /// Scenario: WiFi validate_writable passes with writable ipv4/ipv6 sub-objects
+    #[test]
+    fn test_wifi_with_ipv4_ipv6_passes_writable_validation() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "wifi",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("ipv4", make_map(&[("addresses", Value::List(vec![Value::String("10.0.0.1/24".to_string())]))])),
+                ("ipv6", make_map(&[("addresses", Value::List(vec![Value::String("2001:db8::1/64".to_string())]))])),
+            ],
+        );
+        assert!(
+            registry.validate_writable(&state).is_ok(),
+            "wifi state with ipv4/ipv6 sub-objects should pass validate_writable"
+        );
+    }
+
+    /// Scenario: IPv6 dns_search and nat64_prefix read-only fields pass regular validation
+    #[test]
+    fn test_ipv6_dns_search_and_nat64_prefix_accepted() {
+        let registry = SchemaRegistry::new();
+        let state = make_state(
+            "ethernet",
+            vec![("ipv6", make_map(&[
+                ("dns_search", Value::List(vec![Value::String("example.com".to_string())])),
+                ("nat64_prefix", Value::String("64:ff9b::/96".to_string())),
+            ]))],
+        );
+        assert!(
+            registry.validate(&state).is_ok(),
+            "ipv6 dns_search and nat64_prefix should pass regular validation"
         );
     }
 }

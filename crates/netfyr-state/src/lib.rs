@@ -114,23 +114,41 @@ fn item_eq(a: &Value, b: &Value, comparison_keys: &[String]) -> bool {
 
 const DEFAULT_ROUTE_METRIC: u64 = 100;
 
-/// Fills in `metric: 100` on any route map in `routes` fields that doesn't
-/// already specify a metric. This makes desired state comparable to kernel
-/// state via `PartialEq`, since the kernel always assigns the default metric.
+/// Fills in `metric: 100` on any route map that doesn't already specify a
+/// metric. Handles flat top-level `routes` (backward compat) and routes nested
+/// inside `ipv4` and `ipv6` sub-objects (new format).
 pub fn normalize_route_defaults(state_set: &mut set::StateSet) {
     for state in state_set.iter_mut() {
+        // Flat top-level routes (backward compat with backend-produced states).
         if let Some(fv) = state.fields.get_mut("routes") {
             if let Value::List(ref mut routes) = fv.value {
-                for route in routes.iter_mut() {
-                    if let Value::Map(ref mut map) = route {
-                        if !map.contains_key("metric") {
-                            map.insert(
-                                "metric".to_string(),
-                                Value::U64(DEFAULT_ROUTE_METRIC),
-                            );
-                        }
-                    }
+                fill_route_metrics(routes);
+            }
+        }
+        // Nested ipv4.routes (new format).
+        if let Some(fv) = state.fields.get_mut("ipv4") {
+            if let Value::Map(ref mut ipv4_map) = fv.value {
+                if let Some(Value::List(routes)) = ipv4_map.get_mut("routes") {
+                    fill_route_metrics(routes);
                 }
+            }
+        }
+        // Nested ipv6.routes (new format).
+        if let Some(fv) = state.fields.get_mut("ipv6") {
+            if let Value::Map(ref mut ipv6_map) = fv.value {
+                if let Some(Value::List(routes)) = ipv6_map.get_mut("routes") {
+                    fill_route_metrics(routes);
+                }
+            }
+        }
+    }
+}
+
+fn fill_route_metrics(routes: &mut [Value]) {
+    for route in routes.iter_mut() {
+        if let Value::Map(ref mut map) = route {
+            if !map.contains_key("metric") {
+                map.insert("metric".to_string(), Value::U64(DEFAULT_ROUTE_METRIC));
             }
         }
     }
