@@ -30,7 +30,8 @@ pub use report::DiffReport;
 use std::collections::HashMap;
 use std::fmt;
 
-use netfyr_state::{FieldValue, Selector, State, StateMetadata, StateSet, Value};
+use indexmap::IndexMap;
+use netfyr_state::{FieldValue, Provenance, Selector, State, StateMetadata, StateSet, Value};
 
 // ── PolicyId ──────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,109 @@ pub struct ReconciliationResult {
 }
 
 // ── Merge algorithm ───────────────────────────────────────────────────────────
+
+/// Protocol sub-object field names that receive recursive per-sub-key priority merge.
+///
+/// Route entry maps (e.g. `{destination: "...", gateway: "..."}`) are opaque values and
+/// must NOT be in this list — decomposing them would break their semantics.
+const PROTOCOL_SUB_OBJECTS: &[&str] = &["ipv4", "ipv6"];
+
+/// Return type from [`resolve_sub_fields`]: merged value, source entries, and sub-conflicts.
+type SubFieldResult = (Option<FieldValue>, Vec<((EntityKey, FieldName), PolicyId)>, Vec<Conflict>);
+
+/// Performs per-sub-key priority resolution for a protocol sub-object field.
+///
+/// Returns `None` when any contender's value is not a `Value::Map`, signalling the
+/// caller to fall back to opaque (whole-field) resolution.
+///
+/// On success returns `(merged_fv, sources, sub_conflicts)`:
+/// - `merged_fv`: the merged `FieldValue` (or `None` if all sub-keys conflicted).
+/// - `sources`: `field_sources` entries using dotted paths (`"ipv4.addresses"`, …).
+/// - `sub_conflicts`: any sub-key conflicts (field_name is the dotted path).
+fn resolve_sub_fields(
+    field_name: &str,
+    entity_key: &EntityKey,
+    contenders: &[(PolicyId, u32, FieldValue)],
+) -> Option<SubFieldResult> {
+    // Guard: every contender must be a Value::Map, otherwise fall back to opaque resolution.
+    if !contenders.iter().all(|(_, _, fv)| matches!(fv.value, Value::Map(_))) {
+        return None;
+    }
+
+    // Collect per-sub-key contenders across ALL policies (not just top-priority),
+    // because a lower-priority policy may be the sole provider of a sub-key.
+    let mut sub_key_contenders: HashMap<String, Vec<(PolicyId, u32, Value, Provenance)>> =
+        HashMap::new();
+    for (policy_id, priority, fv) in contenders {
+        if let Value::Map(map) = &fv.value {
+            for (sub_key, sub_val) in map {
+                sub_key_contenders.entry(sub_key.clone()).or_default().push((
+                    policy_id.clone(),
+                    *priority,
+                    sub_val.clone(),
+                    fv.provenance.clone(),
+                ));
+            }
+        }
+    }
+
+    let mut merged_map: IndexMap<String, Value> = IndexMap::new();
+    let mut sources: Vec<((EntityKey, FieldName), PolicyId)> = Vec::new();
+    let mut sub_conflicts: Vec<Conflict> = Vec::new();
+
+    // Process sub-keys in sorted order for deterministic output.
+    let mut sub_keys: Vec<&String> = sub_key_contenders.keys().collect();
+    sub_keys.sort();
+
+    for sub_key in sub_keys {
+        let sub_contenders = &sub_key_contenders[sub_key];
+        let dotted = format!("{}.{}", field_name, sub_key);
+
+        let max_priority = sub_contenders.iter().map(|(_, p, _, _)| *p).max().unwrap_or(0);
+
+        let top: Vec<&(PolicyId, u32, Value, Provenance)> =
+            sub_contenders.iter().filter(|(_, p, _, _)| *p == max_priority).collect();
+
+        let first_val = &top[0].2;
+        let all_agree = top.iter().all(|(_, _, v, _)| values_equal_for_conflict(v, first_val));
+
+        if all_agree {
+            merged_map.insert(sub_key.clone(), first_val.clone());
+            sources.push(((entity_key.clone(), dotted), top[0].0.clone()));
+        } else {
+            let contributions: Vec<ConflictContribution> = top
+                .iter()
+                .map(|(pid, _, v, prov)| ConflictContribution {
+                    policy_id: pid.clone(),
+                    value: FieldValue { value: v.clone(), provenance: prov.clone() },
+                })
+                .collect();
+            sub_conflicts.push(Conflict {
+                entity_key: entity_key.clone(),
+                field_name: dotted,
+                priority: max_priority,
+                contributions,
+            });
+        }
+    }
+
+    // Provenance for the outer FieldValue: use the highest-priority contender's provenance.
+    let best_provenance = contenders
+        .iter()
+        .max_by_key(|(_, p, _)| *p)
+        .map(|(_, _, fv)| fv.provenance.clone())
+        .unwrap_or(Provenance::KernelDefault);
+
+    if merged_map.is_empty() {
+        Some((None, sources, sub_conflicts))
+    } else {
+        Some((
+            Some(FieldValue { value: Value::Map(merged_map), provenance: best_provenance }),
+            sources,
+            sub_conflicts,
+        ))
+    }
+}
 
 /// Merges N policy inputs into a single effective `StateSet` using per-field priority.
 ///
@@ -193,6 +297,23 @@ pub fn merge(inputs: Vec<PolicyInput>) -> ReconciliationResult {
 
         for field_name in field_names {
             let contenders = &entity_data.fields[field_name];
+
+            // Protocol sub-objects (ipv4, ipv6) get per-sub-key priority resolution
+            // instead of opaque whole-field comparison.
+            if PROTOCOL_SUB_OBJECTS.contains(&field_name.as_str()) {
+                if let Some((merged_fv, sub_sources, sub_conflicts)) =
+                    resolve_sub_fields(field_name, &entity_key, contenders)
+                {
+                    if let Some(fv) = merged_fv {
+                        merged_state.fields.insert(field_name.clone(), fv);
+                    }
+                    field_sources.extend(sub_sources);
+                    conflict_list.extend(sub_conflicts);
+                    continue;
+                }
+                // resolve_sub_fields returned None (a contender was not a Value::Map);
+                // fall through to opaque resolution below.
+            }
 
             // Find the maximum priority among all contenders for this field.
             let max_priority = contenders
@@ -1571,5 +1692,396 @@ mod tests {
         assert_eq!(conflict.contributions[0].value.value, Value::U64(9000));
         assert_eq!(conflict.contributions[1].policy_id.as_str(), "team-b");
         assert_eq!(conflict.contributions[1].value.value, Value::U64(1500));
+    }
+
+    // ── ipv4 sub-object tests (SPEC-201 per-sub-field merge) ──────────────────
+
+    /// Builds a `Value::Map` for protocol sub-objects like `ipv4` or `ipv6`.
+    fn make_map_value(fields: Vec<(&str, Value)>) -> Value {
+        let mut map: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (k, v) in fields {
+            map.insert(k.to_string(), v);
+        }
+        Value::Map(map)
+    }
+
+    /// Scenario 1 (ipv4 variant): single policy with ipv4 as a sub-object.
+    /// field_sources must use dotted paths like "ipv4.addresses", not just "ipv4".
+    #[test]
+    fn test_single_policy_ipv4_subobject_field_sources_use_dotted_paths() {
+        let ipv4 = make_map_value(vec![(
+            "addresses",
+            Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
+        )]);
+        let input = make_input(
+            "eth0-config",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![("mtu", Value::U64(1500)), ("ipv4", ipv4)],
+            )],
+        );
+
+        let result = merge(vec![input]);
+
+        let eth0 = result
+            .effective_state
+            .get("ethernet", "eth0")
+            .expect("ethernet/eth0 should be in effective state");
+        assert_eq!(eth0.fields["mtu"].value, Value::U64(1500));
+        assert!(
+            matches!(&eth0.fields["ipv4"].value, Value::Map(_)),
+            "ipv4 field must be a Map in the effective state"
+        );
+
+        // field_sources must record the dotted path "ipv4.addresses"
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "mtu").map(|p| p.as_str()),
+            Some("eth0-config"),
+            "mtu must be attributed to eth0-config"
+        );
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.addresses").map(|p| p.as_str()),
+            Some("eth0-config"),
+            "field_sources must map (ethernet/eth0, ipv4.addresses) to eth0-config"
+        );
+        // "ipv4" as a whole must NOT appear in field_sources for sub-objects
+        // (sub-key resolution replaces the top-level entry with dotted entries)
+        assert!(
+            get_source(&result, "ethernet", "eth0", "ipv4").is_none(),
+            "top-level 'ipv4' key must not appear in field_sources when sub-key resolution is used"
+        );
+    }
+
+    /// Scenario 2 (ipv4 variant): two policies contribute different ipv4 sub-fields.
+    /// field_sources must track each sub-field independently with dotted paths.
+    #[test]
+    fn test_two_policies_ipv4_different_subfields_merged_with_dotted_sources() {
+        let addresses = Value::List(vec![Value::String("10.0.1.50/24".to_string())]);
+        let routes = Value::List(vec![Value::String("0.0.0.0/0 via 10.0.1.1".to_string())]);
+
+        // eth0-base provides ipv4.addresses only
+        let base = make_input(
+            "eth0-base",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![("ipv4", make_map_value(vec![("addresses", addresses.clone())]))],
+            )],
+        );
+        // eth0-dhcp provides ipv4.routes only
+        let dhcp = make_input(
+            "eth0-dhcp",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![("ipv4", make_map_value(vec![("routes", routes.clone())]))],
+            )],
+        );
+
+        let result = merge(vec![base, dhcp]);
+
+        let eth0 = result
+            .effective_state
+            .get("ethernet", "eth0")
+            .expect("ethernet/eth0 should be in effective state");
+
+        let ipv4_map = eth0.fields["ipv4"].value.as_map().expect("ipv4 must be a map");
+        assert!(ipv4_map.contains_key("addresses"), "merged ipv4 must contain 'addresses'");
+        assert!(ipv4_map.contains_key("routes"), "merged ipv4 must contain 'routes'");
+
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.addresses").map(|p| p.as_str()),
+            Some("eth0-base"),
+            "ipv4.addresses must be attributed to eth0-base"
+        );
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.routes").map(|p| p.as_str()),
+            Some("eth0-dhcp"),
+            "ipv4.routes must be attributed to eth0-dhcp"
+        );
+    }
+
+    /// Scenario 11: per-sub-field priority merge within the ipv4 sub-object.
+    /// Policy B (priority 200) wins ipv4.addresses; policy A (priority 100, sole
+    /// provider) wins ipv4.routes.
+    #[test]
+    fn test_per_subfield_priority_merge_within_ipv4_subobject() {
+        let routes = Value::List(vec![Value::String("0.0.0.0/0 via 10.0.1.1".to_string())]);
+
+        // Policy A (priority 100): ipv4={addresses: ["10.0.1.50/24"], routes: [...]}
+        let policy_a = make_input(
+            "policy-a",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![
+                        (
+                            "addresses",
+                            Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
+                        ),
+                        ("routes", routes.clone()),
+                    ]),
+                )],
+            )],
+        );
+
+        // Policy B (priority 200): ipv4={addresses: ["10.0.2.50/24"]}
+        let policy_b = make_input(
+            "policy-b",
+            200,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("10.0.2.50/24".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+
+        let result = merge(vec![policy_a, policy_b]);
+
+        let eth0 = result
+            .effective_state
+            .get("ethernet", "eth0")
+            .expect("ethernet/eth0 should be in effective state");
+        let ipv4_map = eth0.fields["ipv4"].value.as_map().expect("ipv4 must be a map");
+
+        // ipv4.addresses: policy B (priority 200) wins
+        let effective_addresses =
+            ipv4_map.get("addresses").expect("ipv4.addresses must be present");
+        let addr_strs: Vec<String> = effective_addresses
+            .as_list()
+            .expect("addresses must be a list")
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            addr_strs.iter().any(|s| s.contains("10.0.2.50")),
+            "ipv4.addresses must contain 10.0.2.50/24 (from policy-b, priority 200): {:?}",
+            addr_strs
+        );
+        assert!(
+            !addr_strs.iter().any(|s| s.contains("10.0.1.50")),
+            "policy-a's 10.0.1.50/24 must not appear in ipv4.addresses (lower priority): {:?}",
+            addr_strs
+        );
+
+        // ipv4.routes: policy A is the sole provider → included
+        let effective_routes = ipv4_map.get("routes").expect(
+            "ipv4.routes must be present (policy-a is the sole provider)",
+        );
+        assert_eq!(effective_routes, &routes, "ipv4.routes must come from policy-a");
+
+        // field_sources must use dotted paths
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.addresses").map(|p| p.as_str()),
+            Some("policy-b"),
+            "ipv4.addresses must be attributed to policy-b (priority 200)"
+        );
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.routes").map(|p| p.as_str()),
+            Some("policy-a"),
+            "ipv4.routes must be attributed to policy-a (sole provider)"
+        );
+
+        assert!(result.conflicts.is_empty(), "no conflicts should be reported");
+    }
+
+    /// Scenario 10 (ipv4 variant): lower priority ipv4 sub-fields are included
+    /// when not overridden by a higher-priority policy that only touches other fields.
+    #[test]
+    fn test_lower_priority_ipv4_subfields_included_when_not_overridden() {
+        let routes = Value::List(vec![Value::String("0.0.0.0/0 via 10.0.1.1".to_string())]);
+
+        // base (priority 50): mtu=1500, ipv4={addresses: [...], routes: [...]}
+        let base = make_input(
+            "base",
+            50,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![
+                    ("mtu", Value::U64(1500)),
+                    (
+                        "ipv4",
+                        make_map_value(vec![
+                            (
+                                "addresses",
+                                Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
+                            ),
+                            ("routes", routes.clone()),
+                        ]),
+                    ),
+                ],
+            )],
+        );
+
+        // overlay (priority 100): mtu=9000 only — does not touch ipv4
+        let overlay = make_input(
+            "overlay",
+            100,
+            vec![make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))])],
+        );
+
+        let result = merge(vec![base, overlay]);
+
+        let eth0 = result
+            .effective_state
+            .get("ethernet", "eth0")
+            .expect("ethernet/eth0 should be in effective state");
+
+        // mtu overridden by overlay
+        assert_eq!(eth0.fields["mtu"].value, Value::U64(9000), "mtu overridden by overlay");
+
+        // ipv4 sub-object comes from base (sole provider)
+        let ipv4_map = eth0.fields["ipv4"].value.as_map().expect("ipv4 must be a map");
+        let addr_strs: Vec<String> = ipv4_map["addresses"]
+            .as_list()
+            .expect("addresses must be a list")
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            addr_strs.iter().any(|s| s.contains("10.0.1.50")),
+            "ipv4.addresses must come from base (sole provider)"
+        );
+        assert_eq!(&ipv4_map["routes"], &routes, "ipv4.routes must come from base (sole provider)");
+
+        // field_sources
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "mtu").map(|p| p.as_str()),
+            Some("overlay"),
+            "mtu attributed to overlay"
+        );
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.addresses").map(|p| p.as_str()),
+            Some("base"),
+            "ipv4.addresses attributed to base"
+        );
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.routes").map(|p| p.as_str()),
+            Some("base"),
+            "ipv4.routes attributed to base"
+        );
+    }
+
+    /// Verify that when two policies provide different values for the same ipv4 sub-field
+    /// at the same priority, a conflict is reported for the dotted path (e.g. "ipv4.addresses").
+    #[test]
+    fn test_ipv4_subfield_conflict_reported_with_dotted_field_name() {
+        let policy_a = make_input(
+            "policy-a",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+        let policy_b = make_input(
+            "policy-b",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("10.0.2.50/24".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+
+        let result = merge(vec![policy_a, policy_b]);
+
+        assert_eq!(
+            result.conflicts.len(),
+            1,
+            "one conflict expected for ipv4.addresses"
+        );
+        let conflict = &result.conflicts.conflicts[0];
+        assert_eq!(
+            conflict.field_name, "ipv4.addresses",
+            "conflict field_name must use the dotted path 'ipv4.addresses', got '{}'",
+            conflict.field_name
+        );
+        assert_eq!(
+            conflict.entity_key,
+            ("ethernet".to_string(), "eth0".to_string())
+        );
+    }
+
+    /// Verify that ipv6 sub-object fields also receive per-sub-field merge,
+    /// consistent with the PROTOCOL_SUB_OBJECTS list.
+    #[test]
+    fn test_ipv6_subobject_per_subfield_merge() {
+        let policy_a = make_input(
+            "policy-a",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv6",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("2001:db8::1/64".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+        let policy_b = make_input(
+            "policy-b",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv6",
+                    make_map_value(vec![(
+                        "autoconf",
+                        Value::Bool(true),
+                    )]),
+                )],
+            )],
+        );
+
+        let result = merge(vec![policy_a, policy_b]);
+
+        // Both sub-fields should appear — different keys, no conflict
+        assert!(result.conflicts.is_empty(), "no conflicts expected");
+        let eth0 =
+            result.effective_state.get("ethernet", "eth0").expect("eth0 must be in effective state");
+        let ipv6_map = eth0.fields["ipv6"].value.as_map().expect("ipv6 must be a map");
+        assert!(ipv6_map.contains_key("addresses"), "ipv6.addresses must be present");
+        assert!(ipv6_map.contains_key("autoconf"), "ipv6.autoconf must be present");
+
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv6.addresses").map(|p| p.as_str()),
+            Some("policy-a"),
+        );
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv6.autoconf").map(|p| p.as_str()),
+            Some("policy-b"),
+        );
     }
 }
