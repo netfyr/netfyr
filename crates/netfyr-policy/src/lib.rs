@@ -29,7 +29,7 @@ use walkdir::WalkDir;
 
 /// The type of factory that produces state for a policy.
 ///
-/// Serializes to/from lowercase strings in YAML (`"static"`, `"dhcpv4"`).
+/// Serializes to/from lowercase strings in YAML (`"static"`, `"dhcpv4"`, `"ipv6auto"`).
 #[derive(Clone, Debug, PartialEq, Serialize, DeserializeDerive)]
 #[serde(rename_all = "lowercase")]
 pub enum FactoryType {
@@ -37,6 +37,8 @@ pub enum FactoryType {
     Static,
     /// Produces state by acquiring a DHCPv4 lease at runtime (daemon-side).
     Dhcpv4,
+    /// Produces state via IPv6 autoconfiguration: SLAAC + conditional DHCPv6 (daemon-side).
+    Ipv6Auto,
 }
 
 // ── Policy ────────────────────────────────────────────────────────────────────
@@ -834,6 +836,60 @@ selector:
 ";
 
     // ── Feature: Policy type definitions — FactoryType serialization ──────────
+
+    #[test]
+    fn test_factory_type_ipv6auto_serializes_to_lowercase() {
+        let yaml = serde_yaml::to_string(&FactoryType::Ipv6Auto).unwrap();
+        assert_eq!(yaml.trim(), "ipv6auto");
+    }
+
+    #[test]
+    fn test_factory_type_ipv6auto_deserializes_from_lowercase() {
+        let ft: FactoryType = serde_yaml::from_str("ipv6auto").unwrap();
+        assert_eq!(ft, FactoryType::Ipv6Auto);
+    }
+
+    #[test]
+    fn test_parse_ipv6auto_policy() {
+        let yaml = "\
+kind: policy
+name: eth0-ipv6auto
+factory: ipv6auto
+priority: 100
+selector:
+  name: eth0
+";
+        let policies = parse_policy_yaml(yaml).unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].factory_type, FactoryType::Ipv6Auto);
+        assert_eq!(policies[0].name, "eth0-ipv6auto");
+        assert!(policies[0].state.is_none());
+        assert!(policies[0].states.is_none());
+        let sel = policies[0].selector.as_ref().expect("selector should be Some");
+        assert_eq!(sel.name, Some("eth0".to_string()));
+    }
+
+    #[test]
+    fn test_produce_all_static_skips_ipv6auto_policies() {
+        let mut set = PolicySet::new();
+        set.insert(static_policy(
+            "eth0",
+            100,
+            make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))], 100),
+        ));
+        // Ipv6Auto policy — should be skipped by produce_all_static
+        set.insert(Policy {
+            name: "eth0-ipv6auto".to_string(),
+            factory_type: FactoryType::Ipv6Auto,
+            priority: 100,
+            state: None,
+            states: None,
+            selector: Some(Selector::with_name("eth0")),
+        });
+        let result = set.produce_all_static().unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result.get("ethernet", "eth0").is_some());
+    }
 
     #[test]
     fn test_factory_type_dhcpv4_serializes_to_dhcpv4_string() {

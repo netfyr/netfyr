@@ -694,7 +694,8 @@ async fn handle_get_show_info(
                             .unwrap_or(false);
                         via_state || via_states
                     }
-                    netfyr_policy::FactoryType::Dhcpv4 => policy
+                    netfyr_policy::FactoryType::Dhcpv4
+                    | netfyr_policy::FactoryType::Ipv6Auto => policy
                         .selector
                         .as_ref()
                         .map(|sel| sel.matches(interface_selector))
@@ -704,6 +705,7 @@ async fn handle_get_show_info(
                     let policy_type = match policy.factory_type {
                         netfyr_policy::FactoryType::Static => "static",
                         netfyr_policy::FactoryType::Dhcpv4 => "dhcpv4",
+                        netfyr_policy::FactoryType::Ipv6Auto => "ipv6auto",
                     };
                     Some(VarlinkPolicyInfo {
                         name: policy.name.clone(),

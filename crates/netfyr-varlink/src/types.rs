@@ -150,6 +150,7 @@ impl From<&Policy> for VarlinkPolicy {
         let factory = match policy.factory_type {
             FactoryType::Static => "static",
             FactoryType::Dhcpv4 => "dhcpv4",
+            FactoryType::Ipv6Auto => "ipv6auto",
         };
         VarlinkPolicy {
             name: policy.name.clone(),
@@ -171,6 +172,7 @@ impl TryFrom<VarlinkPolicy> for Policy {
         let factory_type = match vp.factory.as_str() {
             "static" => FactoryType::Static,
             "dhcpv4" => FactoryType::Dhcpv4,
+            "ipv6auto" => FactoryType::Ipv6Auto,
             other => return Err(format!("unknown factory type: '{other}'")),
         };
 
@@ -866,6 +868,27 @@ mod tests {
         let vp = VarlinkPolicy::from(&original);
         let restored = Policy::try_from(vp).expect("should convert DHCPv4 policy back");
         assert_eq!(restored.factory_type, FactoryType::Dhcpv4);
+        assert_eq!(
+            restored.selector.as_ref().and_then(|s| s.name.as_deref()),
+            Some("eth0")
+        );
+    }
+
+    /// Ipv6Auto policy roundtrip preserves factory type and selector name.
+    #[test]
+    fn test_varlink_policy_ipv6auto_roundtrip() {
+        let original = Policy {
+            name: "eth0-ipv6auto".to_string(),
+            factory_type: FactoryType::Ipv6Auto,
+            priority: 100,
+            state: None,
+            states: None,
+            selector: Some(Selector::with_name("eth0")),
+        };
+        let vp = VarlinkPolicy::from(&original);
+        assert_eq!(vp.factory, "ipv6auto", "Ipv6Auto must serialize as 'ipv6auto'");
+        let restored = Policy::try_from(vp).expect("Ipv6Auto roundtrip must succeed");
+        assert_eq!(restored.factory_type, FactoryType::Ipv6Auto);
         assert_eq!(
             restored.selector.as_ref().and_then(|s| s.name.as_deref()),
             Some("eth0")
