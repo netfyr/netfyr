@@ -25,6 +25,7 @@ use crate::report::{
 use crate::BackendError;
 
 use super::interface::query_interfaces;
+use super::query::{read_procfs_addr_gen_mode, read_procfs_dad_transmits};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -353,10 +354,13 @@ async fn apply_remove(
 
     let mut fields_changed: Vec<String> = vec![];
 
-    // Remove all addresses first.
+    // Remove all addresses first (link-local IPv6 fe80::/10 are preserved).
     match query_address_messages(handle, index).await {
         Ok(msgs) => {
             for msg in msgs {
+                if is_link_local_msg(&msg) {
+                    continue;
+                }
                 match handle.address().del(msg).execute().await {
                     Ok(()) => fields_changed.push("addresses".to_string()),
                     Err(ref e) if is_not_found_error(e) => {} // already gone
@@ -470,6 +474,56 @@ async fn apply_modify_fields(
     let mut failures: Vec<FailedOperation> = vec![];
     let mut skipped: Vec<SkippedOperation> = vec![];
 
+    // ── Phase 0: IPv6 procfs configuration ───────────────────────────────────
+    // Must run before Phase 1 (link up/down): the kernel generates the
+    // link-local address at interface UP time using the current addr_gen_mode.
+
+    if let Some(fv) = changed_fields.get("ipv6") {
+        if let Some(map) = fv.value.as_map() {
+            if let Some(link_local_val) = map.get("link_local") {
+                if let Some(mode_str) = link_local_val.as_str() {
+                    let current = read_procfs_addr_gen_mode(name);
+                    if current.as_deref() == Some(mode_str) {
+                        skipped.push(SkippedOperation {
+                            operation: DiffOpKind::Modify,
+                            entity_type: ETHERNET.to_string(),
+                            selector: Selector::with_name(name),
+                            reason: format!(
+                                "ipv6.link_local already at desired value ({mode_str})"
+                            ),
+                        });
+                    } else {
+                        match write_procfs_addr_gen_mode(name, mode_str) {
+                            Ok(()) => fields_changed.push("ipv6".to_string()),
+                            Err(e) => failures.push(make_field_failure(name, e, "ipv6")),
+                        }
+                    }
+                }
+            }
+
+            if let Some(dad_val) = map.get("dad_transmits") {
+                if let Some(desired) = dad_val.as_u64() {
+                    let current = read_procfs_dad_transmits(name);
+                    if current == Some(desired) {
+                        skipped.push(SkippedOperation {
+                            operation: DiffOpKind::Modify,
+                            entity_type: ETHERNET.to_string(),
+                            selector: Selector::with_name(name),
+                            reason: format!(
+                                "ipv6.dad_transmits already at desired value ({desired})"
+                            ),
+                        });
+                    } else {
+                        match write_procfs_dad_transmits(name, desired) {
+                            Ok(()) => fields_changed.push("ipv6".to_string()),
+                            Err(e) => failures.push(make_field_failure(name, e, "ipv6")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Phase 1: Link-level ───────────────────────────────────────────────────
 
     if let Some(fv) = changed_fields.get("mtu") {
@@ -551,32 +605,29 @@ async fn apply_modify_fields(
         }
     }
 
-    // ── Phase 2: Addresses ────────────────────────────────────────────────────
+    // ── Phase 2/3: Addresses and Routes ──────────────────────────────────────
+    //
+    // Flat format ("addresses", "routes" top-level keys): backward-compatible
+    // merged processing — handles both IPv4 and IPv6 in a single pass.
+    //
+    // Sub-object format ("ipv4", "ipv6" keys with nested addresses/routes):
+    // per-family processing in the spec-required order:
+    //   Phase 2a: IPv4 addresses → Phase 2b: IPv4 routes →
+    //   Phase 3a: IPv6 addresses → Phase 3b: IPv6 routes
 
-    let addr_in_changed = changed_fields.contains_key("addresses")
-        || changed_fields
-            .get("ipv4")
-            .and_then(|fv| fv.value.as_map())
-            .map(|m| m.contains_key("addresses"))
-            .unwrap_or(false)
-        || changed_fields
-            .get("ipv6")
-            .and_then(|fv| fv.value.as_map())
-            .map(|m| m.contains_key("addresses"))
-            .unwrap_or(false);
-    let addr_in_removed =
-        removed_fields.iter().any(|f| f == "addresses" || f == "ipv4" || f == "ipv6");
+    // ── Flat format: addresses ────────────────────────────────────────────────
 
-    if addr_in_changed || addr_in_removed {
-        // Full desired address list; empty when field is being removed.
-        // Keep original Value items so we can extract lifetimes when adding.
-        let desired_items: Vec<&Value> = if addr_in_changed {
+    let flat_addr_in_changed = changed_fields.contains_key("addresses");
+    let flat_addr_in_removed = removed_fields.iter().any(|f| f == "addresses");
+
+    if flat_addr_in_changed || flat_addr_in_removed {
+        let desired_items: Vec<&Value> = if flat_addr_in_changed {
             extract_desired_address_items(changed_fields)
         } else {
             vec![]
         };
-        let desired_addrs: Vec<String> = desired_items.iter().filter_map(|v| addr_to_cidr(v)).collect();
-
+        let desired_addrs: Vec<String> =
+            desired_items.iter().filter_map(|v| addr_to_cidr(v)).collect();
         let current_addrs: Vec<String> = extract_current_addresses(current_state);
 
         let to_add: Vec<(usize, &String)> = desired_addrs
@@ -598,9 +649,6 @@ async fn apply_modify_fields(
             })
             .collect();
 
-        // Remove unwanted addresses first, then add new ones in desired order.
-        // This ensures the kernel's address list order matches YAML order, and
-        // the first address in the policy becomes the primary (source) address.
         if !to_remove.is_empty() {
             match query_address_messages(handle, index).await {
                 Ok(msgs) => {
@@ -609,12 +657,7 @@ async fn apply_modify_fields(
                             Ok((ip, prefix)) => {
                                 match find_address_message(&msgs, ip, prefix) {
                                     Some(msg) => {
-                                        match handle
-                                            .address()
-                                            .del(msg.clone())
-                                            .execute()
-                                            .await
-                                        {
+                                        match handle.address().del(msg.clone()).execute().await {
                                             Ok(()) => {
                                                 fields_changed.push("addresses".to_string())
                                             }
@@ -656,19 +699,18 @@ async fn apply_modify_fields(
             }
         }
 
-        // Add new addresses in the order they appear in the desired state.
         for (idx, cidr) in &to_add {
             match parse_cidr(cidr) {
                 Ok((ip, prefix)) => {
                     let mut req = handle.address().add(index, ip, prefix);
                     if let Some(orig_value) = desired_items.get(*idx) {
-                        if let (Some(valid), Some(preferred)) = (addr_valid_lft(orig_value), addr_preferred_lft(orig_value)) {
+                        if let (Some(valid), Some(preferred)) =
+                            (addr_valid_lft(orig_value), addr_preferred_lft(orig_value))
+                        {
                             let mut ci = CacheInfo::default();
                             ci.ifa_preferred = preferred;
                             ci.ifa_valid = valid;
-                            req.message_mut().attributes.push(
-                                AddressAttribute::CacheInfo(ci),
-                            );
+                            req.message_mut().attributes.push(AddressAttribute::CacheInfo(ci));
                         }
                     }
                     match req.execute().await {
@@ -692,20 +734,18 @@ async fn apply_modify_fields(
             }
         }
 
-        // Replace existing addresses that carry lifetime attributes.
-        // Uses `ip addr replace` semantics to update CacheInfo in-place.
         for (idx, cidr) in &to_replace {
             match parse_cidr(cidr) {
                 Ok((ip, prefix)) => {
                     let mut req = handle.address().add(index, ip, prefix).replace();
                     if let Some(orig_value) = desired_items.get(*idx) {
-                        if let (Some(valid), Some(preferred)) = (addr_valid_lft(orig_value), addr_preferred_lft(orig_value)) {
+                        if let (Some(valid), Some(preferred)) =
+                            (addr_valid_lft(orig_value), addr_preferred_lft(orig_value))
+                        {
                             let mut ci = CacheInfo::default();
                             ci.ifa_preferred = preferred;
                             ci.ifa_valid = valid;
-                            req.message_mut().attributes.push(
-                                AddressAttribute::CacheInfo(ci),
-                            );
+                            req.message_mut().attributes.push(AddressAttribute::CacheInfo(ci));
                         }
                     }
                     match req.execute().await {
@@ -722,43 +762,27 @@ async fn apply_modify_fields(
         }
     }
 
-    // ── Phase 3: Routes ───────────────────────────────────────────────────────
+    // ── Flat format: routes ───────────────────────────────────────────────────
 
-    let route_in_changed = changed_fields.contains_key("routes")
-        || changed_fields
-            .get("ipv4")
-            .and_then(|fv| fv.value.as_map())
-            .map(|m| m.contains_key("routes"))
-            .unwrap_or(false)
-        || changed_fields
-            .get("ipv6")
-            .and_then(|fv| fv.value.as_map())
-            .map(|m| m.contains_key("routes"))
-            .unwrap_or(false);
-    let route_in_removed =
-        removed_fields.iter().any(|f| f == "routes" || f == "ipv4" || f == "ipv6");
+    let flat_route_in_changed = changed_fields.contains_key("routes");
+    let flat_route_in_removed = removed_fields.iter().any(|f| f == "routes");
 
-    if route_in_changed || route_in_removed {
-        // Full desired route list; empty when field is being removed.
-        let desired_routes: Vec<Value> = if route_in_changed {
+    if flat_route_in_changed || flat_route_in_removed {
+        let desired_routes: Vec<Value> = if flat_route_in_changed {
             extract_desired_routes(changed_fields)
         } else {
             vec![]
         };
-
         let current_routes: Vec<Value> = extract_current_routes(current_state);
 
-        let to_add: Vec<&Value> = desired_routes
-            .iter()
-            .filter(|r| !current_routes.contains(r))
-            .collect();
+        let to_add: Vec<&Value> =
+            desired_routes.iter().filter(|r| !current_routes.contains(r)).collect();
         let to_remove: Vec<&Value> = current_routes
             .iter()
             .filter(|r| !desired_routes.contains(r))
             .filter(|r| !is_kernel_route(r))
             .collect();
 
-        // Add new routes.
         for route_val in &to_add {
             if let Some(map) = route_val.as_map() {
                 match extract_route_fields(map) {
@@ -785,7 +809,6 @@ async fn apply_modify_fields(
             }
         }
 
-        // Remove unwanted routes.
         if !to_remove.is_empty() {
             match query_route_messages(handle, index).await {
                 Ok(route_msgs) => {
@@ -800,12 +823,7 @@ async fn apply_modify_fields(
                                         rf.gateway,
                                     ) {
                                         Some(msg) => {
-                                            match handle
-                                                .route()
-                                                .del(msg.clone())
-                                                .execute()
-                                                .await
-                                            {
+                                            match handle.route().del(msg.clone()).execute().await {
                                                 Ok(()) => {
                                                     fields_changed.push("routes".to_string())
                                                 }
@@ -835,6 +853,60 @@ async fn apply_modify_fields(
                 Err(e) => failures.push(make_field_failure(name, e, "routes")),
             }
         }
+    }
+
+    // ── Sub-object format: per-family ordering ────────────────────────────────
+
+    let subobj_ipv4_has_addresses = changed_fields
+        .get("ipv4")
+        .and_then(|fv| fv.value.as_map())
+        .map(|m| m.contains_key("addresses"))
+        .unwrap_or(false);
+    let subobj_ipv4_has_routes = changed_fields
+        .get("ipv4")
+        .and_then(|fv| fv.value.as_map())
+        .map(|m| m.contains_key("routes"))
+        .unwrap_or(false);
+    let subobj_ipv6_has_addresses = changed_fields
+        .get("ipv6")
+        .and_then(|fv| fv.value.as_map())
+        .map(|m| m.contains_key("addresses"))
+        .unwrap_or(false);
+    let subobj_ipv6_has_routes = changed_fields
+        .get("ipv6")
+        .and_then(|fv| fv.value.as_map())
+        .map(|m| m.contains_key("routes"))
+        .unwrap_or(false);
+    let removed_ipv4 = removed_fields.iter().any(|f| f == "ipv4");
+    let removed_ipv6 = removed_fields.iter().any(|f| f == "ipv6");
+
+    // Phase 2a: IPv4 addresses
+    if subobj_ipv4_has_addresses || removed_ipv4 {
+        apply_addresses_for_family(
+            handle, index, name, current_state, changed_fields, removed_fields,
+            "ipv4", &mut fields_changed, &mut failures, &mut skipped,
+        ).await;
+    }
+    // Phase 2b: IPv4 routes
+    if subobj_ipv4_has_routes || removed_ipv4 {
+        apply_routes_for_family(
+            handle, index, name, current_state, changed_fields, removed_fields,
+            "ipv4", &mut fields_changed, &mut failures, &mut skipped,
+        ).await;
+    }
+    // Phase 3a: IPv6 addresses
+    if subobj_ipv6_has_addresses || removed_ipv6 {
+        apply_addresses_for_family(
+            handle, index, name, current_state, changed_fields, removed_fields,
+            "ipv6", &mut fields_changed, &mut failures, &mut skipped,
+        ).await;
+    }
+    // Phase 3b: IPv6 routes
+    if subobj_ipv6_has_routes || removed_ipv6 {
+        apply_routes_for_family(
+            handle, index, name, current_state, changed_fields, removed_fields,
+            "ipv6", &mut fields_changed, &mut failures, &mut skipped,
+        ).await;
     }
 
     // ── Phase 4: Read-only field defensive check ──────────────────────────────
@@ -960,6 +1032,280 @@ async fn query_route_messages(
     }
 
     Ok(msgs)
+}
+
+// ── Per-family address / route helpers ───────────────────────────────────────
+
+/// Apply address changes for a single address family (`"ipv4"` or `"ipv6"`).
+///
+/// Extracts desired/current addresses for the family, then removes stale
+/// addresses, adds new ones in desired order, and replaces addresses that
+/// carry lifetime attributes.
+#[allow(clippy::too_many_arguments)]
+async fn apply_addresses_for_family(
+    handle: &Handle,
+    index: u32,
+    name: &str,
+    current_state: &State,
+    changed_fields: &IndexMap<String, FieldValue>,
+    removed_fields: &[String],
+    family: &str,
+    fields_changed: &mut Vec<String>,
+    failures: &mut Vec<FailedOperation>,
+    skipped: &mut Vec<SkippedOperation>,
+) {
+    let family_has_addresses = changed_fields
+        .get(family)
+        .and_then(|fv| fv.value.as_map())
+        .map(|m| m.contains_key("addresses"))
+        .unwrap_or(false);
+    let family_removed = removed_fields.iter().any(|f| f == family);
+
+    if !family_has_addresses && !family_removed {
+        return;
+    }
+
+    let desired_items: Vec<&Value> = if family_has_addresses {
+        extract_desired_address_items_for_family(changed_fields, family)
+    } else {
+        vec![]
+    };
+    let desired_addrs: Vec<String> =
+        desired_items.iter().filter_map(|v| addr_to_cidr(v)).collect();
+    let current_addrs: Vec<String> = extract_current_addresses_for_family(current_state, family);
+
+    let to_add: Vec<(usize, &String)> = desired_addrs
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !current_addrs.contains(a))
+        .collect();
+    let to_remove: Vec<&String> = current_addrs
+        .iter()
+        .filter(|a| !desired_addrs.contains(a))
+        .filter(|a| !is_link_local(a))
+        .collect();
+    let to_replace: Vec<(usize, &String)> = desired_addrs
+        .iter()
+        .enumerate()
+        .filter(|(idx, a)| {
+            current_addrs.contains(a)
+                && desired_items.get(*idx).and_then(|v| addr_valid_lft(v)).is_some()
+        })
+        .collect();
+
+    if !to_remove.is_empty() {
+        match query_address_messages(handle, index).await {
+            Ok(msgs) => {
+                for cidr in &to_remove {
+                    match parse_cidr(cidr) {
+                        Ok((ip, prefix)) => match find_address_message(&msgs, ip, prefix) {
+                            Some(msg) => {
+                                match handle.address().del(msg.clone()).execute().await {
+                                    Ok(()) => fields_changed.push(family.to_string()),
+                                    Err(ref e) if is_not_found_error(e) => {
+                                        skipped.push(SkippedOperation {
+                                            operation: DiffOpKind::Modify,
+                                            entity_type: ETHERNET.to_string(),
+                                            selector: Selector::with_name(name),
+                                            reason: format!("address {cidr} not present"),
+                                        });
+                                    }
+                                    Err(e) => failures.push(make_field_failure(
+                                        name,
+                                        map_netlink_error(
+                                            e,
+                                            &format!("del address {cidr} on {name}"),
+                                        ),
+                                        family,
+                                    )),
+                                }
+                            }
+                            None => {
+                                skipped.push(SkippedOperation {
+                                    operation: DiffOpKind::Modify,
+                                    entity_type: ETHERNET.to_string(),
+                                    selector: Selector::with_name(name),
+                                    reason: format!("address {cidr} not present"),
+                                });
+                            }
+                        },
+                        Err(e) => failures.push(make_field_failure(name, e, family)),
+                    }
+                }
+            }
+            Err(e) => failures.push(make_field_failure(name, e, family)),
+        }
+    }
+
+    for (idx, cidr) in &to_add {
+        match parse_cidr(cidr) {
+            Ok((ip, prefix)) => {
+                let mut req = handle.address().add(index, ip, prefix);
+                if let Some(orig_value) = desired_items.get(*idx) {
+                    if let (Some(valid), Some(preferred)) =
+                        (addr_valid_lft(orig_value), addr_preferred_lft(orig_value))
+                    {
+                        let mut ci = CacheInfo::default();
+                        ci.ifa_preferred = preferred;
+                        ci.ifa_valid = valid;
+                        req.message_mut().attributes.push(AddressAttribute::CacheInfo(ci));
+                    }
+                }
+                match req.execute().await {
+                    Ok(()) => fields_changed.push(family.to_string()),
+                    Err(ref e) if is_eexist(e) => {
+                        skipped.push(SkippedOperation {
+                            operation: DiffOpKind::Modify,
+                            entity_type: ETHERNET.to_string(),
+                            selector: Selector::with_name(name),
+                            reason: format!("address {cidr} already present"),
+                        });
+                    }
+                    Err(e) => failures.push(make_field_failure(
+                        name,
+                        map_netlink_error(e, &format!("add address {cidr} on {name}")),
+                        family,
+                    )),
+                }
+            }
+            Err(e) => failures.push(make_field_failure(name, e, family)),
+        }
+    }
+
+    for (idx, cidr) in &to_replace {
+        match parse_cidr(cidr) {
+            Ok((ip, prefix)) => {
+                let mut req = handle.address().add(index, ip, prefix).replace();
+                if let Some(orig_value) = desired_items.get(*idx) {
+                    if let (Some(valid), Some(preferred)) =
+                        (addr_valid_lft(orig_value), addr_preferred_lft(orig_value))
+                    {
+                        let mut ci = CacheInfo::default();
+                        ci.ifa_preferred = preferred;
+                        ci.ifa_valid = valid;
+                        req.message_mut().attributes.push(AddressAttribute::CacheInfo(ci));
+                    }
+                }
+                match req.execute().await {
+                    Ok(()) => fields_changed.push(family.to_string()),
+                    Err(e) => failures.push(make_field_failure(
+                        name,
+                        map_netlink_error(e, &format!("replace address {cidr} on {name}")),
+                        family,
+                    )),
+                }
+            }
+            Err(e) => failures.push(make_field_failure(name, e, family)),
+        }
+    }
+}
+
+/// Apply route changes for a single address family (`"ipv4"` or `"ipv6"`).
+#[allow(clippy::too_many_arguments)]
+async fn apply_routes_for_family(
+    handle: &Handle,
+    index: u32,
+    name: &str,
+    current_state: &State,
+    changed_fields: &IndexMap<String, FieldValue>,
+    removed_fields: &[String],
+    family: &str,
+    fields_changed: &mut Vec<String>,
+    failures: &mut Vec<FailedOperation>,
+    skipped: &mut Vec<SkippedOperation>,
+) {
+    let family_has_routes = changed_fields
+        .get(family)
+        .and_then(|fv| fv.value.as_map())
+        .map(|m| m.contains_key("routes"))
+        .unwrap_or(false);
+    let family_removed = removed_fields.iter().any(|f| f == family);
+
+    if !family_has_routes && !family_removed {
+        return;
+    }
+
+    let desired_routes: Vec<Value> = if family_has_routes {
+        extract_desired_routes_for_family(changed_fields, family)
+    } else {
+        vec![]
+    };
+    let current_routes: Vec<Value> = extract_current_routes_for_family(current_state, family);
+
+    let to_add: Vec<&Value> =
+        desired_routes.iter().filter(|r| !current_routes.contains(r)).collect();
+    let to_remove: Vec<&Value> = current_routes
+        .iter()
+        .filter(|r| !desired_routes.contains(r))
+        .filter(|r| !is_kernel_route(r))
+        .collect();
+
+    for route_val in &to_add {
+        if let Some(map) = route_val.as_map() {
+            match extract_route_fields(map) {
+                Ok(rf) => {
+                    let dst_ip = rf.dst_ip;
+                    let dst_prefix = rf.dst_prefix;
+                    match add_route(handle, index, &rf).await {
+                        Ok(()) => fields_changed.push(family.to_string()),
+                        Err(ref e) if is_eexist_backend(e) => {
+                            skipped.push(SkippedOperation {
+                                operation: DiffOpKind::Modify,
+                                entity_type: ETHERNET.to_string(),
+                                selector: Selector::with_name(name),
+                                reason: format!("route {dst_ip}/{dst_prefix} already present"),
+                            });
+                        }
+                        Err(e) => failures.push(make_field_failure(name, e, family)),
+                    }
+                }
+                Err(e) => failures.push(make_field_failure(name, e, family)),
+            }
+        }
+    }
+
+    if !to_remove.is_empty() {
+        match query_route_messages(handle, index).await {
+            Ok(route_msgs) => {
+                for route_val in &to_remove {
+                    if let Some(map) = route_val.as_map() {
+                        match extract_route_fields(map) {
+                            Ok(rf) => {
+                                match find_route_message(
+                                    &route_msgs,
+                                    rf.dst_ip,
+                                    rf.dst_prefix,
+                                    rf.gateway,
+                                ) {
+                                    Some(msg) => {
+                                        match handle.route().del(msg.clone()).execute().await {
+                                            Ok(()) => fields_changed.push(family.to_string()),
+                                            Err(ref e) if is_not_found_error(e) => {
+                                                fields_changed.push(family.to_string());
+                                            }
+                                            Err(e) => failures.push(make_field_failure(
+                                                name,
+                                                map_netlink_error(
+                                                    e,
+                                                    &format!("del route on {name}"),
+                                                ),
+                                                family,
+                                            )),
+                                        }
+                                    }
+                                    None => {
+                                        fields_changed.push(family.to_string());
+                                    }
+                                }
+                            }
+                            Err(e) => failures.push(make_field_failure(name, e, family)),
+                        }
+                    }
+                }
+            }
+            Err(e) => failures.push(make_field_failure(name, e, family)),
+        }
+    }
 }
 
 // ── Message matching helpers ──────────────────────────────────────────────────
@@ -1308,6 +1654,60 @@ fn extract_current_routes(state: &State) -> Vec<Value> {
     result
 }
 
+/// Extract desired address items for a single address family from the sub-object format.
+///
+/// Extracts from `changed_fields[family].addresses` where `family` is `"ipv4"` or `"ipv6"`.
+fn extract_desired_address_items_for_family<'a>(
+    changed_fields: &'a IndexMap<String, FieldValue>,
+    family: &str,
+) -> Vec<&'a Value> {
+    changed_fields
+        .get(family)
+        .and_then(|fv| fv.value.as_map())
+        .and_then(|m| m.get("addresses"))
+        .and_then(|v| v.as_list())
+        .map(|l| l.iter().collect())
+        .unwrap_or_default()
+}
+
+/// Extract current addresses for a single address family from the state sub-object.
+fn extract_current_addresses_for_family(state: &State, family: &str) -> Vec<String> {
+    state
+        .fields
+        .get(family)
+        .and_then(|fv| fv.value.as_map())
+        .and_then(|m| m.get("addresses"))
+        .and_then(|v| v.as_list())
+        .map(|l| l.iter().filter_map(addr_to_cidr).collect())
+        .unwrap_or_default()
+}
+
+/// Extract desired routes for a single address family from the sub-object format.
+fn extract_desired_routes_for_family(
+    changed_fields: &IndexMap<String, FieldValue>,
+    family: &str,
+) -> Vec<Value> {
+    changed_fields
+        .get(family)
+        .and_then(|fv| fv.value.as_map())
+        .and_then(|m| m.get("routes"))
+        .and_then(|v| v.as_list())
+        .map(|l| l.to_vec())
+        .unwrap_or_default()
+}
+
+/// Extract current routes for a single address family from the state sub-object.
+fn extract_current_routes_for_family(state: &State, family: &str) -> Vec<Value> {
+    state
+        .fields
+        .get(family)
+        .and_then(|fv| fv.value.as_map())
+        .and_then(|m| m.get("routes"))
+        .and_then(|v| v.as_list())
+        .map(|l| l.to_vec())
+        .unwrap_or_default()
+}
+
 fn is_link_local(cidr: &str) -> bool {
     cidr.split_once('/')
         .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
@@ -1325,6 +1725,66 @@ fn is_kernel_route(route_val: &Value) -> bool {
         .and_then(|v| v.as_str())
         .map(|s| s == "kernel")
         .unwrap_or(false)
+}
+
+// ── Procfs write helpers ──────────────────────────────────────────────────────
+
+/// Write the IPv6 address generation mode to procfs.
+///
+/// Maps `"eui64"` → `"0"` and `"none"` → `"1"` (kernel values).
+/// Must be called before the interface is brought UP so the kernel generates
+/// the link-local address with the correct mode.
+fn write_procfs_addr_gen_mode(name: &str, mode: &str) -> Result<(), BackendError> {
+    let value = match mode {
+        "eui64" => "0",
+        "none" => "1",
+        other => {
+            return Err(BackendError::Internal(format!(
+                "unknown addr_gen_mode value: {other}"
+            )));
+        }
+    };
+    let path = format!("/proc/sys/net/ipv6/conf/{name}/addr_gen_mode");
+    std::fs::write(&path, value).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            BackendError::PermissionDenied(format!(
+                "write addr_gen_mode for {name}: permission denied"
+            ))
+        } else {
+            BackendError::ApplyFailed {
+                operation: format!("write addr_gen_mode for {name}"),
+                source: Box::new(e),
+            }
+        }
+    })
+}
+
+/// Write the IPv6 DAD transmit count to procfs.
+fn write_procfs_dad_transmits(name: &str, value: u64) -> Result<(), BackendError> {
+    let path = format!("/proc/sys/net/ipv6/conf/{name}/dad_transmits");
+    std::fs::write(&path, value.to_string()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            BackendError::PermissionDenied(format!(
+                "write dad_transmits for {name}: permission denied"
+            ))
+        } else {
+            BackendError::ApplyFailed {
+                operation: format!("write dad_transmits for {name}"),
+                source: Box::new(e),
+            }
+        }
+    })
+}
+
+/// Returns `true` if `msg` contains an IPv6 link-local address (fe80::/10).
+fn is_link_local_msg(msg: &AddressMessage) -> bool {
+    msg.attributes.iter().any(|attr| {
+        if let AddressAttribute::Address(IpAddr::V6(v6)) = attr {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+        } else {
+            false
+        }
+    })
 }
 
 struct RouteFields {
