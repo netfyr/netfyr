@@ -2030,6 +2030,215 @@ mod tests {
         );
     }
 
+    /// Scenario 12 (full): conflict within ipv4 sub-object.
+    /// - ipv4.addresses conflicts → excluded from effective state.
+    /// - ipv4.routes has only one provider → included in effective state.
+    /// - Only 1 conflict is reported (the dotted path "ipv4.addresses").
+    #[test]
+    fn test_ipv4_subobject_conflict_excludes_conflicted_field_preserves_uncontested() {
+        // "static": ipv4={addresses: ["10.0.1.50/24"], routes: [{destination: "0.0.0.0/0", ...}]}
+        let routes = Value::List(vec![Value::String("0.0.0.0/0 via 10.0.1.1".to_string())]);
+        let static_policy = make_input(
+            "static",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![
+                        (
+                            "addresses",
+                            Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
+                        ),
+                        ("routes", routes.clone()),
+                    ]),
+                )],
+            )],
+        );
+        // "other": ipv4={addresses: ["10.0.2.50/24"]}
+        let other_policy = make_input(
+            "other",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("10.0.2.50/24".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+
+        let result = merge(vec![static_policy, other_policy]);
+
+        // Exactly one conflict: ipv4.addresses
+        assert_eq!(result.conflicts.len(), 1, "exactly one conflict expected (ipv4.addresses)");
+        let conflict = &result.conflicts.conflicts[0];
+        assert_eq!(
+            conflict.field_name, "ipv4.addresses",
+            "conflict must use dotted path 'ipv4.addresses'"
+        );
+        assert_eq!(conflict.priority, 100);
+        assert_eq!(conflict.entity_key, ("ethernet".to_string(), "eth0".to_string()));
+
+        // Effective state: ipv4 map present but addresses absent, routes present.
+        let eth0 =
+            result.effective_state.get("ethernet", "eth0").expect("eth0 must be in effective state");
+        let ipv4_map = eth0.fields.get("ipv4").expect("ipv4 must be present in effective state");
+        let ipv4_inner = ipv4_map.value.as_map().expect("ipv4 must be a Map");
+
+        assert!(
+            !ipv4_inner.contains_key("addresses"),
+            "conflicted ipv4.addresses must be excluded from effective state"
+        );
+        assert!(
+            ipv4_inner.contains_key("routes"),
+            "uncontested ipv4.routes must be included in effective state"
+        );
+        assert_eq!(
+            &ipv4_inner["routes"], &routes,
+            "ipv4.routes must come from the 'static' policy"
+        );
+
+        // field_sources: routes attributed to "static", addresses absent.
+        assert_eq!(
+            get_source(&result, "ethernet", "eth0", "ipv4.routes").map(|p| p.as_str()),
+            Some("static"),
+            "ipv4.routes must be attributed to 'static'"
+        );
+        assert!(
+            get_source(&result, "ethernet", "eth0", "ipv4.addresses").is_none(),
+            "conflicted ipv4.addresses must not appear in field_sources"
+        );
+    }
+
+    /// Scenario 7 (ipv4 sub-object variant): same list values in different order
+    /// within an ipv4 sub-object must NOT produce a conflict.
+    #[test]
+    fn test_ipv4_subobject_list_same_values_different_order_not_a_conflict() {
+        let a = make_input(
+            "a",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![
+                            Value::String("10.0.1.50/24".to_string()),
+                            Value::String("10.0.1.51/24".to_string()),
+                        ]),
+                    )]),
+                )],
+            )],
+        );
+        let b = make_input(
+            "b",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![
+                            Value::String("10.0.1.51/24".to_string()),
+                            Value::String("10.0.1.50/24".to_string()),
+                        ]),
+                    )]),
+                )],
+            )],
+        );
+
+        let result = merge(vec![a, b]);
+
+        assert!(
+            result.conflicts.is_empty(),
+            "same ipv4.addresses in different order must not produce a conflict"
+        );
+        let eth0 =
+            result.effective_state.get("ethernet", "eth0").expect("eth0 must be in effective state");
+        let ipv4_map = eth0.fields["ipv4"].value.as_map().expect("ipv4 must be a map");
+        let addresses =
+            ipv4_map["addresses"].as_list().expect("ipv4.addresses must be a list");
+        let addr_strs: Vec<&str> = addresses.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            addr_strs.contains(&"10.0.1.50/24"),
+            "effective ipv4.addresses must contain 10.0.1.50/24"
+        );
+        assert!(
+            addr_strs.contains(&"10.0.1.51/24"),
+            "effective ipv4.addresses must contain 10.0.1.51/24"
+        );
+    }
+
+    /// Scenario 8 (ipv4 sub-object variant): genuinely different ipv4.addresses
+    /// values produce a conflict and exclude ipv4.addresses from the effective state.
+    #[test]
+    fn test_ipv4_subobject_list_different_values_conflict_excludes_from_effective_state() {
+        let a = make_input(
+            "a",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("10.0.1.50/24".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+        let b = make_input(
+            "b",
+            100,
+            vec![make_state(
+                "ethernet",
+                "eth0",
+                vec![(
+                    "ipv4",
+                    make_map_value(vec![(
+                        "addresses",
+                        Value::List(vec![Value::String("10.0.2.50/24".to_string())]),
+                    )]),
+                )],
+            )],
+        );
+
+        let result = merge(vec![a, b]);
+
+        assert_eq!(result.conflicts.len(), 1, "one conflict expected for ipv4.addresses");
+        assert_eq!(
+            result.conflicts.conflicts[0].field_name, "ipv4.addresses",
+            "conflict must use dotted path 'ipv4.addresses'"
+        );
+
+        // If ipv4 map is present, ipv4.addresses must be absent.
+        if let Some(eth0) = result.effective_state.get("ethernet", "eth0") {
+            if let Some(ipv4_fv) = eth0.fields.get("ipv4") {
+                if let Some(ipv4_map) = ipv4_fv.value.as_map() {
+                    assert!(
+                        !ipv4_map.contains_key("addresses"),
+                        "conflicted ipv4.addresses must be excluded from effective state"
+                    );
+                }
+            }
+        }
+        assert!(
+            get_source(&result, "ethernet", "eth0", "ipv4.addresses").is_none(),
+            "conflicted ipv4.addresses must not appear in field_sources"
+        );
+    }
+
     /// Verify that ipv6 sub-object fields also receive per-sub-field merge,
     /// consistent with the PROTOCOL_SUB_OBJECTS list.
     #[test]
