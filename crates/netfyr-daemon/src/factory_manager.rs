@@ -215,15 +215,32 @@ impl FactoryManager {
                     .as_ref()
                     .is_some_and(|s| s.fields.contains_key("addresses"));
                 // Extract the bare IP (without /prefix) from the "addresses" field.
+                // Each address entry is a Value::Map with "address", "valid_lft",
+                // "preferred_lft" keys; Value::IpNetwork::Display yields "ip/prefix".
                 let lease_ip = current.as_ref().and_then(|s| {
-                    let addr_list = s.fields.get("addresses")?.value.as_list()?.first()?.as_str()?;
+                    let addr_val = s
+                        .fields
+                        .get("addresses")?
+                        .value
+                        .as_list()?
+                        .first()?
+                        .as_map()?
+                        .get("address")?;
+                    let addr_str = addr_val.to_string();
                     // "10.0.1.50/24" → "10.0.1.50"
-                    Some(addr_list.split('/').next().unwrap_or(addr_list).to_string())
+                    Some(addr_str.split('/').next().unwrap_or(&addr_str).to_string())
                 });
                 // Extract full CIDR address from the "addresses" field.
                 let lease_address = current.and_then(|s| {
-                    let addr_str = s.fields.get("addresses")?.value.as_list()?.first()?.as_str()?;
-                    Some(addr_str.to_string())
+                    let addr_val = s
+                        .fields
+                        .get("addresses")?
+                        .value
+                        .as_list()?
+                        .first()?
+                        .as_map()?
+                        .get("address")?;
+                    Some(addr_val.to_string())
                 });
                 // Read lease timing and compute remaining seconds.
                 let timing: Option<LeaseTimingInfo> = factory.lease_timing();
