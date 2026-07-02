@@ -1034,6 +1034,88 @@ mod tests {
         );
     }
 
+    /// Scenario: String values that look like IPv6 addresses are parsed as IpAddr
+    /// Using the spec's exact example value "2001:db8::1"
+    #[test]
+    fn test_deserialize_value_ipv6_addr_spec_example_2001_db8() {
+        let yaml_val = serde_yaml::Value::String("2001:db8::1".to_string());
+        let result = deserialize_value(&yaml_val).unwrap();
+        let expected: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(result, Value::IpAddr(expected), "2001:db8::1 should be parsed as IpAddr");
+    }
+
+    /// Scenario: String values that look like IPv6 CIDR are parsed as IpNetwork
+    /// Using the spec's exact example value "2001:db8::/32"
+    #[test]
+    fn test_deserialize_value_ipv6_cidr_spec_example_2001_db8_32() {
+        let yaml_val = serde_yaml::Value::String("2001:db8::/32".to_string());
+        let result = deserialize_value(&yaml_val).unwrap();
+        let expected: IpNetwork = "2001:db8::/32".parse().unwrap();
+        assert_eq!(result, Value::IpNetwork(expected), "2001:db8::/32 should be parsed as IpNetwork");
+    }
+
+    /// Scenario: Serialize State to flat query output format with mtu=1500 AND ipv4 sub-object
+    /// This matches the exact spec scenario: entity_type "ethernet", selector name "eth0",
+    /// field mtu=1500, and ipv4={addresses: ["10.0.1.50/24"]}
+    #[test]
+    fn test_serialize_state_with_mtu_and_ipv4_sub_object_matches_spec_scenario() {
+        let net: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        let mut ipv4_map = IndexMap::new();
+        ipv4_map.insert("addresses".to_string(), Value::List(vec![Value::IpNetwork(net)]));
+
+        let mut fields = IndexMap::new();
+        fields.insert("mtu".to_string(), make_fv(Value::U64(1500)));
+        fields.insert("ipv4".to_string(), make_fv(Value::Map(ipv4_map)));
+
+        let state = State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields,
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 100,
+        };
+
+        let yaml = state_to_yaml(&state).unwrap();
+
+        assert!(yaml.contains("type: ethernet"), "output must contain 'type: ethernet' from entity_type");
+        assert!(yaml.contains("name: eth0"), "output must contain 'name: eth0' at the top level");
+        assert!(yaml.contains("mtu: 1500"), "output must contain 'mtu: 1500' at the top level");
+        assert!(yaml.contains("ipv4:"), "output must contain 'ipv4:' as a sub-object");
+        assert!(yaml.contains("addresses:"), "output must contain 'addresses:'");
+        assert!(!yaml.contains("kind:"), "bare output must not contain 'kind:'");
+        assert!(!yaml.contains("selector:"), "output must not contain 'selector:' sub-mapping");
+        assert!(!yaml.contains("fields:"), "output must not contain 'fields:' sub-mapping");
+
+        // Verify ipv4 is a structured sub-object by parsing the YAML output
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let map = parsed.as_mapping().expect("output should be a YAML mapping");
+
+        // mtu must be at top level
+        let mtu_key = serde_yaml::Value::String("mtu".to_string());
+        assert_eq!(
+            map.get(&mtu_key),
+            Some(&serde_yaml::Value::Number(serde_yaml::Number::from(1500u64))),
+            "mtu must be at top level in the YAML mapping"
+        );
+
+        // ipv4 must be a sub-mapping
+        let ipv4_key = serde_yaml::Value::String("ipv4".to_string());
+        let ipv4_val = map.get(&ipv4_key).expect("ipv4 must be present in output");
+        assert!(ipv4_val.as_mapping().is_some(), "ipv4 must be a YAML mapping");
+
+        // addresses must be nested under ipv4
+        let addrs_key = serde_yaml::Value::String("addresses".to_string());
+        let addrs = ipv4_val.as_mapping().unwrap().get(&addrs_key).expect("addresses must be under ipv4");
+        let seq = addrs.as_sequence().expect("addresses must be a YAML sequence");
+        assert_eq!(seq.len(), 1, "addresses must have exactly one element");
+        assert_eq!(
+            seq[0],
+            serde_yaml::Value::String("10.0.1.50/24".to_string()),
+            "the address must serialize to '10.0.1.50/24'"
+        );
+    }
+
     /// Scenario: A `Value::IpAddr` field survives a YAML round-trip correctly.
     #[test]
     fn test_round_trip_yaml_ip_addr_round_trips_correctly() {
@@ -1464,5 +1546,93 @@ mod tests {
             Some("0000:03:00.0".to_string())
         );
         assert!(!states[0].fields.contains_key("pci_path"));
+    }
+
+    /// Scenario: Parse bare state with ipv4/ipv6 as nested sub-objects
+    /// fields["ipv4"] is Value::Map containing "addresses" as Value::List with IpNetwork values
+    #[test]
+    fn test_parse_yaml_selector_submapping_ipv4_ipv6_sub_objects() {
+        let yaml = "selector:\n  name: eth0\nmtu: 1500\nipv4:\n  addresses:\n    - 10.0.1.50/24\nipv6:\n  addresses:\n    - 2001:db8::50/64\n";
+        let states = parse_yaml(yaml).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].entity_type, "");
+        assert_eq!(states[0].selector.name, Some("eth0".to_string()));
+        assert_eq!(states[0].fields["mtu"].value, Value::U64(1500));
+
+        let ipv4 = states[0].fields["ipv4"].value.as_map().expect("ipv4 should be Value::Map");
+        let ipv4_addrs = ipv4["addresses"].as_list().expect("ipv4.addresses should be Value::List");
+        assert_eq!(ipv4_addrs.len(), 1);
+        let expected_v4: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        assert_eq!(ipv4_addrs[0], Value::IpNetwork(expected_v4));
+
+        let ipv6 = states[0].fields["ipv6"].value.as_map().expect("ipv6 should be Value::Map");
+        let ipv6_addrs = ipv6["addresses"].as_list().expect("ipv6.addresses should be Value::List");
+        assert_eq!(ipv6_addrs.len(), 1);
+        let expected_v6: IpNetwork = "2001:db8::50/64".parse().unwrap();
+        assert_eq!(ipv6_addrs[0], Value::IpNetwork(expected_v6));
+    }
+
+    /// Scenario: Parse route objects within ipv4 sub-object
+    /// fields["ipv4"] is Value::Map, containing "routes" as Value::List,
+    /// first route is a Value::Map with correctly-typed destination/gateway/metric
+    #[test]
+    fn test_parse_yaml_selector_submapping_routes_inside_ipv4_sub_object() {
+        let yaml = "selector:\n  name: eth0\nipv4:\n  routes:\n    - destination: 0.0.0.0/0\n      gateway: 10.0.1.1\n      metric: 100\n";
+        let states = parse_yaml(yaml).unwrap();
+
+        let ipv4 = states[0].fields["ipv4"].value.as_map().expect("ipv4 should be Value::Map");
+        let routes = ipv4["routes"].as_list().expect("ipv4.routes should be Value::List");
+        assert_eq!(routes.len(), 1);
+
+        let route_map = routes[0].as_map().expect("route element should be Value::Map");
+        assert!(route_map.contains_key("destination"));
+        assert!(route_map.contains_key("gateway"));
+        assert!(route_map.contains_key("metric"));
+
+        let expected_dst: IpNetwork = "0.0.0.0/0".parse().unwrap();
+        assert_eq!(route_map["destination"], Value::IpNetwork(expected_dst));
+        let expected_gw: IpAddr = "10.0.1.1".parse().unwrap();
+        assert_eq!(route_map["gateway"], Value::IpAddr(expected_gw));
+        assert_eq!(route_map["metric"], Value::U64(100));
+    }
+
+    /// Scenario: Link-local IPv6 CIDR "fe80::1/64" is parsed as IpNetwork (not String)
+    #[test]
+    fn test_deserialize_link_local_ipv6_network() {
+        let yaml_val = serde_yaml::Value::String("fe80::1/64".to_string());
+        let result = deserialize_value(&yaml_val).unwrap();
+        let expected: IpNetwork = "fe80::1/64".parse().unwrap();
+        assert_eq!(result, Value::IpNetwork(expected));
+    }
+
+    /// Scenario: Serialize State with nested ipv4 Map field to flat query output format
+    /// Output has type/name at top level, ipv4 as sub-object, no kind/selector keys
+    #[test]
+    fn test_serialize_state_with_ipv4_sub_object() {
+        let mut fields = IndexMap::new();
+        let mut ipv4_map = indexmap::IndexMap::new();
+        let net: IpNetwork = "10.0.1.50/24".parse().unwrap();
+        ipv4_map.insert("addresses".to_string(), Value::List(vec![Value::IpNetwork(net)]));
+        fields.insert("ipv4".to_string(), make_fv(Value::Map(ipv4_map)));
+
+        let state = State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields,
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 100,
+        };
+
+        let yaml = state_to_yaml(&state).unwrap();
+
+        assert!(yaml.contains("type: ethernet"), "output should contain 'type: ethernet'");
+        assert!(yaml.contains("name: eth0"), "output should contain 'name: eth0'");
+        assert!(yaml.contains("ipv4:"), "output should contain 'ipv4:' sub-object");
+        assert!(yaml.contains("addresses:"), "output should contain 'addresses:'");
+        assert!(yaml.contains("10.0.1.50/24"), "output should contain the network address");
+        assert!(!yaml.contains("kind:"), "output should not contain 'kind:'");
+        assert!(!yaml.contains("selector:"), "output should not contain 'selector:'");
+        assert!(!yaml.contains("fields:"), "output should not contain 'fields:'");
     }
 }

@@ -174,8 +174,8 @@ mod tests {
     #[test]
     fn test_load_dir_error_on_duplicate_entity_keys() {
         let dir = temp_dir("dup_key");
-        fs::write(dir.join("file1.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
-        fs::write(dir.join("file2.yaml"), "type: ethernet\nname: eth0\nmtu: 9000\n").unwrap();
+        fs::write(dir.join("file1.yaml"), "selector:\n  name: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.join("file2.yaml"), "selector:\n  name: eth0\nmtu: 9000\n").unwrap();
 
         let result = load_dir(&dir);
         let _ = fs::remove_dir_all(&dir);
