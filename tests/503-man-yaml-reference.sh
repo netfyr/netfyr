@@ -114,25 +114,30 @@ for field in name driver pci_path mac; do
     fi
 done
 
-# Scenario: All ethernet fields are documented (mtu, addresses, routes, state).
+# Scenario: All ethernet fields are documented (mtu, enabled, ipv4, ipv6).
 if ! grep -q '^\.SH FIELDS' "$MAN_FILE"; then
     fail "FIELDS section is missing"
 fi
 
 fields_section=$(sed -n '/^\.SH FIELDS/,/^\.SH/p' "$MAN_FILE")
 
-for field in mtu addresses routes state; do
+for field in mtu enabled ipv4 ipv6; do
     if ! echo "$fields_section" | grep -q "\\b${field}\\b"; then
         fail "FIELDS section does not document '${field}'"
     fi
 done
 
 # Scenario: Factory types documented (checked via POLICY FORMAT).
-for factory in static dhcpv4; do
+for factory in static dhcpv4 ipv6auto; do
     if ! echo "$policy_section" | grep -q "\\b${factory}\\b"; then
         fail "POLICY FORMAT does not document factory type '${factory}'"
     fi
 done
+
+# Scenario: ipv6auto factory documents SLAAC and DHCPv6.
+if ! echo "$policy_section" | grep -qi "slaac\|router advertisement\|dhcpv6"; then
+    fail "POLICY FORMAT does not document SLAAC or DHCPv6 for ipv6auto factory"
+fi
 
 # Scenario: VALUE TYPES section shows the YAML-to-netfyr type mapping.
 if ! grep -q 'SH.*VALUE TYPES' "$MAN_FILE"; then

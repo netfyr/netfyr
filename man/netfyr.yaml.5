@@ -55,9 +55,9 @@ See
 below.
 For ethernet:
 .BR mtu ,
-.BR addresses ,
-.BR routes ,
-.BR state .
+.BR enabled ,
+.BR ipv4 ,
+.BR ipv6 .
 .PP
 Example:
 .RS 4
@@ -65,8 +65,9 @@ Example:
 selector:
   name: eth0
 mtu: 1500
-addresses:
-  - 10.0.1.50/24
+ipv4:
+  addresses:
+    \- 10.0.1.50/24
 .fi
 .RE
 .SH "POLICY FORMAT"
@@ -91,7 +92,8 @@ Used in conflict reports and provenance tracking.
 Factory type.
 One of:
 .BR static ,
-.BR dhcpv4 .
+.BR dhcpv4 ,
+.BR ipv6auto .
 .RS
 .TP
 .B static
@@ -104,6 +106,15 @@ fields defined in this policy.
 .B dhcpv4
 Acquires an address via DHCPv4 for the interface identified by
 .BR selector .
+Requires the netfyr daemon to be running.
+.TP
+.B ipv6auto
+Enables full IPv6 autoconfiguration for the interface identified by
+.BR selector .
+Always runs SLAAC (processing Router Advertisements for prefixes, DNS,
+and routes), and conditionally starts DHCPv6 based on the M/O flags in
+RAs.
+The router decides whether DHCPv6 is needed, not the user.
 Requires the netfyr daemon to be running.
 .RE
 .TP
@@ -123,8 +134,8 @@ Contains selector properties (see
 (mapping, optional)
 Configuration fields for the target entity (e.g.,
 .BR mtu ,
-.BR addresses ,
-.BR routes ).
+.BR ipv4 ,
+.BR ipv6 ).
 Does not contain selector fields.
 Mutually exclusive with
 .BR states .
@@ -152,8 +163,12 @@ selector:
   name: eth0
 state:
   mtu: 9000
-  addresses:
-    - 10.0.1.50/24
+  ipv4:
+    addresses:
+      \- 10.0.1.50/24
+  ipv6:
+    addresses:
+      \- 2001:db8::50/64
 .fi
 .RE
 .PP
@@ -167,9 +182,10 @@ priority: 150
 selector:
   name: eth0
 states:
-  - mtu: 9000
-    addresses:
-      - 10.0.1.50/24
+  \- mtu: 9000
+    ipv4:
+      addresses:
+        \- 10.0.1.50/24
 .fi
 .RE
 .PP
@@ -179,6 +195,17 @@ Example (dhcpv4):
 kind: policy
 name: eth0\-dhcp
 factory: dhcpv4
+selector:
+  name: eth0
+.fi
+.RE
+.PP
+Example (ipv6auto):
+.RS 4
+.nf
+kind: policy
+name: eth0\-ipv6
+factory: ipv6auto
 selector:
   name: eth0
 .fi
@@ -243,72 +270,58 @@ mapping) or inside the
 .B state:
 mapping of an explicit policy.
 The available fields depend on the entity type.
-.SS Ethernet
+.SS "Ethernet fields (top level)"
 The following fields apply to
-.BR "type: ethernet" .
+.BR "type: ethernet"
+at the top level of the state.
 .TP
 .B mtu
 (integer)
 Maximum transmission unit in bytes.
 Valid range: 68\(en65535.
 .TP
-.B addresses
-(sequence of strings or mappings)
-IP addresses assigned to the interface, in CIDR notation.
-Both IPv4 (e.g.,
-.BR 10.0.1.50/24 )
-and IPv6 (e.g.,
-.BR fd00::1/64 )
-are supported.
+.B enabled
+(boolean)
+Administrative state of the interface.
+.B true
+brings the interface up;
+.B false
+brings it down.
+.SS "Ethernet fields (ipv4 sub-object)"
+.TP
+.B ipv4
+(mapping, optional, keep-when-absent)
+IPv4 configuration sub-object.
+Omitting
+.B ipv4
+entirely means \(lqdon\(aqt touch IPv4 config\(rq.
+An explicit empty mapping
+.RB ( "ipv4: {}" )
+means \(lqmanage IPv4, remove unspecified\(rq.
+.TP
+.B ipv4.addresses
+(sequence of strings)
+IPv4 addresses assigned to the interface, in CIDR notation
+(e.g.,
+.BR 10.0.1.50/24 ).
 Order is preserved: the first address becomes the primary (source) address.
 Duplicate addresses are rejected.
-.RS
-.PP
-Each item can be a plain string or a mapping with lifetime attributes:
 .TP
-.B address
-(string, required)
-The IP address in CIDR notation.
-.TP
-.B valid_lft
-(integer, optional)
-Valid lifetime in seconds.
-.TP
-.B preferred_lft
-(integer, optional)
-Preferred lifetime in seconds.
-.RE
-.IP
-Example:
-.RS 4
-.nf
-addresses:
-  \- 10.0.1.50/24
-  \- address: fd00::1/64
-    valid_lft: 3600
-    preferred_lft: 1800
-.fi
-.RE
-.TP
-.B routes
+.B ipv4.routes
 (sequence of mappings)
-Static routes to configure.
+Static IPv4 routes to configure.
 Each route mapping supports the following keys:
 .RS
 .TP
 .B destination
 (string, required)
 Route destination in CIDR notation (e.g.,
-.BR 0.0.0.0/0
-or
-.BR ::/0 ).
+.BR 0.0.0.0/0 ).
 .TP
 .B gateway
 (string, optional)
-Next-hop IP address (e.g.,
-.BR 10.0.1.1
-or
-.BR fe80::1 ).
+Next-hop IPv4 address (e.g.,
+.BR 10.0.1.1 ).
 .TP
 .B metric
 (integer, optional)
@@ -335,13 +348,77 @@ Route protocol (e.g.,
 .BR dhcp ,
 .BR kernel ).
 .RE
+.SS "Ethernet fields (ipv6 sub-object)"
 .TP
-.B state
-(string)
-Administrative state of the interface.
+.B ipv6
+(mapping, optional, keep-when-absent)
+IPv6 configuration sub-object.
+Omitting
+.B ipv6
+entirely means \(lqdon\(aqt touch IPv6 config\(rq.
+An explicit empty mapping
+.RB ( "ipv6: {}" )
+means \(lqmanage IPv6, remove unspecified\(rq.
+.TP
+.B ipv6.addresses
+(sequence of strings or mappings)
+IPv6 addresses assigned to the interface, in CIDR notation
+(e.g.,
+.BR 2001:db8::1/64 ).
+Each item may be a plain string or a mapping with lifetime attributes:
+.RS
+.TP
+.B address
+(string, required)
+The IPv6 address in CIDR notation.
+.TP
+.B valid_lft
+(integer, optional)
+Valid lifetime in seconds.
+.TP
+.B preferred_lft
+(integer, optional)
+Preferred lifetime in seconds.
+.RE
+.TP
+.B ipv6.routes
+(sequence of mappings)
+Static IPv6 routes to configure.
+Each route mapping supports the following keys:
+.RS
+.TP
+.B destination
+(string, required)
+Route destination in IPv6 CIDR notation (e.g.,
+.BR ::/0 ).
+.TP
+.B gateway
+(string, optional)
+Next-hop IPv6 address (e.g.,
+.BR fe80::1 ).
+.TP
+.B metric
+(integer, optional)
+Route metric (lower values are preferred).
+.RE
+.TP
+.B ipv6.link_local
+(string, optional, keep-when-absent)
+Link-local address generation mode.
 Accepted values:
-.BR up ,
-.BR down .
+.B eui64
+(default) or
+.BR none .
+Controls the kernel\(aqs
+.B addr_gen_mode
+sysctl.
+Must be set before the interface is brought up.
+.TP
+.B ipv6.dad_transmits
+(integer, optional, keep-when-absent)
+Number of DAD (Duplicate Address Detection) probes to send.
+0 disables DAD.
+Default: kernel default (usually 1).
 .SH "VALUE TYPES"
 YAML scalars are mapped to netfyr internal types as follows:
 .TP
@@ -357,20 +434,25 @@ netfyr
 netfyr
 .B I64
 .TP
-.B "YAML string (valid IP address)"
+.B "YAML string (valid IPv4 or IPv6 address)"
 netfyr
 .B IpAddr
 (e.g.,
-.BR 10.0.0.1 ).
-IPv6 addresses are not supported as standalone policy values.
+.B 10.0.0.1
+or
+.BR ::1 ).
+Both IPv4 and IPv6 addresses are supported.
 .TP
 .B "YAML string (valid CIDR prefix)"
 netfyr
 .B IpNetwork
 (e.g.,
-.BR 10.0.0.0/24
+.B 10.0.0.0/24
 or
-.BR fd00::/64 )
+.BR ::/0 ).
+Both IPv4 and IPv6 prefixes are supported.
+The deserializer tries IpNetwork first (CIDR with prefix length),
+then IpAddr (bare address), then falls back to String.
 .TP
 .B "YAML string (other)"
 netfyr

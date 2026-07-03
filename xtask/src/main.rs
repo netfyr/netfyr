@@ -959,7 +959,7 @@ mod tests {
         );
     }
 
-    /// AC: FIELDS section documents the `state` ethernet field.
+    /// AC: FIELDS section documents the `enabled` ethernet field.
     #[test]
     fn test_yaml_man_page_fields_documents_state_field() {
         let content = read_yaml_man_page();
@@ -967,8 +967,8 @@ mod tests {
         let value_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
         let fields_section = &content[fields_start..value_start];
         assert!(
-            fields_section.contains("state"),
-            "FIELDS section must document the 'state' ethernet field"
+            fields_section.contains("enabled"),
+            "FIELDS section must document the 'enabled' ethernet field"
         );
     }
 
@@ -2434,7 +2434,7 @@ mod tests {
         );
     }
 
-    /// AC 503: FIELDS section documents IPv4 CIDR notation for addresses.
+    /// AC 503: FIELDS section documents CIDR notation for addresses and IPv6 sub-object.
     #[test]
     fn test_yaml_man_page_fields_addresses_documents_cidr_notation() {
         let content = read_yaml_man_page();
@@ -2449,11 +2449,15 @@ mod tests {
             fields_section.contains("IPv4") || fields_section.contains("ipv4"),
             "FIELDS addresses documentation must mention IPv4"
         );
+        assert!(
+            fields_section.contains("IPv6") || fields_section.contains("ipv6"),
+            "FIELDS addresses documentation must mention IPv6"
+        );
     }
 
-    /// AC 503: VALUE TYPES section notes that IPv6 is not supported.
+    /// AC 503: VALUE TYPES section documents IPv6 support.
     #[test]
-    fn test_yaml_man_page_value_types_documents_ipv6_not_supported() {
+    fn test_yaml_man_page_value_types_documents_ipv6_supported() {
         let content = read_yaml_man_page();
         let vt_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
         let files_start = content.find("\n.SH FILES").expect("FILES section must exist");
@@ -2461,7 +2465,123 @@ mod tests {
         let lower = vt_section.to_lowercase();
         assert!(
             lower.contains("ipv6"),
-            "VALUE TYPES section must note that IPv6 is not supported"
+            "VALUE TYPES section must document IPv6 support"
+        );
+        assert!(
+            !lower.contains("not supported"),
+            "VALUE TYPES section must not say IPv6 is not supported"
+        );
+    }
+
+    /// AC 503: POLICY FORMAT section documents the ipv6auto factory type.
+    #[test]
+    fn test_yaml_man_page_policy_format_documents_ipv6auto_factory() {
+        let content = read_yaml_man_page();
+        let policy_start = content
+            .find("POLICY FORMAT")
+            .expect("POLICY FORMAT section must exist");
+        let multi_start = content
+            .find("MULTI-DOCUMENT")
+            .expect("MULTI-DOCUMENT FILES section must exist");
+        let policy_section = &content[policy_start..multi_start];
+        assert!(
+            policy_section.contains("ipv6auto"),
+            "POLICY FORMAT section must document the 'ipv6auto' factory type"
+        );
+    }
+
+    /// AC 503: POLICY FORMAT section has an ipv6auto example.
+    #[test]
+    fn test_yaml_man_page_policy_format_has_ipv6auto_example() {
+        let content = read_yaml_man_page();
+        let policy_start = content
+            .find("POLICY FORMAT")
+            .expect("POLICY FORMAT section must exist");
+        let multi_start = content
+            .find("MULTI-DOCUMENT")
+            .expect("MULTI-DOCUMENT FILES section must exist");
+        let policy_section = &content[policy_start..multi_start];
+        assert!(
+            policy_section.contains("factory: ipv6auto"),
+            "POLICY FORMAT section must include an ipv6auto factory example"
+        );
+    }
+
+    /// AC 503: POLICY FORMAT documents that ipv6auto handles SLAAC and DHCPv6.
+    #[test]
+    fn test_yaml_man_page_ipv6auto_documents_slaac_dhcpv6() {
+        let content = read_yaml_man_page();
+        let policy_start = content
+            .find("POLICY FORMAT")
+            .expect("POLICY FORMAT section must exist");
+        let multi_start = content
+            .find("MULTI-DOCUMENT")
+            .expect("MULTI-DOCUMENT FILES section must exist");
+        let policy_section = &content[policy_start..multi_start];
+        let lower = policy_section.to_lowercase();
+        assert!(
+            lower.contains("slaac") || lower.contains("router advertisement"),
+            "POLICY FORMAT must mention SLAAC or Router Advertisement for ipv6auto"
+        );
+        assert!(
+            lower.contains("dhcpv6"),
+            "POLICY FORMAT must mention DHCPv6 for ipv6auto"
+        );
+    }
+
+    /// AC 503: FIELDS section documents the ipv4 sub-object.
+    #[test]
+    fn test_yaml_man_page_fields_documents_ipv4_sub_object() {
+        let content = read_yaml_man_page();
+        let fields_start = content.find("\n.SH FIELDS").expect("FIELDS section must exist");
+        let value_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
+        let fields_section = &content[fields_start..value_start];
+        assert!(
+            fields_section.contains("ipv4"),
+            "FIELDS section must document the 'ipv4' sub-object"
+        );
+        assert!(
+            fields_section.contains("ipv4.addresses"),
+            "FIELDS section must document 'ipv4.addresses'"
+        );
+    }
+
+    /// AC 503: FIELDS section documents the ipv6 sub-object with link_local and dad_transmits.
+    #[test]
+    fn test_yaml_man_page_fields_documents_ipv6_sub_object() {
+        let content = read_yaml_man_page();
+        let fields_start = content.find("\n.SH FIELDS").expect("FIELDS section must exist");
+        let value_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
+        let fields_section = &content[fields_start..value_start];
+        assert!(
+            fields_section.contains("ipv6"),
+            "FIELDS section must document the 'ipv6' sub-object"
+        );
+        assert!(
+            fields_section.contains("link_local"),
+            "FIELDS section must document 'ipv6.link_local'"
+        );
+        assert!(
+            fields_section.contains("dad_transmits"),
+            "FIELDS section must document 'ipv6.dad_transmits'"
+        );
+    }
+
+    /// AC 503: FIELDS section documents the `enabled` field for administrative state.
+    #[test]
+    fn test_yaml_man_page_fields_documents_enabled() {
+        let content = read_yaml_man_page();
+        let fields_start = content.find("\n.SH FIELDS").expect("FIELDS section must exist");
+        let value_start = content.find("VALUE TYPES").expect("VALUE TYPES section must exist");
+        let fields_section = &content[fields_start..value_start];
+        assert!(
+            fields_section.contains("enabled"),
+            "FIELDS section must document the 'enabled' field"
+        );
+        let lower = fields_section.to_lowercase();
+        assert!(
+            lower.contains("administrative") || lower.contains("admin"),
+            "FIELDS 'enabled' documentation must describe administrative state"
         );
     }
 
