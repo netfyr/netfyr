@@ -307,21 +307,55 @@ pub(crate) fn format_text_detail(entry: &JournalEntry) -> String {
                     .to_string(),
             };
             out.push_str(&header);
-            for fc in &op.field_changes {
-                if fc.change_kind == "unchanged" {
-                    continue;
-                }
-                let annotation = if show_annotations {
-                    fc.outcome.as_deref()
-                } else {
-                    None
-                };
+
+            // Partition field changes into top-level (no dot) and sub-object (dotted).
+            // Top-level fields are rendered first at 6-space indent; dotted fields are
+            // grouped by their protocol prefix (e.g. "ipv4") and rendered under a shared
+            // header line "      ipv4:" with 8-space field headers and 10-space elements.
+            let changed_fcs: Vec<&SerializableFieldChange> = op
+                .field_changes
+                .iter()
+                .filter(|fc| fc.change_kind != "unchanged")
+                .collect();
+
+            // Render top-level fields (no dot in name).
+            for fc in changed_fcs.iter().copied().filter(|fc| !fc.field_name.contains('.')) {
+                let annotation = if show_annotations { fc.outcome.as_deref() } else { None };
                 let is_list = fc.current.as_ref().is_some_and(|v| v.is_array())
                     || fc.desired.as_ref().is_some_and(|v| v.is_array());
                 if is_list {
-                    format_list_field_diff(&mut out, fc, annotation);
+                    format_list_field_diff(&mut out, fc, annotation, 6, &fc.field_name);
                 } else {
-                    format_scalar_field_diff(&mut out, fc, annotation);
+                    format_scalar_field_diff(&mut out, fc, annotation, 6, &fc.field_name);
+                }
+            }
+
+            // Collect sub-object fields (dotted names) into ordered groups by prefix.
+            let mut sub_groups: Vec<(String, Vec<&SerializableFieldChange>)> = Vec::new();
+            for fc in changed_fcs.iter().copied().filter(|fc| fc.field_name.contains('.')) {
+                let prefix = fc.field_name.split('.').next().unwrap().to_string();
+                if let Some(group) = sub_groups.iter_mut().find(|(p, _)| p == &prefix) {
+                    group.1.push(fc);
+                } else {
+                    sub_groups.push((prefix, vec![fc]));
+                }
+            }
+
+            // Render each sub-object group under a "      prefix:" header.
+            for (prefix, fcs) in &sub_groups {
+                out.push_str(&format!("      {}:\n", prefix));
+                for fc in fcs.iter().copied() {
+                    let annotation =
+                        if show_annotations { fc.outcome.as_deref() } else { None };
+                    let base_name =
+                        fc.field_name.split('.').next_back().unwrap_or(&fc.field_name);
+                    let is_list = fc.current.as_ref().is_some_and(|v| v.is_array())
+                        || fc.desired.as_ref().is_some_and(|v| v.is_array());
+                    if is_list {
+                        format_list_field_diff(&mut out, fc, annotation, 8, base_name);
+                    } else {
+                        format_scalar_field_diff(&mut out, fc, annotation, 8, base_name);
+                    }
                 }
             }
         }
@@ -371,41 +405,44 @@ fn format_scalar_field_diff(
     out: &mut String,
     fc: &SerializableFieldChange,
     annotation: Option<&str>,
+    indent: usize,
+    display_name: &str,
 ) {
+    let ind = " ".repeat(indent);
     let ann = format_annotation_colored(annotation);
     match fc.change_kind.as_str() {
         "set" if fc.current.is_none() => {
             let desired = opt_json_compact(&fc.desired);
-            let line = format!("+{}: {}", fc.field_name, desired);
-            out.push_str(&format!("      {}{}\n", line.green(), ann));
+            let line = format!("+{}: {}", display_name, desired);
+            out.push_str(&format!("{}{}{}\n", ind, line.green(), ann));
         }
         "set" => {
             let current = opt_json_compact(&fc.current);
             let desired = opt_json_compact(&fc.desired);
-            let old_line = format!("-{}: {}", fc.field_name, current);
-            let new_line = format!("+{}: {}", fc.field_name, desired);
+            let old_line = format!("-{}: {}", display_name, current);
+            let new_line = format!("+{}: {}", display_name, desired);
             match annotation {
                 Some("skipped") | Some("failed") => {
                     // The new value was never applied; suppress the +new line so the
                     // operator is not misled into thinking the desired value took effect.
-                    out.push_str(&format!("      {}{}\n", old_line.red(), ann));
+                    out.push_str(&format!("{}{}{}\n", ind, old_line.red(), ann));
                 }
                 Some("applied") => {
                     // In a mixed-outcome context, confirm what was actually set and
                     // suppress the -old line (less relevant once the change landed).
-                    out.push_str(&format!("      {}{}\n", new_line.green(), ann));
+                    out.push_str(&format!("{}{}{}\n", ind, new_line.green(), ann));
                 }
                 _ => {
                     // No annotation (all succeeded or unannotated): standard unified-diff.
-                    out.push_str(&format!("      {}\n", old_line.red()));
-                    out.push_str(&format!("      {}{}\n", new_line.green(), ann));
+                    out.push_str(&format!("{}{}\n", ind, old_line.red()));
+                    out.push_str(&format!("{}{}{}\n", ind, new_line.green(), ann));
                 }
             }
         }
         "unset" => {
             let current = opt_json_compact(&fc.current);
-            let line = format!("-{}: {}", fc.field_name, current);
-            out.push_str(&format!("      {}{}\n", line.red(), ann));
+            let line = format!("-{}: {}", display_name, current);
+            out.push_str(&format!("{}{}{}\n", ind, line.red(), ann));
         }
         _ => {}
     }
@@ -415,7 +452,12 @@ fn format_list_field_diff(
     out: &mut String,
     fc: &SerializableFieldChange,
     annotation: Option<&str>,
+    header_indent: usize,
+    display_name: &str,
 ) {
+    let h_ind = " ".repeat(header_indent);
+    let e_ind = " ".repeat(header_indent + 2);
+
     let empty = Vec::new();
     let current_items = fc
         .current
@@ -429,16 +471,16 @@ fn format_list_field_diff(
         .unwrap_or(&empty);
 
     let ann = format_annotation_colored(annotation);
-    out.push_str(&format!("      {}:\n", fc.field_name));
+    out.push_str(&format!("{}{}:\n", h_ind, display_name));
     for item in desired_items {
         if !current_items.contains(item) {
-            let line = format!("        +{}", format_list_element(item));
+            let line = format!("{}+{}", e_ind, format_list_element(item));
             out.push_str(&format!("{}{}\n", line.green(), ann));
         }
     }
     for item in current_items {
         if !desired_items.contains(item) {
-            let line = format!("        -{}", format_list_element(item));
+            let line = format!("{}-{}", e_ind, format_list_element(item));
             out.push_str(&format!("{}{}\n", line.red(), ann));
         }
     }

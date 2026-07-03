@@ -418,8 +418,18 @@ pub(crate) fn entities_summary_fitted(
 
 // ── Field display priority ───────────────────────────────────────────────────
 
+/// Returns the part of a field name after the first `.`, or the whole name if
+/// there is no dot.  Used to strip protocol prefixes like `ipv4.` from dotted
+/// field names produced by the reconcile diff engine.
+pub(crate) fn base_field_name(name: &str) -> &str {
+    match name.find('.') {
+        Some(pos) => &name[pos + 1..],
+        None => name,
+    }
+}
+
 fn field_display_priority(name: &str) -> u8 {
-    match name {
+    match base_field_name(name) {
         "enabled" => 1,
         "carrier" => 2,
         "addresses" => 3,
@@ -454,6 +464,10 @@ pub(crate) fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                         continue;
                     }
                     let prio = field_display_priority(&fc.field_name);
+                    // Strip protocol prefix (e.g. "ipv4.addresses" → "addresses") so
+                    // that dotted field names from the reconcile diff engine are matched
+                    // and displayed correctly.
+                    let base = base_field_name(&fc.field_name);
                     let is_list = fc.current.as_ref().is_some_and(|v| v.is_array())
                         || fc.desired.as_ref().is_some_and(|v| v.is_array());
 
@@ -470,7 +484,7 @@ pub(crate) fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                             .and_then(|v| v.as_array())
                             .unwrap_or(&empty_arr);
 
-                        if fc.field_name == "addresses" {
+                        if base == "addresses" {
                             fn extract_addr(v: &serde_json::Value) -> Option<&str> {
                                 v.as_str().or_else(|| v.get("address")?.as_str())
                             }
@@ -509,7 +523,7 @@ pub(crate) fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                             continue;
                         }
 
-                        match fc.field_name.as_str() {
+                        match base {
                             "routes" => {
                                 for s in format_route_changes(added, removed) {
                                     parts.push((prio, s));
@@ -559,16 +573,16 @@ pub(crate) fn changes_summary(ops: &[SerializableDiffOp]) -> String {
                                 let new = json_display_value(
                                     fc.desired.as_ref().unwrap_or(&serde_json::Value::Null),
                                 );
-                                parts.push((prio, format!("{} {}→{}", fc.field_name, old, new)));
+                                parts.push((prio, format!("{} {}→{}", base, old, new)));
                             }
                             "set" => {
                                 let val = json_display_value(
                                     fc.desired.as_ref().unwrap_or(&serde_json::Value::Null),
                                 );
-                                parts.push((prio, format!("+{}: {}", fc.field_name, val)));
+                                parts.push((prio, format!("+{}: {}", base, val)));
                             }
                             "unset" => {
-                                parts.push((prio, format!("-{}", fc.field_name)));
+                                parts.push((prio, format!("-{}", base)));
                             }
                             _ => {}
                         }

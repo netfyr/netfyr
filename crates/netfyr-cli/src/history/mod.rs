@@ -4164,4 +4164,181 @@ mod tests {
         assert!(result.contains("-10.0.0.1/24"), "should show first removed address, got: {}", result);
         assert!(result.contains("-10.0.0.2/24"), "should show second removed address, got: {}", result);
     }
+
+    #[test]
+    fn test_format_text_detail_groups_ipv4_sub_fields_under_header() {
+        let mut entry = make_entry();
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "ipv4.addresses".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!(["10.0.0.1/24"])),
+                        outcome: None,
+                    },
+                    SerializableFieldChange {
+                        field_name: "ipv4.routes".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!([{"to": "default", "via": "10.0.0.254"}])),
+                        outcome: None,
+                    },
+                ],
+            }],
+        };
+        let output = strip_ansi(&format_text_detail(&entry));
+        assert!(
+            output.contains("      ipv4:"),
+            "should have ipv4 group header, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("        addresses:"),
+            "should have nested addresses header, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("        routes:"),
+            "should have nested routes header, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("          +10.0.0.1/24"),
+            "addresses list element should be at 10-space indent, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_format_text_detail_ipv4_and_scalar_fields_render_separately() {
+        let mut entry = make_entry();
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "mtu".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!(1500)),
+                        desired: Some(serde_json::json!(9000)),
+                        outcome: None,
+                    },
+                    SerializableFieldChange {
+                        field_name: "ipv4.addresses".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!(["192.168.1.10/24"])),
+                        outcome: None,
+                    },
+                ],
+            }],
+        };
+        let output = strip_ansi(&format_text_detail(&entry));
+        assert!(
+            output.contains("      -mtu:") || output.contains("      +mtu:"),
+            "mtu should render at 6-space indent, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("      ipv4:"),
+            "ipv4 group header should be at 6-space indent, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("        addresses:"),
+            "addresses should be nested under ipv4 at 8-space indent, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_format_text_detail_ipv4_annotation_on_nested_list() {
+        let mut entry = make_entry();
+        entry.outcome = ApplyOutcome::Applied { succeeded: 0, failed: 1, skipped: 1 };
+        entry.diff = SerializableDiff {
+            operations: vec![SerializableDiffOp {
+                kind: "modify".to_string(),
+                entity_type: "ethernet".to_string(),
+                entity_name: "eth0".to_string(),
+                field_changes: vec![
+                    SerializableFieldChange {
+                        field_name: "ipv4.dns_servers".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!(["8.8.8.8"])),
+                        outcome: Some("skipped".to_string()),
+                    },
+                    SerializableFieldChange {
+                        field_name: "ipv4.routes".to_string(),
+                        change_kind: "set".to_string(),
+                        current: Some(serde_json::json!([])),
+                        desired: Some(serde_json::json!([{"to": "default", "via": "10.0.0.1"}])),
+                        outcome: Some("failed".to_string()),
+                    },
+                ],
+            }],
+        };
+        let output = strip_ansi(&format_text_detail(&entry));
+        assert!(
+            output.contains("[skipped]"),
+            "skipped annotation should appear for dns_servers, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("[failed]"),
+            "failed annotation should appear for routes, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_changes_summary_handles_dotted_addresses_field() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "ipv4.addresses".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!([])),
+                desired: Some(serde_json::json!(["10.0.1.50/24"])),
+                outcome: None,
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert!(
+            result.contains("+10.0.1.50/24"),
+            "dotted addresses field should display address value, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_changes_summary_handles_dotted_routes_field() {
+        let ops = vec![SerializableDiffOp {
+            kind: "modify".to_string(),
+            entity_type: "ethernet".to_string(),
+            entity_name: "eth0".to_string(),
+            field_changes: vec![SerializableFieldChange {
+                field_name: "ipv4.routes".to_string(),
+                change_kind: "set".to_string(),
+                current: Some(serde_json::json!([])),
+                desired: Some(serde_json::json!([{"to": "default", "via": "192.168.1.1"}])),
+                outcome: None,
+            }],
+        }];
+        let result = changes_summary(&ops);
+        assert!(
+            result.contains("+dflt via 192.168.1.1") || result.contains("+1 route"),
+            "dotted routes field should display route summary, got: {}",
+            result
+        );
+    }
 }
