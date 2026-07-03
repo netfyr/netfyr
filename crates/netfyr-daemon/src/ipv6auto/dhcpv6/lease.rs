@@ -1,6 +1,4 @@
 //! DHCPv6 lease data types.
-// SPEC-412 will use these types; all items unused until then.
-#![allow(dead_code)]
 
 use std::net::Ipv6Addr;
 use std::time::{Duration, Instant};
@@ -43,6 +41,7 @@ pub struct Dhcpv6Lease {
 
 impl Dhcpv6Lease {
     /// Return true if the lease (or info refresh) has expired.
+    #[allow(dead_code)]
     pub fn is_expired(&self) -> bool {
         let elapsed = self.acquired_at.elapsed();
         if self.addresses.is_empty() {
@@ -86,6 +85,7 @@ impl Dhcpv6Lease {
     }
 
     /// Minimum preferred lifetime across all addresses; 0 if no addresses.
+    #[allow(dead_code)]
     pub fn shortest_preferred_lft(&self) -> u32 {
         self.addresses
             .iter()

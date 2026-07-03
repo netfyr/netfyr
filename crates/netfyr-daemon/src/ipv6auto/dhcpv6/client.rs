@@ -1,6 +1,4 @@
 //! DHCPv6 protocol state machine (RFC 8415).
-// SPEC-412 will call into this module; until then all items are unused.
-#![allow(dead_code)]
 //!
 //! Implements both stateful (IA_NA: Solicit → Advertise → Request → Reply →
 //! Renew/Rebind/Release) and stateless (Information-Request → Reply → refresh)
@@ -72,6 +70,7 @@ pub(super) struct Dhcpv6Context {
     pub iaid: u32,
     pub duid: DuidLlt,
     /// Interface's link-local address; used as UDP source.
+    #[allow(dead_code)]
     pub link_local: Ipv6Addr,
     /// Interface index; used as IPv6 scope_id for link-local socket.
     pub ifindex: u32,

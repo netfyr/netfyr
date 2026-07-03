@@ -1,7 +1,4 @@
 //! DHCPv6 client for the ipv6auto factory.
-// SPEC-412 will integrate this module into Ipv6AutoFactory; until then,
-// all public items are temporarily unused.
-#![allow(dead_code)]
 //!
 //! Supports stateful (IA_NA: acquires addresses and options) and stateless
 //! (Information-Request: acquires options only) modes. The mode is determined
@@ -50,9 +47,11 @@ pub enum Dhcpv6Result {
 /// Manages the lifecycle of a background tokio task that runs the DHCPv6
 /// protocol state machine and sends `Dhcpv6Result` messages to the caller.
 pub struct Dhcpv6Client {
+    #[allow(dead_code)]
     interface: String,
     stateful: bool,
     /// Snapshot of the latest lease for synchronous reads.
+    #[allow(dead_code)]
     lease: Arc<Mutex<Option<Dhcpv6Lease>>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<JoinHandle<()>>,
@@ -136,11 +135,13 @@ impl Dhcpv6Client {
 
     /// Return a clone of the latest lease, or `None` if no lease has been
     /// acquired yet.
+    #[allow(dead_code)]
     pub fn current_lease(&self) -> Option<Dhcpv6Lease> {
         self.lease.lock().unwrap().clone()
     }
 
     /// Name of the interface this client is running on.
+    #[allow(dead_code)]
     pub fn interface(&self) -> &str {
         &self.interface
     }

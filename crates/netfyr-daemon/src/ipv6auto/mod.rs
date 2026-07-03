@@ -15,6 +15,7 @@ mod ra;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::Ipv6Addr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,8 @@ use self::address::{
     get_interface_mac, remove_ipv6_address, update_address_lifetime, wait_for_link_local_dad,
     DadStatus,
 };
+use self::dhcpv6::lease::Dhcpv6Lease;
+use self::dhcpv6::{Dhcpv6Client, Dhcpv6Result};
 use self::ra::{open_ra_socket, parse_ra, send_router_solicitation, RaOption};
 
 // ── Lifetime constants ────────────────────────────────────────────────────────
@@ -311,6 +314,13 @@ async fn run_ipv6auto(
     let mut rs_interval = Duration::from_secs(4);
     let mut next_rs_time = Instant::now() + rs_interval;
 
+    // DHCPv6 state: optional client started on M/O flag, its result channel,
+    // the most recent lease, and IA_NA addresses we installed via netlink.
+    let mut dhcpv6_client: Option<Dhcpv6Client> = None;
+    let mut dhcpv6_result_rx: Option<mpsc::Receiver<Dhcpv6Result>> = None;
+    let mut dhcpv6_lease: Option<Dhcpv6Lease> = None;
+    let mut dhcpv6_installed_addrs: Vec<Ipv6Addr> = Vec::new();
+
     loop {
         // Compute earliest wakeup from all tracked timers.
         let has_pending_dad = ra_state
@@ -357,7 +367,7 @@ async fn run_ipv6auto(
                             debug!(interface, %src, "RA received");
                             first_ra_received = true;
 
-                            // Report M/O flag changes.
+                            // Report M/O flag changes and start/stop DHCPv6.
                             let m_changed = ra_state.last_m != Some(ra.m_flag);
                             let o_changed = ra_state.last_o != Some(ra.o_flag);
                             if m_changed || o_changed {
@@ -370,19 +380,35 @@ async fn run_ipv6auto(
                                         o: ra.o_flag,
                                     })
                                     .await;
+                                manage_dhcpv6(
+                                    ra.m_flag,
+                                    ra.o_flag,
+                                    &interface,
+                                    &mut dhcpv6_client,
+                                    &mut dhcpv6_result_rx,
+                                    &mut dhcpv6_lease,
+                                    &mut dhcpv6_installed_addrs,
+                                )
+                                .await;
                             }
 
                             handle_ra(&ra, &mut ra_state, &interface, mac).await;
 
-                            let new_state =
-                                build_ra_state(&ra_state, &interface, &policy_name, priority);
+                            let new_state = build_merged_state(
+                                &ra_state,
+                                &interface,
+                                &policy_name,
+                                priority,
+                                dhcpv6_lease.as_ref(),
+                            );
                             *state_arc.lock().unwrap() = Some(new_state.clone());
-                            emit_lease_event(
+                            emit_lease_event_inner(
                                 &ra_state,
                                 &mut lease_acquired,
                                 &policy_name,
                                 new_state,
                                 &event_tx,
+                                dhcpv6_lease.is_some(),
                             )
                             .await;
                         }
@@ -472,23 +498,107 @@ async fn run_ipv6auto(
                 state_changed |= changed;
 
                 if state_changed {
-                    let new_state =
-                        build_ra_state(&ra_state, &interface, &policy_name, priority);
+                    let new_state = build_merged_state(
+                        &ra_state,
+                        &interface,
+                        &policy_name,
+                        priority,
+                        dhcpv6_lease.as_ref(),
+                    );
                     *state_arc.lock().unwrap() = Some(new_state.clone());
-                    emit_lease_event(
+                    emit_lease_event_inner(
                         &ra_state,
                         &mut lease_acquired,
                         &policy_name,
                         new_state,
                         &event_tx,
+                        dhcpv6_lease.is_some(),
                     )
                     .await;
+                }
+            }
+
+            // ── DHCPv6 result ─────────────────────────────────────────────────
+            dhcpv6_msg = async {
+                match dhcpv6_result_rx.as_mut() {
+                    Some(rx) => match rx.recv().await {
+                        Some(r) => r,
+                        None => std::future::pending::<Dhcpv6Result>().await,
+                    },
+                    None => std::future::pending::<Dhcpv6Result>().await,
+                }
+            } => {
+                match dhcpv6_msg {
+                    Dhcpv6Result::Acquired(lease) | Dhcpv6Result::Renewed(lease) => {
+                        let is_stateful =
+                            dhcpv6_client.as_ref().is_some_and(|c| c.is_stateful());
+                        if is_stateful {
+                            install_dhcpv6_addresses(
+                                &interface,
+                                &lease,
+                                &mut dhcpv6_installed_addrs,
+                            )
+                            .await;
+                        }
+                        dhcpv6_lease = Some(lease);
+                        let new_state = build_merged_state(
+                            &ra_state,
+                            &interface,
+                            &policy_name,
+                            priority,
+                            dhcpv6_lease.as_ref(),
+                        );
+                        *state_arc.lock().unwrap() = Some(new_state.clone());
+                        emit_lease_event_inner(
+                            &ra_state,
+                            &mut lease_acquired,
+                            &policy_name,
+                            new_state,
+                            &event_tx,
+                            true,
+                        )
+                        .await;
+                    }
+                    Dhcpv6Result::Expired => {
+                        remove_dhcpv6_addresses(&interface, &mut dhcpv6_installed_addrs).await;
+                        dhcpv6_lease = None;
+                        let new_state = build_merged_state(
+                            &ra_state,
+                            &interface,
+                            &policy_name,
+                            priority,
+                            None,
+                        );
+                        *state_arc.lock().unwrap() = Some(new_state.clone());
+                        emit_lease_event_inner(
+                            &ra_state,
+                            &mut lease_acquired,
+                            &policy_name,
+                            new_state,
+                            &event_tx,
+                            false,
+                        )
+                        .await;
+                    }
+                    Dhcpv6Result::Error(e) => {
+                        warn!(interface, error = %e, "DHCPv6 transient error");
+                        let _ = event_tx
+                            .send(FactoryEvent::Error {
+                                policy_name: policy_name.clone(),
+                                error: format!("dhcpv6: {e}"),
+                            })
+                            .await;
+                    }
                 }
             }
 
             // ── Stop signal ───────────────────────────────────────────────────
             _ = &mut stop_rx => {
                 debug!(interface, "IPv6 auto factory stopping");
+                if let Some(mut c) = dhcpv6_client.take() {
+                    let _ = c.stop().await;
+                }
+                remove_dhcpv6_addresses(&interface, &mut dhcpv6_installed_addrs).await;
                 break;
             }
         }
@@ -715,31 +825,32 @@ async fn handle_ra(
 
 // ── Lease event emission ──────────────────────────────────────────────────────
 
-/// Emit the appropriate `FactoryEvent` based on the current RA state.
+/// Inner implementation shared by `emit_lease_event` and the DHCPv6 arm.
 ///
-/// - `LeaseAcquired`: first time a DAD-complete address is available.
-/// - `LeaseRenewed`: subsequent state updates while a lease is active.
-/// - `LeaseExpired`: all prefixes and routers have expired.
-/// - (no event): pre-acquisition, waiting for first DAD to complete.
-async fn emit_lease_event(
+/// `has_dhcpv6_lease`: true when a DHCPv6 lease (stateful or stateless) is
+/// currently held, so that `LeaseAcquired` can fire even when no SLAAC
+/// address is DAD-complete (M-only scenario).
+async fn emit_lease_event_inner(
     ra_state: &Ipv6AutoState,
     lease_acquired: &mut bool,
     policy_name: &str,
     state: State,
     event_tx: &mpsc::Sender<FactoryEvent>,
+    has_dhcpv6_lease: bool,
 ) {
     let has_complete_addr = ra_state
         .prefixes
         .values()
         .any(|ps| ps.dad_complete && !ps.dad_failed);
-    let all_gone = ra_state.prefixes.is_empty() && ra_state.routers.is_empty();
+    let all_gone =
+        ra_state.prefixes.is_empty() && ra_state.routers.is_empty() && !has_dhcpv6_lease;
 
     let event = if all_gone && *lease_acquired {
         *lease_acquired = false;
         Some(FactoryEvent::LeaseExpired {
             policy_name: policy_name.to_string(),
         })
-    } else if has_complete_addr && !*lease_acquired {
+    } else if (has_complete_addr || has_dhcpv6_lease) && !*lease_acquired {
         *lease_acquired = true;
         Some(FactoryEvent::LeaseAcquired {
             policy_name: policy_name.to_string(),
@@ -756,6 +867,125 @@ async fn emit_lease_event(
 
     if let Some(ev) = event {
         let _ = event_tx.send(ev).await;
+    }
+}
+
+/// Emit the appropriate `FactoryEvent` based on the current RA state.
+///
+/// - `LeaseAcquired`: first time a DAD-complete address is available.
+/// - `LeaseRenewed`: subsequent state updates while a lease is active.
+/// - `LeaseExpired`: all prefixes and routers have expired.
+/// - (no event): pre-acquisition, waiting for first DAD to complete.
+///
+/// This wrapper passes `has_dhcpv6_lease = false`; the run loop calls
+/// `emit_lease_event_inner` directly with the real DHCPv6 lease status.
+#[cfg(test)]
+async fn emit_lease_event(
+    ra_state: &Ipv6AutoState,
+    lease_acquired: &mut bool,
+    policy_name: &str,
+    state: State,
+    event_tx: &mpsc::Sender<FactoryEvent>,
+) {
+    emit_lease_event_inner(ra_state, lease_acquired, policy_name, state, event_tx, false).await;
+}
+
+// ── DHCPv6 integration helpers ────────────────────────────────────────────────
+
+/// Start, stop, or leave the DHCPv6 client unchanged based on RA M/O flags.
+///
+/// - M=1: stateful DHCPv6 (IA_NA — acquires addresses and options).
+/// - M=0, O=1: stateless DHCPv6 (Information-Request — options only).
+/// - M=0, O=0: no DHCPv6.
+///
+/// When the required mode changes the running client is stopped first.
+async fn manage_dhcpv6(
+    m: bool,
+    o: bool,
+    interface: &str,
+    client: &mut Option<Dhcpv6Client>,
+    result_rx: &mut Option<mpsc::Receiver<Dhcpv6Result>>,
+    lease: &mut Option<Dhcpv6Lease>,
+    installed_addrs: &mut Vec<Ipv6Addr>,
+) {
+    let want_stateful = m;
+    let want_dhcpv6 = m || o;
+
+    // Stop the running client if the mode no longer matches or DHCPv6 is unneeded.
+    if let Some(ref existing) = client {
+        let mode_ok = existing.is_stateful() == want_stateful;
+        if !want_dhcpv6 || !mode_ok {
+            if let Some(mut c) = client.take() {
+                let _ = c.stop().await;
+            }
+            *result_rx = None;
+            remove_dhcpv6_addresses(interface, installed_addrs).await;
+            *lease = None;
+        }
+    }
+
+    // Start a new client if needed.
+    if want_dhcpv6 && client.is_none() {
+        let duid_path = PathBuf::from(
+            std::env::var("NETFYR_DUID_PATH")
+                .unwrap_or_else(|_| "/var/lib/netfyr/duid".to_string()),
+        );
+        let (tx, rx) = mpsc::channel(8);
+        match Dhcpv6Client::start(interface, want_stateful, &duid_path, tx).await {
+            Ok(c) => {
+                *client = Some(c);
+                *result_rx = Some(rx);
+            }
+            Err(e) => {
+                warn!(interface, error = %e, "Failed to start DHCPv6 client");
+            }
+        }
+    }
+}
+
+/// Install new DHCPv6 IA_NA addresses and remove stale ones from a prior lease.
+async fn install_dhcpv6_addresses(
+    interface: &str,
+    lease: &Dhcpv6Lease,
+    installed: &mut Vec<Ipv6Addr>,
+) {
+    let new_addrs: Vec<Ipv6Addr> = lease.addresses.iter().map(|a| a.address).collect();
+
+    // Remove addresses from the previous lease that are not in the new one.
+    let stale: Vec<Ipv6Addr> = installed
+        .iter()
+        .filter(|a| !new_addrs.contains(a))
+        .copied()
+        .collect();
+    for addr in stale {
+        if let Err(e) = remove_ipv6_address(interface, addr, 128).await {
+            warn!(interface, %addr, error = %e, "Failed to remove stale DHCPv6 address");
+        }
+        installed.retain(|a| *a != addr);
+    }
+
+    // Install addresses that are new.
+    for da in &lease.addresses {
+        if !installed.contains(&da.address) {
+            match add_ipv6_address(interface, da.address, da.prefix_len, da.valid_lft, da.preferred_lft).await {
+                Ok(()) => {
+                    info!(interface, addr = %da.address, "DHCPv6 address installed");
+                    installed.push(da.address);
+                }
+                Err(e) => {
+                    warn!(interface, addr = %da.address, error = %e, "Failed to install DHCPv6 address");
+                }
+            }
+        }
+    }
+}
+
+/// Remove all DHCPv6 addresses previously installed via `install_dhcpv6_addresses`.
+async fn remove_dhcpv6_addresses(interface: &str, installed: &mut Vec<Ipv6Addr>) {
+    for addr in installed.drain(..) {
+        if let Err(e) = remove_ipv6_address(interface, addr, 128).await {
+            warn!(interface, %addr, error = %e, "Failed to remove DHCPv6 address");
+        }
     }
 }
 
@@ -920,15 +1150,31 @@ fn pending_state(interface: &str, policy_name: &str, priority: u32) -> State {
 
 /// Build the full `State` from the current RA-derived information.
 ///
-/// Addresses are only included when DAD has completed (`dad_complete = true`).
-/// Always includes `enabled: true` and an `ipv6` sub-object with the
-/// currently active addresses, routers, DNS servers, search domains, and
-/// NAT64 prefix.
+/// Thin wrapper around `build_merged_state` with no DHCPv6 lease.
+/// Tests call this directly and must not break.
+#[cfg(test)]
 fn build_ra_state(
     ra_state: &Ipv6AutoState,
     interface: &str,
     policy_name: &str,
     priority: u32,
+) -> State {
+    build_merged_state(ra_state, interface, policy_name, priority, None)
+}
+
+/// Build the full `State` merging RA-derived SLAAC data with an optional
+/// DHCPv6 lease.
+///
+/// Addresses are only included when DAD has completed (`dad_complete = true`).
+/// DHCPv6 IA_NA addresses (if any) are appended after SLAAC addresses.
+/// DNS servers and search domains are merged from RDNSS/DNSSL and DHCPv6
+/// option 23/24 without duplicates.
+fn build_merged_state(
+    ra_state: &Ipv6AutoState,
+    interface: &str,
+    policy_name: &str,
+    priority: u32,
+    dhcpv6_lease: Option<&Dhcpv6Lease>,
 ) -> State {
     let prov = Provenance::UserConfigured {
         policy_ref: policy_name.to_string(),
@@ -944,8 +1190,9 @@ fn build_ra_state(
 
     let mut ipv6_map: IndexMap<String, Value> = IndexMap::new();
 
-    // Addresses: DAD-complete, not-failed, not-yet-expired SLAAC addresses.
-    let addr_list: Vec<Value> = ra_state
+    // SLAAC addresses: DAD-complete, not-failed, not-yet-expired.
+    // Collect as (Ipv6Addr, Value) pairs so DHCPv6 deduplication can remove overlaps.
+    let mut slaac_addrs: Vec<(Ipv6Addr, Value)> = ra_state
         .prefixes
         .values()
         .filter(|ps| ps.dad_complete && !ps.dad_failed && ps.valid_expires > now)
@@ -960,9 +1207,33 @@ fn build_ra_state(
             m.insert("address".to_string(), Value::IpNetwork(net));
             m.insert("valid_lft".to_string(), Value::U64(valid_secs));
             m.insert("preferred_lft".to_string(), Value::U64(pref_secs));
-            Value::Map(m)
+            (ps.addr, Value::Map(m))
         })
         .collect();
+
+    // DHCPv6 IA_NA addresses (stateful only; stateless has empty addresses vec).
+    // If both SLAAC and DHCPv6 produce the same address, prefer the DHCPv6 version
+    // (it carries server-assigned lifetimes).
+    let mut dhcpv6_addr_list: Vec<Value> = Vec::new();
+    if let Some(lease) = dhcpv6_lease {
+        for da in &lease.addresses {
+            // Remove any SLAAC entry with the same address before appending the DHCPv6 version.
+            slaac_addrs.retain(|(slaac_ip, _)| *slaac_ip != da.address);
+            let net: IpNetwork = format!("{}/{}", da.address, da.prefix_len)
+                .parse()
+                .unwrap_or_else(|_| {
+                    IpNetwork::V6(Ipv6Network::new(da.address, da.prefix_len).unwrap())
+                });
+            let mut m = IndexMap::new();
+            m.insert("address".to_string(), Value::IpNetwork(net));
+            m.insert("valid_lft".to_string(), Value::U64(da.valid_lft as u64));
+            m.insert("preferred_lft".to_string(), Value::U64(da.preferred_lft as u64));
+            dhcpv6_addr_list.push(Value::Map(m));
+        }
+    }
+    let mut addr_list: Vec<Value> = slaac_addrs.into_iter().map(|(_, v)| v).collect();
+    addr_list.extend(dhcpv6_addr_list);
+
     if !addr_list.is_empty() {
         ipv6_map.insert("addresses".to_string(), Value::List(addr_list));
     }
@@ -1006,26 +1277,56 @@ fn build_ra_state(
         ipv6_map.insert("routes".to_string(), Value::List(route_list));
     }
 
-    // DNS servers from RDNSS options.
-    let dns_servers: Vec<Value> = ra_state
+    // DNS servers: RDNSS addresses first, then DHCPv6 option 23 without duplicates.
+    let mut dns_seen: Vec<String> = Vec::new();
+    let mut dns_servers: Vec<Value> = Vec::new();
+    for addr in ra_state
         .rdnss
         .iter()
         .filter(|e| e.expires_at > now)
         .flat_map(|e| e.addresses.iter())
-        .map(|addr| Value::String(addr.to_string()))
-        .collect();
+    {
+        let s = addr.to_string();
+        if !dns_seen.contains(&s) {
+            dns_seen.push(s.clone());
+            dns_servers.push(Value::String(s));
+        }
+    }
+    if let Some(lease) = dhcpv6_lease {
+        for addr in &lease.dns_servers {
+            let s = addr.to_string();
+            if !dns_seen.contains(&s) {
+                dns_seen.push(s.clone());
+                dns_servers.push(Value::String(s));
+            }
+        }
+    }
     if !dns_servers.is_empty() {
         ipv6_map.insert("dns_servers".to_string(), Value::List(dns_servers));
     }
 
-    // DNS search domains from DNSSL options.
-    let dns_search: Vec<Value> = ra_state
+    // DNS search domains: DNSSL first, then DHCPv6 option 24 without duplicates.
+    let mut search_seen: Vec<String> = Vec::new();
+    let mut dns_search: Vec<Value> = Vec::new();
+    for d in ra_state
         .dnssl
         .iter()
         .filter(|e| e.expires_at > now)
         .flat_map(|e| e.domains.iter())
-        .map(|d| Value::String(d.clone()))
-        .collect();
+    {
+        if !search_seen.contains(d) {
+            search_seen.push(d.clone());
+            dns_search.push(Value::String(d.clone()));
+        }
+    }
+    if let Some(lease) = dhcpv6_lease {
+        for d in &lease.dns_search {
+            if !search_seen.contains(d) {
+                search_seen.push(d.clone());
+                dns_search.push(Value::String(d.clone()));
+            }
+        }
+    }
     if !dns_search.is_empty() {
         ipv6_map.insert("dns_search".to_string(), Value::List(dns_search));
     }
@@ -2278,6 +2579,649 @@ mod tests {
             state.pref64.as_ref().unwrap().prefix,
             nat64,
             "NAT64 prefix must be stored correctly"
+        );
+    }
+
+    // ── DHCPv6 test helpers ───────────────────────────────────────────────────
+
+    /// Make a stateful Dhcpv6Lease for unit tests.
+    fn make_test_dhcpv6_lease_stateful(
+        addr_specs: Vec<(std::net::Ipv6Addr, u8, u32, u32)>,
+        dns: Vec<std::net::Ipv6Addr>,
+        search: Vec<String>,
+    ) -> Dhcpv6Lease {
+        use self::dhcpv6::lease::Dhcpv6Address;
+        Dhcpv6Lease {
+            addresses: addr_specs
+                .into_iter()
+                .map(|(address, prefix_len, preferred_lft, valid_lft)| Dhcpv6Address {
+                    address,
+                    prefix_len,
+                    preferred_lft,
+                    valid_lft,
+                })
+                .collect(),
+            dns_servers: dns,
+            dns_search: search,
+            t1: 3600,
+            t2: 5760,
+            server_duid: vec![0, 1, 2, 3],
+            server_addr: "fe80::1".parse().unwrap(),
+            info_refresh_time: None,
+            acquired_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Make a stateless Dhcpv6Lease (no addresses) for unit tests.
+    fn make_test_dhcpv6_lease_stateless(
+        dns: Vec<std::net::Ipv6Addr>,
+        search: Vec<String>,
+    ) -> Dhcpv6Lease {
+        Dhcpv6Lease {
+            addresses: vec![],
+            dns_servers: dns,
+            dns_search: search,
+            t1: 0,
+            t2: 0,
+            server_duid: vec![0, 1, 2, 3],
+            server_addr: "fe80::1".parse().unwrap(),
+            info_refresh_time: Some(1800),
+            acquired_at: std::time::Instant::now(),
+        }
+    }
+
+    // ── build_merged_state with DHCPv6 lease ─────────────────────────────────
+
+    /// Scenario: SLAAC and DHCPv6 stateful addresses are merged
+    /// Given SLAAC provides one address and DHCPv6 stateful provides another,
+    /// build_merged_state includes both in ipv6.addresses.
+    #[test]
+    fn test_build_merged_state_stateful_includes_both_slaac_and_dhcpv6_addresses() {
+        let mut ra_state = Ipv6AutoState::default();
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        let slaac_addr: Ipv6Addr = "2001:db8::a8bb:ccff:fedd:eeff".parse().unwrap();
+        ra_state
+            .prefixes
+            .insert(net, make_prefix_state(slaac_addr, true, false, far_future(), far_future()));
+
+        let dhcpv6_addr: Ipv6Addr = "2001:db8::100".parse().unwrap();
+        let lease = make_test_dhcpv6_lease_stateful(
+            vec![(dhcpv6_addr, 128, 14400, 86400)],
+            vec![],
+            vec![],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let addrs = map
+            .get("addresses")
+            .expect("addresses must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(
+            addrs.len(),
+            2,
+            "both SLAAC and DHCPv6 stateful addresses must appear"
+        );
+        let addr_strs: Vec<String> = addrs
+            .iter()
+            .filter_map(|v| v.as_map())
+            .filter_map(|m| m.get("address"))
+            .map(|v| v.to_string())
+            .collect();
+        assert!(
+            addr_strs.iter().any(|s| s.contains("a8bb:ccff:fedd:eeff")),
+            "SLAAC address must be in addresses list"
+        );
+        assert!(
+            addr_strs.iter().any(|s| s.contains("100")),
+            "DHCPv6 address must be in addresses list"
+        );
+    }
+
+    /// Scenario: O flag (stateless) — no DHCPv6 addresses in produced state
+    /// Given a stateless DHCPv6 lease (empty address list) and a SLAAC address,
+    /// only the SLAAC address appears in ipv6.addresses.
+    #[test]
+    fn test_build_merged_state_stateless_dhcpv6_adds_no_addresses() {
+        let mut ra_state = Ipv6AutoState::default();
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        let slaac_addr: Ipv6Addr = "2001:db8::a8bb:ccff:fedd:eeff".parse().unwrap();
+        ra_state
+            .prefixes
+            .insert(net, make_prefix_state(slaac_addr, true, false, far_future(), far_future()));
+
+        let lease = make_test_dhcpv6_lease_stateless(
+            vec!["2001:db8::53".parse().unwrap()],
+            vec!["example.com".to_string()],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let addrs = map
+            .get("addresses")
+            .expect("SLAAC address must still appear")
+            .as_list()
+            .unwrap();
+        assert_eq!(
+            addrs.len(),
+            1,
+            "only the SLAAC address must appear; stateless DHCPv6 provides no addresses"
+        );
+    }
+
+    /// Scenario: M flag implies O — DNS from both RDNSS and DHCPv6
+    /// Given RA RDNSS provides [2001:db8::53] and a stateful DHCPv6 lease provides
+    /// [2001:db8::54], both servers appear in ipv6.dns_servers.
+    #[test]
+    fn test_build_merged_state_dns_merged_from_rdnss_and_dhcpv6_stateful() {
+        let mut ra_state = Ipv6AutoState::default();
+        ra_state.rdnss.push(RdnssEntry {
+            addresses: vec!["2001:db8::53".parse().unwrap()],
+            expires_at: far_future(),
+        });
+
+        let lease = make_test_dhcpv6_lease_stateful(
+            vec![],
+            vec!["2001:db8::54".parse().unwrap()],
+            vec![],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let dns = map
+            .get("dns_servers")
+            .expect("dns_servers must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(dns.len(), 2, "RDNSS and DHCPv6 DNS servers must both appear");
+        let dns_strs: Vec<&str> = dns.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            dns_strs.contains(&"2001:db8::53"),
+            "RDNSS DNS server 2001:db8::53 must be present"
+        );
+        assert!(
+            dns_strs.contains(&"2001:db8::54"),
+            "DHCPv6 DNS server 2001:db8::54 must be present"
+        );
+    }
+
+    /// Scenario: DNS servers from RDNSS and stateless DHCPv6 are merged.
+    #[test]
+    fn test_build_merged_state_dns_merged_from_rdnss_and_dhcpv6_stateless() {
+        let mut ra_state = Ipv6AutoState::default();
+        ra_state.rdnss.push(RdnssEntry {
+            addresses: vec!["2001:db8::53".parse().unwrap()],
+            expires_at: far_future(),
+        });
+
+        let lease = make_test_dhcpv6_lease_stateless(
+            vec!["2001:db8::54".parse().unwrap()],
+            vec![],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let dns = map
+            .get("dns_servers")
+            .expect("dns_servers must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(
+            dns.len(),
+            2,
+            "RDNSS and stateless DHCPv6 DNS servers must both appear"
+        );
+    }
+
+    /// Scenario: Duplicate DNS servers are deduplicated
+    /// Given RDNSS [2001:db8::53] and DHCPv6 [2001:db8::53, 2001:db8::54],
+    /// result is [2001:db8::53, 2001:db8::54] with no duplicates.
+    #[test]
+    fn test_build_merged_state_duplicate_dns_servers_deduplicated() {
+        let mut ra_state = Ipv6AutoState::default();
+        ra_state.rdnss.push(RdnssEntry {
+            addresses: vec!["2001:db8::53".parse().unwrap()],
+            expires_at: far_future(),
+        });
+
+        let lease = make_test_dhcpv6_lease_stateless(
+            vec!["2001:db8::53".parse().unwrap(), "2001:db8::54".parse().unwrap()],
+            vec![],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let dns = map
+            .get("dns_servers")
+            .expect("dns_servers must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(
+            dns.len(),
+            2,
+            "duplicate DNS server 2001:db8::53 must not appear twice"
+        );
+        let dns_strs: Vec<&str> = dns.iter().filter_map(|v| v.as_str()).collect();
+        assert!(dns_strs.contains(&"2001:db8::53"), "2001:db8::53 must appear once");
+        assert!(dns_strs.contains(&"2001:db8::54"), "2001:db8::54 must appear");
+    }
+
+    /// Scenario: DNS search domains are merged from DNSSL and DHCPv6 without duplicates.
+    #[test]
+    fn test_build_merged_state_dns_search_merged_and_deduplicated() {
+        let mut ra_state = Ipv6AutoState::default();
+        ra_state.dnssl.push(DnsslEntry {
+            domains: vec!["example.com".to_string()],
+            expires_at: far_future(),
+        });
+
+        let lease = make_test_dhcpv6_lease_stateless(
+            vec![],
+            vec!["example.com".to_string(), "other.example.com".to_string()],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let search = map
+            .get("dns_search")
+            .expect("dns_search must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(
+            search.len(),
+            2,
+            "duplicate search domain must not appear twice; expected [example.com, other.example.com]"
+        );
+        let search_strs: Vec<&str> = search.iter().filter_map(|v| v.as_str()).collect();
+        assert!(search_strs.contains(&"example.com"), "DNSSL domain must appear");
+        assert!(
+            search_strs.contains(&"other.example.com"),
+            "DHCPv6-only domain must appear"
+        );
+    }
+
+    /// Scenario: DHCPv6 address replaces SLAAC address when both produce the same IP.
+    /// The DHCPv6 version (server-assigned lifetimes) takes precedence.
+    #[test]
+    fn test_build_merged_state_dhcpv6_address_deduplicates_slaac_duplicate() {
+        let mut ra_state = Ipv6AutoState::default();
+        let shared_addr: Ipv6Addr = "2001:db8::a8bb:ccff:fedd:eeff".parse().unwrap();
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        ra_state.prefixes.insert(
+            net,
+            make_prefix_state(shared_addr, true, false, far_future(), far_future()),
+        );
+
+        // DHCPv6 assigns the same address with distinct server-assigned lifetimes.
+        let lease = make_test_dhcpv6_lease_stateful(
+            vec![(shared_addr, 128, 7200, 43200)],
+            vec![],
+            vec![],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let addrs = map
+            .get("addresses")
+            .expect("addresses must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(
+            addrs.len(),
+            1,
+            "duplicate address from SLAAC and DHCPv6 must appear only once"
+        );
+        let addr_map = addrs[0].as_map().unwrap();
+        let valid_lft = addr_map["valid_lft"]
+            .as_u64()
+            .expect("valid_lft must be u64");
+        assert_eq!(
+            valid_lft, 43200,
+            "DHCPv6 version of duplicate address must take precedence (valid_lft=43200)"
+        );
+    }
+
+    /// Scenario: routes come from SLAAC only (DHCPv6 does not provide routes).
+    /// Given a DHCPv6 lease alongside an active router, routes still come from RA.
+    #[test]
+    fn test_build_merged_state_routes_from_slaac_not_dhcpv6() {
+        let mut ra_state = Ipv6AutoState::default();
+        ra_state
+            .routers
+            .insert("fe80::1".parse().unwrap(), RouterState { expires_at: far_future() });
+
+        let lease = make_test_dhcpv6_lease_stateless(vec![], vec![]);
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let routes = map
+            .get("routes")
+            .expect("routes must be present from RA router")
+            .as_list()
+            .unwrap();
+        assert_eq!(routes.len(), 1, "one default route must appear from the RA router");
+        let route = routes[0].as_map().unwrap();
+        let dest = route["destination"].to_string();
+        assert!(dest.contains("::/0"), "route destination must be ::/0 (default route)");
+    }
+
+    /// Scenario: nat64_prefix from SLAAC PREF64 is preserved when DHCPv6 lease is present.
+    #[test]
+    fn test_build_merged_state_nat64_prefix_preserved_with_dhcpv6_lease() {
+        let mut ra_state = Ipv6AutoState::default();
+        let prefix: Ipv6Network = "64:ff9b::/96".parse().unwrap();
+        ra_state.pref64 = Some(Pref64Entry {
+            prefix,
+            expires_at: far_future(),
+        });
+
+        let lease =
+            make_test_dhcpv6_lease_stateless(vec!["2001:db8::53".parse().unwrap()], vec![]);
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        assert!(
+            map.get("nat64_prefix").is_some(),
+            "nat64_prefix from PREF64 must be preserved alongside a DHCPv6 lease"
+        );
+    }
+
+    /// Scenario: DHCPv6 error does not affect SLAAC state
+    /// After a DHCPv6 error the factory calls build_merged_state with None lease.
+    /// SLAAC addresses, routes, and DNS from RDNSS must remain unchanged.
+    #[test]
+    fn test_build_merged_state_slaac_state_intact_when_no_dhcpv6_lease() {
+        let mut ra_state = Ipv6AutoState::default();
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        let slaac_addr: Ipv6Addr = "2001:db8::a8bb:ccff:fedd:eeff".parse().unwrap();
+        ra_state
+            .prefixes
+            .insert(net, make_prefix_state(slaac_addr, true, false, far_future(), far_future()));
+        ra_state
+            .routers
+            .insert("fe80::1".parse().unwrap(), RouterState { expires_at: far_future() });
+        ra_state.rdnss.push(RdnssEntry {
+            addresses: vec!["2001:db8::53".parse().unwrap()],
+            expires_at: far_future(),
+        });
+
+        // None lease simulates DHCPv6 error / expiry clearing the lease.
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, None);
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        assert!(
+            map.get("addresses").is_some(),
+            "SLAAC address must remain in produced state after DHCPv6 error"
+        );
+        assert!(
+            map.get("routes").is_some(),
+            "SLAAC routes must remain in produced state after DHCPv6 error"
+        );
+        assert!(
+            map.get("dns_servers").is_some(),
+            "RDNSS dns_servers must remain in produced state after DHCPv6 error"
+        );
+    }
+
+    /// Scenario: DHCPv6 stateful lease provides addresses even with no DAD-complete SLAAC.
+    /// This covers the M-only scenario where the interface gets addresses only via DHCPv6.
+    #[test]
+    fn test_build_merged_state_dhcpv6_only_no_slaac_addresses() {
+        let ra_state = Ipv6AutoState::default(); // No SLAAC state
+        let dhcpv6_addr: Ipv6Addr = "2001:db8::200".parse().unwrap();
+        let lease = make_test_dhcpv6_lease_stateful(
+            vec![(dhcpv6_addr, 128, 14400, 86400)],
+            vec!["2001:db8::53".parse().unwrap()],
+            vec![],
+        );
+
+        let state = build_merged_state(&ra_state, "eth0", "test-policy", 100, Some(&lease));
+        let ipv6 = state.fields.get("ipv6").unwrap();
+        let map = ipv6.value.as_map().unwrap();
+        let addrs = map
+            .get("addresses")
+            .expect("DHCPv6 addresses must be present even with no SLAAC")
+            .as_list()
+            .unwrap();
+        assert_eq!(addrs.len(), 1, "one DHCPv6 address must appear");
+        let dns = map
+            .get("dns_servers")
+            .expect("dns_servers from DHCPv6 must be present")
+            .as_list()
+            .unwrap();
+        assert_eq!(dns.len(), 1, "one DHCPv6 DNS server must appear");
+    }
+
+    // ── emit_lease_event_inner with DHCPv6 lease ──────────────────────────────
+
+    /// Scenario: emit_lease_event_inner sends LeaseAcquired when DHCPv6 lease present
+    /// but no DAD-complete SLAAC addresses (M-only scenario).
+    #[tokio::test]
+    async fn test_emit_lease_event_inner_lease_acquired_with_dhcpv6_only() {
+        let ra_state = Ipv6AutoState::default(); // No SLAAC addresses
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut lease_acquired = false;
+
+        emit_lease_event_inner(
+            &ra_state,
+            &mut lease_acquired,
+            "test",
+            pending_state("eth0", "test", 100),
+            &tx,
+            true, // has_dhcpv6_lease = true
+        )
+        .await;
+
+        let event =
+            rx.try_recv().expect("LeaseAcquired must be sent when DHCPv6 lease is present");
+        assert!(
+            matches!(event, FactoryEvent::LeaseAcquired { .. }),
+            "DHCPv6 lease alone (no SLAAC DAD) must trigger LeaseAcquired"
+        );
+        assert!(lease_acquired, "lease_acquired flag must be set to true");
+    }
+
+    /// Scenario: emit_lease_event_inner sends LeaseRenewed when DHCPv6 renews
+    /// and lease_acquired is already true.
+    #[tokio::test]
+    async fn test_emit_lease_event_inner_lease_renewed_on_dhcpv6_renewal() {
+        let ra_state = Ipv6AutoState::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut lease_acquired = true; // Already acquired from a prior event
+
+        emit_lease_event_inner(
+            &ra_state,
+            &mut lease_acquired,
+            "test",
+            pending_state("eth0", "test", 100),
+            &tx,
+            true,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("LeaseRenewed must be sent on DHCPv6 renewal");
+        assert!(
+            matches!(event, FactoryEvent::LeaseRenewed { .. }),
+            "DHCPv6 renewal with lease_acquired=true must emit LeaseRenewed"
+        );
+    }
+
+    /// Scenario: emit_lease_event_inner sends LeaseExpired when DHCPv6 expires
+    /// and there is no SLAAC state (M flag cleared, no more SLAAC).
+    #[tokio::test]
+    async fn test_emit_lease_event_inner_lease_expired_when_dhcpv6_clears_with_no_slaac() {
+        let ra_state = Ipv6AutoState::default(); // No SLAAC prefixes or routers
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut lease_acquired = true; // Was previously acquired
+
+        emit_lease_event_inner(
+            &ra_state,
+            &mut lease_acquired,
+            "test",
+            pending_state("eth0", "test", 100),
+            &tx,
+            false, // has_dhcpv6_lease = false (expired)
+        )
+        .await;
+
+        let event = rx
+            .try_recv()
+            .expect("LeaseExpired must be sent when DHCPv6 clears with no SLAAC");
+        assert!(
+            matches!(event, FactoryEvent::LeaseExpired { .. }),
+            "DHCPv6 expiry with no SLAAC must emit LeaseExpired"
+        );
+        assert!(
+            !lease_acquired,
+            "lease_acquired must be reset to false on LeaseExpired"
+        );
+    }
+
+    /// Scenario: emit_lease_event_inner does not send an event before first acquisition
+    /// even with has_dhcpv6_lease=false and no SLAAC (initial state, nothing acquired yet).
+    #[tokio::test]
+    async fn test_emit_lease_event_inner_no_event_when_never_acquired_and_no_dhcpv6() {
+        let ra_state = Ipv6AutoState::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut lease_acquired = false;
+
+        emit_lease_event_inner(
+            &ra_state,
+            &mut lease_acquired,
+            "test",
+            pending_state("eth0", "test", 100),
+            &tx,
+            false,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no event must be sent when neither SLAAC nor DHCPv6 has ever acquired"
+        );
+    }
+
+    // ── manage_dhcpv6 M/O flag state machine ─────────────────────────────────
+
+    /// Scenario: No M or O flags — no DHCPv6 client is started.
+    /// manage_dhcpv6(M=0, O=0) with no existing client must leave client as None.
+    #[tokio::test]
+    async fn test_manage_dhcpv6_no_flags_does_not_start_client() {
+        let mut client: Option<Dhcpv6Client> = None;
+        let mut result_rx: Option<mpsc::Receiver<Dhcpv6Result>> = None;
+        let mut lease: Option<Dhcpv6Lease> = None;
+        let mut installed_addrs: Vec<Ipv6Addr> = Vec::new();
+
+        manage_dhcpv6(
+            false,
+            false,
+            "nonexistent-iface-for-test",
+            &mut client,
+            &mut result_rx,
+            &mut lease,
+            &mut installed_addrs,
+        )
+        .await;
+
+        assert!(client.is_none(), "M=0, O=0 must not start a DHCPv6 client");
+        assert!(
+            result_rx.is_none(),
+            "M=0, O=0 must not create a DHCPv6 result receiver"
+        );
+    }
+
+    /// Scenario: manage_dhcpv6 keeps client and result_rx coherent.
+    /// When M=1 on a nonexistent interface, the start attempt fails but client
+    /// and result_rx remain coherent (both None or both Some).
+    #[tokio::test]
+    async fn test_manage_dhcpv6_client_and_rx_always_coherent_on_m_flag() {
+        let mut client: Option<Dhcpv6Client> = None;
+        let mut result_rx: Option<mpsc::Receiver<Dhcpv6Result>> = None;
+        let mut lease: Option<Dhcpv6Lease> = None;
+        let mut installed_addrs: Vec<Ipv6Addr> = Vec::new();
+
+        // Start attempt will fail on nonexistent interface; must not panic.
+        manage_dhcpv6(
+            true,
+            false,
+            "nonexistent-iface-for-test",
+            &mut client,
+            &mut result_rx,
+            &mut lease,
+            &mut installed_addrs,
+        )
+        .await;
+
+        assert_eq!(
+            client.is_some(),
+            result_rx.is_some(),
+            "client and result_rx must always be set/unset together"
+        );
+    }
+
+    /// Scenario: O flag (stateless) — manage_dhcpv6 attempts a stateless client start.
+    /// On a nonexistent interface the start may fail; client/result_rx remain coherent.
+    #[tokio::test]
+    async fn test_manage_dhcpv6_o_flag_stateless_client_and_rx_coherent() {
+        let mut client: Option<Dhcpv6Client> = None;
+        let mut result_rx: Option<mpsc::Receiver<Dhcpv6Result>> = None;
+        let mut lease: Option<Dhcpv6Lease> = None;
+        let mut installed_addrs: Vec<Ipv6Addr> = Vec::new();
+
+        manage_dhcpv6(
+            false,
+            true,
+            "nonexistent-iface-for-test",
+            &mut client,
+            &mut result_rx,
+            &mut lease,
+            &mut installed_addrs,
+        )
+        .await;
+
+        assert_eq!(
+            client.is_some(),
+            result_rx.is_some(),
+            "client and result_rx must always be set/unset together for O flag"
+        );
+    }
+
+    /// Scenario: manage_dhcpv6 with M=0, O=0 and no running client
+    /// does not start a new client.
+    #[tokio::test]
+    async fn test_manage_dhcpv6_no_flags_no_existing_client_noop() {
+        let mut client: Option<Dhcpv6Client> = None;
+        let mut result_rx: Option<mpsc::Receiver<Dhcpv6Result>> = None;
+        let mut lease: Option<Dhcpv6Lease> = None;
+        let mut installed_addrs: Vec<Ipv6Addr> = Vec::new();
+
+        manage_dhcpv6(
+            false,
+            false,
+            "nonexistent-iface-for-test",
+            &mut client,
+            &mut result_rx,
+            &mut lease,
+            &mut installed_addrs,
+        )
+        .await;
+
+        assert!(client.is_none(), "no client must be started with M=0, O=0");
+        assert!(result_rx.is_none(), "no result_rx must be created with M=0, O=0");
+        // installed_addrs must remain empty (no addresses to remove).
+        assert!(
+            installed_addrs.is_empty(),
+            "installed_addrs must remain empty when no client ran"
         );
     }
 
