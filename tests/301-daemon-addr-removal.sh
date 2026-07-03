@@ -40,10 +40,11 @@ state:
   type: ethernet
   name: veth-addr0
   mtu: 1400
-  addresses:
-    - "10.99.0.1/24"
-    - "10.99.0.2/24"
-    - "10.99.0.3/24"
+  ipv4:
+    addresses:
+      - "10.99.0.1/24"
+      - "10.99.0.2/24"
+      - "10.99.0.3/24"
 EOF
 
 APPLY_A_EXIT=0
@@ -71,6 +72,7 @@ state:
   type: ethernet
   name: veth-addr0
   mtu: 1400
+  ipv4: {}
 EOF
 
 APPLY_B_EXIT=0

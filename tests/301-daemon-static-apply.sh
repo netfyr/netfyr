@@ -39,8 +39,9 @@ state:
   type: ethernet
   name: veth-e2e0
   mtu: 1400
-  addresses:
-    - "10.99.0.1/24"
+  ipv4:
+    addresses:
+      - "10.99.0.1/24"
 EOF
 
 APPLY_EXIT=0

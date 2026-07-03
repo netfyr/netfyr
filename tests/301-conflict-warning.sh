@@ -39,8 +39,9 @@ states:
   - type: ethernet
     name: veth-test0
     mtu: 1400
-    addresses:
-      - 10.99.0.1/24
+    ipv4:
+      addresses:
+        - 10.99.0.1/24
 EOF
 
 # Policy B: sets mtu=9000 (conflict with A at same priority 100).

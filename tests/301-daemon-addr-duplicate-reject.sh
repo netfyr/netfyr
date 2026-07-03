@@ -38,10 +38,11 @@ priority: 100
 state:
   type: ethernet
   name: veth-addr0
-  addresses:
-    - "10.99.0.1/24"
-    - "10.99.0.2/24"
-    - "10.99.0.1/24"
+  ipv4:
+    addresses:
+      - "10.99.0.1/24"
+      - "10.99.0.2/24"
+      - "10.99.0.1/24"
 EOF
 
 # The spec expects exit code 2 for a validation error; check for any non-zero.

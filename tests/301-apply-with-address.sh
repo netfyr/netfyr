@@ -28,8 +28,9 @@ cat > "$POLICY_FILE" <<'EOF'
 selector:
   name: veth-test0
 mtu: 1400
-addresses:
-  - 10.99.0.1/24
+ipv4:
+  addresses:
+    - 10.99.0.1/24
 EOF
 
 "$NETFYR_BIN" apply "$POLICY_FILE"

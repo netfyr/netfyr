@@ -37,10 +37,11 @@ priority: 100
 state:
   type: ethernet
   name: veth-addr0
-  addresses:
-    - "10.99.0.1/24"
-    - "10.99.1.1/24"
-    - "10.99.2.1/24"
+  ipv4:
+    addresses:
+      - "10.99.0.1/24"
+      - "10.99.1.1/24"
+      - "10.99.2.1/24"
 EOF
 
 APPLY_EXIT=0

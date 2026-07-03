@@ -38,11 +38,12 @@ state:
   type: ethernet
   name: veth-rt0
   enabled: true
-  addresses:
-    - "10.99.0.50/24"
-  routes:
-    - destination: "0.0.0.0/0"
-      gateway: "10.99.0.254"
+  ipv4:
+    addresses:
+      - "10.99.0.50/24"
+    routes:
+      - destination: "0.0.0.0/0"
+        gateway: "10.99.0.254"
 EOF
 
 # ── First apply ───────────────────────────────────────────────────────────────
