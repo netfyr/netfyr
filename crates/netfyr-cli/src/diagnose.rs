@@ -673,7 +673,7 @@ fn detect_dhcp_lease_lost(
                 details: vec![
                     format!("Lease expired {} (seq {})", ago, entry.seq),
                     format!("Policy: {}", policy_name),
-                    "Interface may have no addresses".to_string(),
+                    "Interface may have no ipv4 or ipv6 addresses".to_string(),
                 ],
                 suggested_actions: vec![
                     "Check DHCP server reachability".to_string(),
