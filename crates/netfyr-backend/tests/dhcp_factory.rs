@@ -609,6 +609,9 @@ async fn test_lease_expired_event_when_dhcp_server_stops() {
                 Some(FactoryEvent::LeaseAcquired { .. }) => {
                     // Factory may re-enter DORA after expiry. Continue watching.
                 }
+                Some(FactoryEvent::Ipv6AutoFlags { .. }) => {
+                    // Not expected from a DHCPv4 factory; ignore.
+                }
                 None => return false,
             }
         }

@@ -38,7 +38,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # as a transitive dep of rtnetlink 0.20; pinning here makes it a direct dep.
 netlink-sys = "0.8"
 # libc: used to set SO_RCVTIMEO on the blocking netlink socket in dump_link_names
+# and ICMP6_FILTER for the ipv6auto factory's raw ICMPv6 socket.
 libc = "0.2"
+# socket2: ICMPv6 raw socket construction for the ipv6auto factory (AF_INET6/SOCK_RAW).
+# Already in the lockfile as a transitive dep of netfyr-backend.
+socket2 = { version = "0.5", features = ["all"] }
+# ipnetwork: Ipv6Network for prefix representation in the ipv6auto factory.
+# Already in the lockfile as a transitive dep of netfyr-state.
+ipnetwork = "0.20"
+# indexmap: building Value::Map for the ipv6 sub-object in produced State.
+# Already in the lockfile as a transitive dep of netfyr-state.
+indexmap = "2"
+# futures: TryStreamExt for rtnetlink async stream iteration in ipv6auto/address.rs.
+# Already in the lockfile as a transitive dep of rtnetlink.
+futures = "0.3"
+# rtnetlink / netlink-packet-route: address management and DAD monitoring in ipv6auto.
+# Already in the lockfile as transitive deps of netfyr-backend.
+rtnetlink = "0.20"
+netlink-packet-route = "0.28"
+# rand: random transaction IDs (3 bytes) and jitter for exponential backoff in
+# the DHCPv6 client. Already in Cargo.lock as a transitive dep of netfyr-backend.
+rand = "0.9"
 
 [dev-dependencies]
 # tempfile: creates temporary directories for unit tests

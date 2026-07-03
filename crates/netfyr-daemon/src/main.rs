@@ -33,6 +33,7 @@
 
 pub mod policy_store;
 mod factory_manager;
+mod ipv6auto;
 mod netlink_monitor;
 mod reconciler;
 mod server;

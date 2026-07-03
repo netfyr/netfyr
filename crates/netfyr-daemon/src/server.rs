@@ -322,7 +322,7 @@ async fn handle_get_status(
             .into_iter()
             .map(|fs| VarlinkFactoryStatus {
                 policy_id: fs.policy_name,
-                factory_type: "dhcpv4".to_string(),
+                factory_type: fs.factory_type,
                 interface_name: fs.interface,
                 state: if fs.has_lease { "running" } else { "waiting" }.to_string(),
                 lease_ip: fs.lease_ip,
@@ -1130,6 +1130,15 @@ pub async fn serve_varlink(
                     }
                     FactoryEvent::Error { policy_name, error } => {
                         warn!(policy = %policy_name, error = %error, "DHCP factory error");
+                        continue;
+                    }
+                    FactoryEvent::Ipv6AutoFlags { policy_name, m, o } => {
+                        info!(
+                            policy = %policy_name,
+                            managed = m,
+                            other = o,
+                            "IPv6 RA M/O flags changed"
+                        );
                         continue;
                     }
                 };

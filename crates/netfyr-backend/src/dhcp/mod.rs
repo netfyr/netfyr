@@ -84,6 +84,16 @@ pub enum FactoryEvent {
         policy_name: String,
         error: String,
     },
+    /// IPv6 Router Advertisement M/O flags changed. The daemon uses these to
+    /// start or stop the DHCPv6 client (SPEC-412). Only sent when the flags
+    /// differ from the previously reported values.
+    Ipv6AutoFlags {
+        policy_name: String,
+        /// Managed Address Configuration flag: router expects DHCPv6 stateful.
+        m: bool,
+        /// Other Configuration flag: router expects DHCPv6 stateless.
+        o: bool,
+    },
 }
 
 // ── Dhcpv4Factory ─────────────────────────────────────────────────────────────

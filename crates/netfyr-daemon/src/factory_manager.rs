@@ -1,10 +1,10 @@
-//! DHCP factory lifecycle manager.
+//! Factory lifecycle manager for DHCPv4 and IPv6 SLAAC factories.
 //!
-//! `FactoryManager` owns the set of running `Dhcpv4Factory` instances and
-//! maintains a single `mpsc` channel through which all factory events flow
-//! back to the daemon event loop. The `sync` method provides idempotent
-//! convergence: call it with the current policy set after any `SubmitPolicies`
-//! request to start new factories and stop removed ones.
+//! `FactoryManager` owns the set of running `Dhcpv4Factory` and
+//! `Ipv6AutoFactory` instances and maintains a single `mpsc` channel through
+//! which all factory events flow back to the daemon event loop. The `sync`
+//! method provides idempotent convergence: call it with the current policy set
+//! after any `SubmitPolicies` request to start new factories and stop removed ones.
 
 use std::collections::HashMap;
 
@@ -14,11 +14,15 @@ use netfyr_state::State;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
+use crate::ipv6auto::Ipv6AutoFactory;
+
 // ── FactoryStatus ─────────────────────────────────────────────────────────────
 
 /// Status of a single running factory, used for `GetStatus` responses.
 pub struct FactoryStatus {
     pub policy_name: String,
+    /// Factory type string: `"dhcpv4"` or `"ipv6auto"`.
+    pub factory_type: String,
     pub interface: String,
     pub has_lease: bool,
     /// The acquired IP address (without prefix length), if a lease is active.
@@ -33,13 +37,15 @@ pub struct FactoryStatus {
 
 // ── FactoryManager ────────────────────────────────────────────────────────────
 
-/// Manages the lifecycle of all DHCPv4 factories.
+/// Manages the lifecycle of DHCPv4 and IPv6 SLAAC factories.
 ///
 /// Factories are keyed by policy name. A single `mpsc` channel aggregates
 /// events from all factories into the daemon's event loop via `next_event`.
 pub struct FactoryManager {
-    /// Running factories, keyed by policy name.
+    /// Running DHCPv4 factories, keyed by policy name.
     factories: HashMap<String, Dhcpv4Factory>,
+    /// Running IPv6 SLAAC factories, keyed by policy name.
+    ipv6auto_factories: HashMap<String, Ipv6AutoFactory>,
     /// Sender cloned into each factory on start.
     event_tx: mpsc::Sender<FactoryEvent>,
     /// Receiver polled by the daemon event loop.
@@ -52,6 +58,7 @@ impl FactoryManager {
         let (event_tx, event_rx) = mpsc::channel(64);
         Self {
             factories: HashMap::new(),
+            ipv6auto_factories: HashMap::new(),
             event_tx,
             event_rx,
         }
@@ -68,22 +75,23 @@ impl FactoryManager {
     /// caller can include them in error reporting). Individual failures do not
     /// abort the sync — other policies are still processed.
     pub async fn sync(&mut self, policies: &[Policy]) -> anyhow::Result<Vec<String>> {
-        // Build the desired set: policy_name → Policy for all DHCPv4 policies.
-        let desired: HashMap<String, &Policy> = policies
+        let mut failed = Vec::new();
+
+        // ── DHCPv4 factories ──────────────────────────────────────────────────
+
+        let desired_dhcp: HashMap<String, &Policy> = policies
             .iter()
             .filter(|p| p.factory_type == FactoryType::Dhcpv4)
             .map(|p| (p.name.clone(), p))
             .collect();
 
-        // ── Stop removed factories ────────────────────────────────────────────
-        let to_stop: Vec<String> = self
+        let to_stop_dhcp: Vec<String> = self
             .factories
             .keys()
-            .filter(|name| !desired.contains_key(*name))
+            .filter(|name| !desired_dhcp.contains_key(*name))
             .cloned()
             .collect();
-
-        for name in to_stop {
+        for name in to_stop_dhcp {
             if let Some(mut factory) = self.factories.remove(&name) {
                 if let Err(e) = factory.stop().await {
                     warn!(policy = %name, error = %e, "Failed to stop DHCP factory");
@@ -91,21 +99,11 @@ impl FactoryManager {
             }
         }
 
-        // ── Start new factories ───────────────────────────────────────────────
-        let mut failed = Vec::new();
-
-        for (name, policy) in &desired {
+        for (name, policy) in &desired_dhcp {
             if self.factories.contains_key(name.as_str()) {
-                // Already running — leave it alone.
                 continue;
             }
-
-            // Extract the interface name from the selector's name field.
-            let interface = match policy
-                .selector
-                .as_ref()
-                .and_then(|s| s.name.as_deref())
-            {
+            let interface = match policy.selector.as_ref().and_then(|s| s.name.as_deref()) {
                 Some(iface) => iface.to_string(),
                 None => {
                     warn!(
@@ -116,14 +114,6 @@ impl FactoryManager {
                     continue;
                 }
             };
-
-            // Validate that the interface exists before spawning the factory.
-            // Dhcpv4Factory::start() always succeeds (it spawns a background
-            // task), so we must pre-check here to give the caller a synchronous
-            // error signal for nonexistent interfaces.
-            // Use rtnetlink (via netfyr_backend::interface_exists) rather than
-            // /sys/class/net/ because sysfs is not network-namespace-aware in
-            // all environments (e.g., containers, unshare --user --net).
             if !netfyr_backend::interface_exists(&interface).await {
                 error!(
                     policy = %name,
@@ -133,7 +123,6 @@ impl FactoryManager {
                 failed.push(name.clone());
                 continue;
             }
-
             match Dhcpv4Factory::start(
                 &interface,
                 name.clone(),
@@ -157,34 +146,120 @@ impl FactoryManager {
             }
         }
 
+        // ── IPv6Auto factories ────────────────────────────────────────────────
+
+        let desired_ipv6auto: HashMap<String, &Policy> = policies
+            .iter()
+            .filter(|p| p.factory_type == FactoryType::Ipv6Auto)
+            .map(|p| (p.name.clone(), p))
+            .collect();
+
+        let to_stop_ipv6auto: Vec<String> = self
+            .ipv6auto_factories
+            .keys()
+            .filter(|name| !desired_ipv6auto.contains_key(*name))
+            .cloned()
+            .collect();
+        for name in to_stop_ipv6auto {
+            if let Some(mut factory) = self.ipv6auto_factories.remove(&name) {
+                if let Err(e) = factory.stop().await {
+                    warn!(policy = %name, error = %e, "Failed to stop IPv6Auto factory");
+                }
+            }
+        }
+
+        for (name, policy) in &desired_ipv6auto {
+            if self.ipv6auto_factories.contains_key(name.as_str()) {
+                continue;
+            }
+            let interface = match policy.selector.as_ref().and_then(|s| s.name.as_deref()) {
+                Some(iface) => iface.to_string(),
+                None => {
+                    warn!(
+                        policy = %name,
+                        "Ipv6Auto policy has no interface name in selector; skipping factory start"
+                    );
+                    failed.push(name.clone());
+                    continue;
+                }
+            };
+            if !netfyr_backend::interface_exists(&interface).await {
+                error!(
+                    policy = %name,
+                    interface = %interface,
+                    "Interface does not exist; cannot start IPv6Auto factory"
+                );
+                failed.push(name.clone());
+                continue;
+            }
+            match Ipv6AutoFactory::start(
+                &interface,
+                name.clone(),
+                policy.priority,
+                self.event_tx.clone(),
+            )
+            .await
+            {
+                Ok(factory) => {
+                    self.ipv6auto_factories.insert(name.clone(), factory);
+                }
+                Err(e) => {
+                    error!(
+                        policy = %name,
+                        interface = %interface,
+                        error = %e,
+                        "Failed to start IPv6Auto factory"
+                    );
+                    failed.push(name.clone());
+                }
+            }
+        }
+
         Ok(failed)
     }
 
-    /// Returns the current lease state produced by all active factories.
+    /// Returns the current state produced by all active factories.
     ///
-    /// Factories that have not yet acquired a lease (i.e., `current_state()`
+    /// Factories that have not yet produced a state (i.e., `current_state()`
     /// returns `None`) are omitted.
     pub fn produced_states(&self) -> Vec<(String, State)> {
-        self.factories
+        let mut result: Vec<(String, State)> = self
+            .factories
             .iter()
             .filter_map(|(name, factory)| {
                 factory.current_state().map(|state| (name.clone(), state))
             })
-            .collect()
+            .collect();
+        result.extend(self.ipv6auto_factories.iter().filter_map(|(name, factory)| {
+            factory.current_state().map(|state| (name.clone(), state))
+        }));
+        result
     }
 
     /// Stops all running factories. Called on daemon shutdown.
     ///
     /// Individual stop failures are logged but do not abort the loop.
     pub async fn stop_all(&mut self) -> anyhow::Result<()> {
-        let names: Vec<String> = self.factories.keys().cloned().collect();
-        for name in names {
+        let dhcp_names: Vec<String> = self.factories.keys().cloned().collect();
+        for name in dhcp_names {
             if let Some(mut factory) = self.factories.remove(&name) {
                 if let Err(e) = factory.stop().await {
                     warn!(
                         policy = %name,
                         error = %e,
                         "Failed to stop DHCP factory during shutdown"
+                    );
+                }
+            }
+        }
+        let ipv6_names: Vec<String> = self.ipv6auto_factories.keys().cloned().collect();
+        for name in ipv6_names {
+            if let Some(mut factory) = self.ipv6auto_factories.remove(&name) {
+                if let Err(e) = factory.stop().await {
+                    warn!(
+                        policy = %name,
+                        error = %e,
+                        "Failed to stop IPv6Auto factory during shutdown"
                     );
                 }
             }
@@ -204,7 +279,8 @@ impl FactoryManager {
 
     /// Returns status information for each running factory, for `GetStatus`.
     pub fn factory_statuses(&self) -> Vec<FactoryStatus> {
-        self.factories
+        let mut result: Vec<FactoryStatus> = self
+            .factories
             .iter()
             .map(|(name, factory)| {
                 let current = factory.current_state();
@@ -215,8 +291,6 @@ impl FactoryManager {
                     .as_ref()
                     .is_some_and(|s| s.fields.contains_key("addresses"));
                 // Extract the bare IP (without /prefix) from the "addresses" field.
-                // Each address entry is a Value::Map with "address", "valid_lft",
-                // "preferred_lft" keys; Value::IpNetwork::Display yields "ip/prefix".
                 let lease_ip = current.as_ref().and_then(|s| {
                     let addr_val = s
                         .fields
@@ -227,10 +301,8 @@ impl FactoryManager {
                         .as_map()?
                         .get("address")?;
                     let addr_str = addr_val.to_string();
-                    // "10.0.1.50/24" → "10.0.1.50"
                     Some(addr_str.split('/').next().unwrap_or(&addr_str).to_string())
                 });
-                // Extract full CIDR address from the "addresses" field.
                 let lease_address = current.and_then(|s| {
                     let addr_val = s
                         .fields
@@ -242,7 +314,6 @@ impl FactoryManager {
                         .get("address")?;
                     Some(addr_val.to_string())
                 });
-                // Read lease timing and compute remaining seconds.
                 let timing: Option<LeaseTimingInfo> = factory.lease_timing();
                 let (lease_time_secs, lease_remaining_secs) = match timing {
                     Some(info) => {
@@ -254,6 +325,7 @@ impl FactoryManager {
                 };
                 FactoryStatus {
                     policy_name: name.clone(),
+                    factory_type: "dhcpv4".to_string(),
                     interface: factory.interface().to_string(),
                     has_lease,
                     lease_ip,
@@ -262,7 +334,34 @@ impl FactoryManager {
                     lease_remaining_secs,
                 }
             })
-            .collect()
+            .collect();
+
+        // IPv6Auto factories: no lease concept — has_lease reflects whether
+        // at least one SLAAC address has been configured.
+        result.extend(self.ipv6auto_factories.iter().map(|(name, factory)| {
+            let current = factory.current_state();
+            let has_lease = current.as_ref().is_some_and(|s| {
+                s.fields
+                    .get("ipv6")
+                    .and_then(|fv| fv.value.as_map())
+                    .and_then(|m| m.get("addresses"))
+                    .and_then(|v| v.as_list())
+                    .map(|l| !l.is_empty())
+                    .unwrap_or(false)
+            });
+            FactoryStatus {
+                policy_name: name.clone(),
+                factory_type: "ipv6auto".to_string(),
+                interface: factory.interface().to_string(),
+                has_lease,
+                lease_ip: None,
+                lease_address: None,
+                lease_time_secs: None,
+                lease_remaining_secs: None,
+            }
+        }));
+
+        result
     }
 }
 
