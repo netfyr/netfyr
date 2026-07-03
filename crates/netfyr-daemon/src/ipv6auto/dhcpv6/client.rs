@@ -1329,6 +1329,543 @@ mod tests {
         assert!(decoded.is_empty(), "truncated option must be silently dropped");
     }
 
+    // ── parse_reply_from_options ──────────────────────────────────────────────
+
+    // Scenario: parse_reply_from_options assembles all stateful fields correctly
+    #[test]
+    fn test_parse_reply_from_options_stateful_assembles_all_fields() {
+        let dns: Ipv6Addr = "2001:db8::53".parse().unwrap();
+        let ia_addr = Dhcpv6Address {
+            address: "2001:db8::100".parse().unwrap(),
+            prefix_len: 128,
+            preferred_lft: 14400,
+            valid_lft: 86400,
+        };
+        let server_duid = vec![
+            0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let server_src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let options = vec![
+            Dhcpv6Option::ServerId(server_duid.clone()),
+            Dhcpv6Option::IaNa {
+                iaid: 1,
+                t1: 3600,
+                t2: 5760,
+                addresses: vec![ia_addr],
+            },
+            Dhcpv6Option::DnsServers(vec![dns]),
+            Dhcpv6Option::DnsSearchList(vec!["example.com".to_string()]),
+        ];
+
+        let reply = parse_reply_from_options(options, server_src)
+            .expect("parse_reply_from_options must succeed for valid stateful options");
+
+        assert_eq!(reply.server_duid, server_duid, "server_duid must match");
+        assert_eq!(reply.server_addr, server_src, "server_addr must be set from src_ip");
+        assert_eq!(reply.addresses.len(), 1, "must have one IA_NA address");
+        assert_eq!(
+            reply.addresses[0].address,
+            "2001:db8::100".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(reply.dns_servers, vec![dns], "dns_servers must match");
+        assert_eq!(reply.dns_search, vec!["example.com"], "dns_search must match");
+        assert_eq!(reply.t1, 3600, "t1 must match IA_NA t1");
+        assert_eq!(reply.t2, 5760, "t2 must match IA_NA t2");
+        assert_eq!(reply.info_refresh_time, None, "stateful reply has no info_refresh_time");
+    }
+
+    // Scenario: parse_reply_from_options stateless — no addresses, has info_refresh_time
+    #[test]
+    fn test_parse_reply_from_options_stateless_no_addresses_with_info_refresh() {
+        let dns: Ipv6Addr = "2001:db8::53".parse().unwrap();
+        let server_src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let options = vec![
+            Dhcpv6Option::ServerId(vec![
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00,
+            ]),
+            Dhcpv6Option::DnsServers(vec![dns]),
+            Dhcpv6Option::DnsSearchList(vec!["example.com".to_string()]),
+            Dhcpv6Option::InfoRefreshTime(900),
+        ];
+
+        let reply = parse_reply_from_options(options, server_src)
+            .expect("parse_reply_from_options must succeed for valid stateless options");
+
+        assert!(
+            reply.addresses.is_empty(),
+            "stateless reply must have no addresses (no IA_NA option)"
+        );
+        assert_eq!(reply.dns_servers, vec![dns], "dns_servers must be captured");
+        assert_eq!(reply.dns_search, vec!["example.com"], "dns_search must be captured");
+        assert_eq!(
+            reply.info_refresh_time,
+            Some(900),
+            "info_refresh_time must be captured from option 32"
+        );
+    }
+
+    // Scenario: parse_reply_from_options with multiple addresses in IA_NA
+    #[test]
+    fn test_parse_reply_from_options_multiple_addresses_in_ia_na() {
+        let addr1 = Dhcpv6Address {
+            address: "2001:db8::100".parse().unwrap(),
+            prefix_len: 128,
+            preferred_lft: 14400,
+            valid_lft: 86400,
+        };
+        let addr2 = Dhcpv6Address {
+            address: "2001:db8::200".parse().unwrap(),
+            prefix_len: 128,
+            preferred_lft: 7200,
+            valid_lft: 43200,
+        };
+        let server_src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let options = vec![Dhcpv6Option::IaNa {
+            iaid: 1,
+            t1: 1800,
+            t2: 2880,
+            addresses: vec![addr1, addr2],
+        }];
+
+        let reply = parse_reply_from_options(options, server_src).unwrap();
+
+        assert_eq!(
+            reply.addresses.len(),
+            2,
+            "parse_reply_from_options must collect all IA_NA addresses"
+        );
+        assert_eq!(
+            reply.addresses[0].address,
+            "2001:db8::100".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(
+            reply.addresses[1].address,
+            "2001:db8::200".parse::<Ipv6Addr>().unwrap()
+        );
+    }
+
+    // ── build_lease_from_reply ────────────────────────────────────────────────
+
+    // Scenario: build_lease_from_reply produces a correct stateful lease
+    #[test]
+    fn test_build_lease_from_reply_stateful_correct_lease() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let ia_addr = Dhcpv6Address {
+            address: "2001:db8::100".parse().unwrap(),
+            prefix_len: 128,
+            preferred_lft: 14400,
+            valid_lft: 86400,
+        };
+        let reply = super::ParsedReply {
+            server_duid: vec![0x00, 0x01],
+            server_addr,
+            addresses: vec![ia_addr],
+            dns_servers: vec!["2001:db8::53".parse().unwrap()],
+            dns_search: vec!["example.com".to_string()],
+            t1: 7200,
+            t2: 11520,
+            info_refresh_time: None,
+        };
+
+        let lease = build_lease_from_reply(reply, server_addr)
+            .expect("build_lease_from_reply must succeed when addresses are present");
+
+        assert_eq!(lease.addresses.len(), 1, "stateful lease must have one address");
+        assert_eq!(
+            lease.addresses[0].address,
+            "2001:db8::100".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(lease.addresses[0].preferred_lft, 14400);
+        assert_eq!(lease.addresses[0].valid_lft, 86400);
+        assert_eq!(
+            lease.dns_servers,
+            vec!["2001:db8::53".parse::<Ipv6Addr>().unwrap()]
+        );
+        assert_eq!(lease.dns_search, vec!["example.com"]);
+        assert_eq!(lease.t1, 7200, "t1 must match");
+        assert_eq!(lease.t2, 11520, "t2 must match");
+        assert_eq!(lease.server_addr, server_addr, "server_addr must match");
+        assert!(lease.info_refresh_time.is_none(), "stateful lease has no info_refresh_time");
+    }
+
+    // Scenario: build_lease_from_reply fails when server reply has no IA_NA addresses
+    #[test]
+    fn test_build_lease_from_reply_fails_when_no_addresses() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let reply = super::ParsedReply {
+            server_duid: vec![],
+            server_addr,
+            addresses: vec![],
+            dns_servers: vec![],
+            dns_search: vec![],
+            t1: 0,
+            t2: 0,
+            info_refresh_time: None,
+        };
+
+        let result = build_lease_from_reply(reply, server_addr);
+        assert!(
+            result.is_err(),
+            "build_lease_from_reply must fail when no addresses are present"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no IA_NA addresses"),
+            "error message must mention 'no IA_NA addresses', got: {err}"
+        );
+    }
+
+    // Scenario: build_lease_from_reply uses compute_t1_t2 when t1/t2 are 0 (server omits them)
+    #[test]
+    fn test_build_lease_from_reply_computes_t1_t2_when_server_sends_zero() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let ia_addr = Dhcpv6Address {
+            address: "2001:db8::100".parse().unwrap(),
+            prefix_len: 128,
+            preferred_lft: 14400,
+            valid_lft: 86400,
+        };
+        let reply = super::ParsedReply {
+            server_duid: vec![0x00, 0x01],
+            server_addr,
+            addresses: vec![ia_addr],
+            dns_servers: vec![],
+            dns_search: vec![],
+            t1: 0, // server sends 0 → compute 50% of preferred_lft = 7200
+            t2: 0, // server sends 0 → compute 80% of preferred_lft = 11520
+            info_refresh_time: None,
+        };
+
+        let lease = build_lease_from_reply(reply, server_addr).unwrap();
+
+        assert_eq!(
+            lease.t1, 7200,
+            "t1 must be computed as 50% of preferred_lft (14400/2=7200) when server sends 0"
+        );
+        assert_eq!(
+            lease.t2, 11520,
+            "t2 must be computed as 80% of preferred_lft (14400*4/5=11520) when server sends 0"
+        );
+    }
+
+    // ── build_stateless_lease_from_reply ─────────────────────────────────────
+
+    // Scenario: Stateless lease has no addresses
+    #[test]
+    fn test_build_stateless_lease_from_reply_has_no_addresses() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let reply = super::ParsedReply {
+            server_duid: vec![0x00, 0x01],
+            server_addr,
+            addresses: vec![],
+            dns_servers: vec!["2001:db8::53".parse().unwrap()],
+            dns_search: vec!["example.com".to_string()],
+            t1: 0,
+            t2: 0,
+            info_refresh_time: Some(900),
+        };
+
+        let lease = build_stateless_lease_from_reply(reply)
+            .expect("build_stateless_lease_from_reply must succeed");
+
+        assert!(
+            lease.addresses.is_empty(),
+            "stateless lease must NOT contain addresses (AC: 'does NOT contain addresses')"
+        );
+        assert_eq!(lease.t1, 0, "stateless lease t1 must be 0");
+        assert_eq!(lease.t2, 0, "stateless lease t2 must be 0");
+    }
+
+    // Scenario: Stateless lease captures dns_servers and dns_search
+    #[test]
+    fn test_build_stateless_lease_from_reply_captures_dns_options() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dns: Ipv6Addr = "2001:db8::53".parse().unwrap();
+        let reply = super::ParsedReply {
+            server_duid: vec![0x00, 0x01],
+            server_addr,
+            addresses: vec![],
+            dns_servers: vec![dns],
+            dns_search: vec!["example.com".to_string()],
+            t1: 0,
+            t2: 0,
+            info_refresh_time: Some(1800),
+        };
+
+        let lease = build_stateless_lease_from_reply(reply).unwrap();
+
+        assert_eq!(lease.dns_servers, vec![dns], "stateless lease must capture dns_servers");
+        assert_eq!(
+            lease.dns_search,
+            vec!["example.com"],
+            "stateless lease must capture dns_search"
+        );
+    }
+
+    // Scenario: Stateless lease stores info_refresh_time for scheduling refreshes
+    #[test]
+    fn test_build_stateless_lease_from_reply_stores_info_refresh_time() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let reply = super::ParsedReply {
+            server_duid: vec![0x00, 0x01],
+            server_addr,
+            addresses: vec![],
+            dns_servers: vec![],
+            dns_search: vec![],
+            t1: 0,
+            t2: 0,
+            info_refresh_time: Some(3600),
+        };
+
+        let lease = build_stateless_lease_from_reply(reply).unwrap();
+
+        assert_eq!(
+            lease.info_refresh_time,
+            Some(3600),
+            "stateless lease must preserve info_refresh_time for scheduling periodic refreshes"
+        );
+    }
+
+    // Scenario: Stateless lease with None info_refresh_time (server did not send option 32)
+    #[test]
+    fn test_build_stateless_lease_from_reply_none_info_refresh_time() {
+        let server_addr: Ipv6Addr = "fe80::1".parse().unwrap();
+        let reply = super::ParsedReply {
+            server_duid: vec![],
+            server_addr,
+            addresses: vec![],
+            dns_servers: vec![],
+            dns_search: vec![],
+            t1: 0,
+            t2: 0,
+            info_refresh_time: None,
+        };
+
+        let lease = build_stateless_lease_from_reply(reply).unwrap();
+
+        assert_eq!(
+            lease.info_refresh_time, None,
+            "when server omits option 32, info_refresh_time must be None (caller uses default 1800s)"
+        );
+    }
+
+    // ── Message type structure validation ─────────────────────────────────────
+
+    // Scenario: Solicit message has correct type byte (MSG_SOLICIT = 1)
+    #[test]
+    fn test_solicit_message_type_byte_is_one() {
+        let msg = encode_message(MSG_SOLICIT, [0xAA, 0xBB, 0xCC], &[]);
+        assert_eq!(msg[0], 1u8, "Solicit message type must be 1 (MSG_SOLICIT)");
+        assert_eq!(msg[0], MSG_SOLICIT, "first byte must equal MSG_SOLICIT constant");
+    }
+
+    // Scenario: Solicit message includes IA_NA option with no addresses (RFC 8415 §18.2.2)
+    #[test]
+    fn test_solicit_message_ia_na_has_no_addresses() {
+        let duid_bytes = vec![
+            0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let options = vec![
+            Dhcpv6Option::ClientId(duid_bytes.clone()),
+            Dhcpv6Option::IaNa { iaid: 1, t1: 0, t2: 0, addresses: vec![] },
+            Dhcpv6Option::OptionRequest(vec![OPT_DNS_SERVERS, OPT_DNS_SEARCH]),
+            Dhcpv6Option::ElapsedTime(0),
+        ];
+        let msg = encode_message(MSG_SOLICIT, [0x01, 0x02, 0x03], &options);
+        assert_eq!(msg[0], MSG_SOLICIT, "Solicit must start with MSG_SOLICIT type byte");
+
+        let decoded = decode_options(&msg[4..]);
+        let ia_na_empty = decoded.iter().any(|o| {
+            matches!(o, Dhcpv6Option::IaNa { addresses, .. } if addresses.is_empty())
+        });
+        assert!(
+            ia_na_empty,
+            "Solicit IA_NA must have no addresses (Solicit is a request, not an assignment)"
+        );
+    }
+
+    // Scenario: Solicit message includes ClientId option
+    #[test]
+    fn test_solicit_message_includes_client_id() {
+        let duid_bytes = vec![
+            0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let options = vec![
+            Dhcpv6Option::ClientId(duid_bytes.clone()),
+            Dhcpv6Option::IaNa { iaid: 1, t1: 0, t2: 0, addresses: vec![] },
+            Dhcpv6Option::OptionRequest(vec![OPT_DNS_SERVERS, OPT_DNS_SEARCH]),
+            Dhcpv6Option::ElapsedTime(0),
+        ];
+        let msg = encode_message(MSG_SOLICIT, [0x01, 0x02, 0x03], &options);
+        let decoded = decode_options(&msg[4..]);
+
+        let has_client_id = decoded.iter().any(|o| {
+            matches!(o, Dhcpv6Option::ClientId(d) if d == &duid_bytes)
+        });
+        assert!(has_client_id, "Solicit must include ClientId option with the client DUID");
+    }
+
+    // Scenario: Information-Request does NOT include an IA_NA option (stateless mode, RFC 8415 §6.1)
+    #[test]
+    fn test_information_request_has_no_ia_na_option() {
+        let duid_bytes = vec![
+            0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        // This is what send_information_request encodes
+        let options = vec![
+            Dhcpv6Option::ClientId(duid_bytes.clone()),
+            Dhcpv6Option::OptionRequest(vec![OPT_DNS_SERVERS, OPT_DNS_SEARCH, OPT_INFO_REFRESH_TIME]),
+            Dhcpv6Option::ElapsedTime(0),
+        ];
+        let msg = encode_message(MSG_INFORMATION_REQUEST, [0x01, 0x02, 0x03], &options);
+
+        assert_eq!(
+            msg[0], MSG_INFORMATION_REQUEST,
+            "Information-Request must have correct type byte ({MSG_INFORMATION_REQUEST})"
+        );
+
+        let decoded = decode_options(&msg[4..]);
+        let has_ia_na = decoded.iter().any(|o| matches!(o, Dhcpv6Option::IaNa { .. }));
+        assert!(
+            !has_ia_na,
+            "Information-Request must NOT include an IA_NA option (stateless mode acquires options only)"
+        );
+
+        let has_client_id = decoded.iter().any(|o| matches!(o, Dhcpv6Option::ClientId(_)));
+        let has_elapsed_time = decoded.iter().any(|o| matches!(o, Dhcpv6Option::ElapsedTime(_)));
+        assert!(has_client_id, "Information-Request must include ClientId");
+        assert!(has_elapsed_time, "Information-Request must include ElapsedTime");
+    }
+
+    // Scenario: Information-Request OptionRequest includes InfoRefreshTime code (opt 32)
+    //           so the server knows to send option 32 in its Reply
+    #[test]
+    fn test_information_request_option_request_includes_info_refresh_time() {
+        // Verify the Option Request codes for Information-Request (stateless)
+        // must include OPT_INFO_REFRESH_TIME (32)
+        let options = vec![Dhcpv6Option::OptionRequest(vec![
+            OPT_DNS_SERVERS,
+            OPT_DNS_SEARCH,
+            OPT_INFO_REFRESH_TIME,
+        ])];
+        let msg = encode_message(MSG_INFORMATION_REQUEST, [0, 0, 0], &options);
+
+        // OptionRequest is encoded with code 6 (OPT_OPTION_REQUEST) and decoded
+        // as Unknown since the client doesn't need to decode its own ORO.
+        // We verify the raw bytes contain the option codes we set.
+        let raw_options = &msg[4..];
+        assert!(
+            raw_options.len() >= 4 + 6, // 4-byte TLV header + 3×2-byte codes
+            "OptionRequest for stateless mode must encode all three option codes"
+        );
+
+        // Verify OPT_INFO_REFRESH_TIME (32 = 0x0020) is in the OptionRequest payload.
+        let has_info_refresh_code = raw_options.windows(2).any(|w| {
+            u16::from_be_bytes([w[0], w[1]]) == OPT_INFO_REFRESH_TIME
+        });
+        assert!(
+            has_info_refresh_code,
+            "Information-Request OptionRequest must include InfoRefreshTime code (32) so the \
+             server sends option 32 in its Reply (used by client to schedule refreshes)"
+        );
+    }
+
+    // Scenario: Request message includes ServerId (targeting a specific server)
+    #[test]
+    fn test_request_message_includes_server_id() {
+        let server_duid = vec![
+            0x00, 0x01, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ];
+        let client_duid = vec![
+            0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        // This is what send_request encodes (ServerId is mandatory in Request per RFC 8415)
+        let options = vec![
+            Dhcpv6Option::ClientId(client_duid.clone()),
+            Dhcpv6Option::ServerId(server_duid.clone()),
+            Dhcpv6Option::IaNa { iaid: 1, t1: 0, t2: 0, addresses: vec![] },
+            Dhcpv6Option::OptionRequest(vec![OPT_DNS_SERVERS, OPT_DNS_SEARCH]),
+            Dhcpv6Option::ElapsedTime(0),
+        ];
+        let msg = encode_message(MSG_REQUEST, [0x01, 0x02, 0x03], &options);
+
+        assert_eq!(
+            msg[0], MSG_REQUEST,
+            "Request message must have correct type byte ({MSG_REQUEST})"
+        );
+
+        let decoded = decode_options(&msg[4..]);
+        let has_server_id = decoded.iter().any(|o| {
+            matches!(o, Dhcpv6Option::ServerId(d) if d == &server_duid)
+        });
+        assert!(
+            has_server_id,
+            "Request must include ServerId to target the chosen server (RFC 8415 §18.2.4)"
+        );
+
+        let has_client_id = decoded.iter().any(|o| matches!(o, Dhcpv6Option::ClientId(_)));
+        let has_ia_na = decoded.iter().any(|o| matches!(o, Dhcpv6Option::IaNa { .. }));
+        assert!(has_client_id, "Request must include ClientId");
+        assert!(has_ia_na, "Request must include IaNa");
+    }
+
+    // Scenario: Release message includes ServerId (unicast to server)
+    #[test]
+    fn test_release_message_includes_server_id_and_ia_na() {
+        let server_duid = vec![
+            0x00, 0x01, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ];
+        let client_duid = vec![
+            0x00, 0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let ia_addr = Dhcpv6Address {
+            address: "2001:db8::100".parse().unwrap(),
+            prefix_len: 128,
+            preferred_lft: 14400,
+            valid_lft: 86400,
+        };
+        let options = vec![
+            Dhcpv6Option::ClientId(client_duid.clone()),
+            Dhcpv6Option::ServerId(server_duid.clone()),
+            Dhcpv6Option::IaNa { iaid: 1, t1: 0, t2: 0, addresses: vec![ia_addr] },
+            Dhcpv6Option::ElapsedTime(0),
+        ];
+        let msg = encode_message(MSG_RELEASE, [0xAA, 0xBB, 0xCC], &options);
+
+        assert_eq!(msg[0], MSG_RELEASE, "Release must have MSG_RELEASE type byte");
+
+        let decoded = decode_options(&msg[4..]);
+        let has_server_id = decoded.iter().any(|o| {
+            matches!(o, Dhcpv6Option::ServerId(d) if d == &server_duid)
+        });
+        assert!(
+            has_server_id,
+            "Release must include ServerId so the server knows which server's lease to release"
+        );
+        let has_ia_na = decoded.iter().any(|o| {
+            matches!(o, Dhcpv6Option::IaNa { addresses, .. } if !addresses.is_empty())
+        });
+        assert!(
+            has_ia_na,
+            "Release must include IA_NA with the address being released (RFC 8415 §18.2.7)"
+        );
+    }
+
+    // Scenario: Renew message type byte is MSG_RENEW (5)
+    #[test]
+    fn test_renew_message_type_byte_is_five() {
+        let msg = encode_message(MSG_RENEW, [0, 0, 0], &[]);
+        assert_eq!(msg[0], 5u8, "Renew message type must be 5 (MSG_RENEW)");
+    }
+
+    // Scenario: Rebind message type byte is MSG_REBIND (6)
+    #[test]
+    fn test_rebind_message_type_byte_is_six() {
+        let msg = encode_message(MSG_REBIND, [0, 0, 0], &[]);
+        assert_eq!(msg[0], 6u8, "Rebind message type must be 6 (MSG_REBIND)");
+    }
+
     // ── Multi-option messages ─────────────────────────────────────────────────
 
     // Scenario: A Reply message with ClientId, ServerId, IA_NA, and DnsServers
