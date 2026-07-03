@@ -117,11 +117,28 @@ struct Ipv6AutoState {
 
 // ── Public factory struct ─────────────────────────────────────────────────────
 
+/// DHCPv6 activity and lease timing, exposed via `Ipv6AutoFactory::dhcpv6_info()`.
+///
+/// Updated by the background task whenever the DHCPv6 client starts, stops,
+/// acquires a lease, or the lease expires.
+#[derive(Clone, Default)]
+pub struct Dhcpv6StatusInfo {
+    /// `true` when a DHCPv6 client is running (M or O flag seen from an RA).
+    pub active: bool,
+    /// Total lease duration in seconds: min `valid_lft` for stateful leases,
+    /// `info_refresh_time` (default 1800) for stateless leases.
+    pub lease_time_secs: Option<u32>,
+    /// When the current lease was acquired (for computing remaining time).
+    pub acquired_at: Option<std::time::Instant>,
+}
+
 /// Manages the lifecycle of a userspace IPv6 SLAAC process for one interface.
 pub struct Ipv6AutoFactory {
     interface: String,
     /// Latest produced `State`, updated by the background task on every RA.
     state: Arc<Mutex<Option<State>>>,
+    /// DHCPv6 status shared with the background task.
+    dhcpv6_info: Arc<Mutex<Dhcpv6StatusInfo>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -150,6 +167,9 @@ impl Ipv6AutoFactory {
 
         let task_interface = interface.to_string();
         let task_state_arc = Arc::clone(&state_arc);
+        let dhcpv6_info_arc: Arc<Mutex<Dhcpv6StatusInfo>> =
+            Arc::new(Mutex::new(Dhcpv6StatusInfo::default()));
+        let task_dhcpv6_info_arc = Arc::clone(&dhcpv6_info_arc);
 
         let handle = tokio::spawn(async move {
             run_ipv6auto(
@@ -159,6 +179,7 @@ impl Ipv6AutoFactory {
                 task_state_arc,
                 event_tx,
                 stop_rx,
+                task_dhcpv6_info_arc,
             )
             .await;
         });
@@ -166,6 +187,7 @@ impl Ipv6AutoFactory {
         Ok(Self {
             interface: interface.to_string(),
             state: state_arc,
+            dhcpv6_info: dhcpv6_info_arc,
             stop_tx: Some(stop_tx),
             task_handle: Some(handle),
         })
@@ -187,6 +209,11 @@ impl Ipv6AutoFactory {
         self.state.lock().unwrap().clone()
     }
 
+    /// Return a snapshot of the current DHCPv6 status.
+    pub fn dhcpv6_info(&self) -> Dhcpv6StatusInfo {
+        self.dhcpv6_info.lock().unwrap().clone()
+    }
+
     /// Return the network interface name this factory manages.
     pub fn interface(&self) -> &str {
         &self.interface
@@ -197,6 +224,18 @@ impl Ipv6AutoFactory {
 
 /// Main event loop: startup, RA reception, lifetime expiry, DAD monitoring,
 /// RS retry with exponential backoff, stop signal.
+/// Compute the representative lease duration in seconds from a DHCPv6 lease.
+///
+/// Stateful: shortest `valid_lft` across IA_NA addresses.
+/// Stateless: `info_refresh_time`, defaulting to 1800 per RFC 8415 §21.23.
+fn dhcpv6_lease_time_secs(lease: &Dhcpv6Lease) -> u32 {
+    if lease.addresses.is_empty() {
+        lease.info_refresh_time.unwrap_or(1800)
+    } else {
+        lease.addresses.iter().map(|a| a.valid_lft).min().unwrap_or(0)
+    }
+}
+
 async fn run_ipv6auto(
     interface: String,
     policy_name: String,
@@ -204,6 +243,7 @@ async fn run_ipv6auto(
     state_arc: Arc<Mutex<Option<State>>>,
     event_tx: mpsc::Sender<FactoryEvent>,
     mut stop_rx: oneshot::Receiver<()>,
+    dhcpv6_info_arc: Arc<Mutex<Dhcpv6StatusInfo>>,
 ) {
     // ── Startup ───────────────────────────────────────────────────────────────
 
@@ -390,6 +430,15 @@ async fn run_ipv6auto(
                                     &mut dhcpv6_installed_addrs,
                                 )
                                 .await;
+                                {
+                                    let is_active = dhcpv6_client.is_some();
+                                    let mut info = dhcpv6_info_arc.lock().unwrap();
+                                    info.active = is_active;
+                                    if !is_active {
+                                        info.lease_time_secs = None;
+                                        info.acquired_at = None;
+                                    }
+                                }
                             }
 
                             handle_ra(&ra, &mut ra_state, &interface, mac).await;
@@ -541,6 +590,13 @@ async fn run_ipv6auto(
                             .await;
                         }
                         dhcpv6_lease = Some(lease);
+                        {
+                            let lease_ref = dhcpv6_lease.as_ref().unwrap();
+                            let mut info = dhcpv6_info_arc.lock().unwrap();
+                            info.active = true;
+                            info.lease_time_secs = Some(dhcpv6_lease_time_secs(lease_ref));
+                            info.acquired_at = Some(lease_ref.acquired_at);
+                        }
                         let new_state = build_merged_state(
                             &ra_state,
                             &interface,
@@ -562,6 +618,12 @@ async fn run_ipv6auto(
                     Dhcpv6Result::Expired => {
                         remove_dhcpv6_addresses(&interface, &mut dhcpv6_installed_addrs).await;
                         dhcpv6_lease = None;
+                        {
+                            let mut info = dhcpv6_info_arc.lock().unwrap();
+                            // Keep active=true: the DHCPv6 client is still running.
+                            info.lease_time_secs = None;
+                            info.acquired_at = None;
+                        }
                         let new_state = build_merged_state(
                             &ra_state,
                             &interface,

@@ -717,24 +717,30 @@ async fn handle_get_show_info(
             })
             .collect();
 
-        // Build DHCP info if a factory is running for this interface.
-        let dhcp = factory_by_iface.get(&name).map(|fs| {
-            if fs.has_lease {
-                VarlinkDhcpInfo {
-                    state: "running".to_string(),
-                    lease_address: fs.lease_address.clone(),
-                    lease_time_secs: fs.lease_time_secs.map(|v| v as i64),
-                    lease_remaining_secs: fs.lease_remaining_secs.map(|v| v as i64),
+        // Build DHCP info only when a DHCP client is active for this interface.
+        // For ipv6auto, dhcp_active is false in SLAAC-only mode (no M/O flags),
+        // so no dhcp object is emitted. State is "running" when a lease is held
+        // (lease_time_secs present), "waiting" otherwise.
+        let dhcp = factory_by_iface
+            .get(&name)
+            .filter(|fs| fs.dhcp_active)
+            .map(|fs| {
+                if fs.lease_time_secs.is_some() {
+                    VarlinkDhcpInfo {
+                        state: "running".to_string(),
+                        lease_address: fs.lease_address.clone(),
+                        lease_time_secs: fs.lease_time_secs.map(|v| v as i64),
+                        lease_remaining_secs: fs.lease_remaining_secs.map(|v| v as i64),
+                    }
+                } else {
+                    VarlinkDhcpInfo {
+                        state: "waiting".to_string(),
+                        lease_address: None,
+                        lease_time_secs: None,
+                        lease_remaining_secs: None,
+                    }
                 }
-            } else {
-                VarlinkDhcpInfo {
-                    state: "waiting".to_string(),
-                    lease_address: None,
-                    lease_time_secs: None,
-                    lease_remaining_secs: None,
-                }
-            }
-        });
+            });
 
         // Determine config drift for managed interfaces.
         let is_managed = !matching_policies.is_empty();
@@ -1307,6 +1313,19 @@ mod tests {
         let yaml = format!(
             "kind: policy\nname: {name}\nfactory: static\npriority: 100\n\
              state:\n  type: ethernet\n  name: eth0\n  mtu: 1500\n"
+        );
+        netfyr_policy::parse_policy_yaml(&yaml)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    /// Build an ipv6auto policy targeting the loopback interface.
+    fn make_ipv6auto_lo_policy(name: &str) -> netfyr_policy::Policy {
+        let yaml = format!(
+            "kind: policy\nname: {name}\nfactory: ipv6auto\npriority: 100\n\
+             selector:\n  name: lo\n"
         );
         netfyr_policy::parse_policy_yaml(&yaml)
             .unwrap()
@@ -1998,6 +2017,65 @@ mod tests {
             msg["parameters"]["info"]["interfaces"].is_array(),
             "interfaces must be an array: {msg:?}"
         );
+    }
+
+    /// Scenario: ipv6auto factory in SLAAC-only mode (no M/O flags received)
+    /// must not produce a dhcp object in GetShowInfo — dhcp_active is false
+    /// until DHCPv6 is triggered by an RA with M or O flag.
+    #[tokio::test]
+    async fn test_handle_get_show_info_ipv6auto_slaac_only_has_no_dhcp_object() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy = make_ipv6auto_lo_policy("lo-v6-slaac");
+        let mut fm = FactoryManager::new();
+        let _ = fm.sync(&[policy.clone()]).await;
+        let state =
+            make_test_state(PolicyStore::ephemeral(vec![policy]), fm);
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(msg.get("error").is_none(), "must not return error: {msg:?}");
+        let interfaces =
+            msg["parameters"]["info"]["interfaces"].as_array().unwrap();
+        if let Some(lo) = interfaces.iter().find(|i| i["name"] == "lo") {
+            assert!(
+                lo.get("dhcp").is_none() || lo["dhcp"].is_null(),
+                "SLAAC-only ipv6auto must not produce a dhcp field: {lo:?}"
+            );
+        }
+    }
+
+    /// Scenario: GetShowInfo for an interface managed by an ipv6auto factory
+    /// must include a policy entry with type "ipv6auto".
+    #[tokio::test]
+    async fn test_handle_get_show_info_ipv6auto_policy_type_is_ipv6auto() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let policy = make_ipv6auto_lo_policy("lo-v6-type");
+        let mut fm = FactoryManager::new();
+        let _ = fm.sync(&[policy.clone()]).await;
+        let state =
+            make_test_state(PolicyStore::ephemeral(vec![policy]), fm);
+        let reconciler = Reconciler::new();
+        let start_time = Instant::now();
+
+        handle_get_show_info(&mut server, &state, &reconciler, start_time)
+            .await
+            .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(msg.get("error").is_none(), "must not return error: {msg:?}");
+        let interfaces =
+            msg["parameters"]["info"]["interfaces"].as_array().unwrap();
+        if let Some(lo) = interfaces.iter().find(|i| i["name"] == "lo") {
+            let has_ipv6auto = lo["policies"]
+                .as_array()
+                .is_some_and(|ps| ps.iter().any(|p| p["type"] == "ipv6auto"));
+            assert!(has_ipv6auto, "ipv6auto policy must appear in policies with type 'ipv6auto': {lo:?}");
+        }
     }
 
     // ── Revert handler ────────────────────────────────────────────────────────

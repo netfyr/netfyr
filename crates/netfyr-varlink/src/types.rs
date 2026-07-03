@@ -589,7 +589,7 @@ pub struct VarlinkDriftEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VarlinkPolicyInfo {
     pub name: String,
-    /// Factory type: `"static"` or `"dhcpv4"`. Uses `#[serde(rename)]`
+    /// Factory type: `"static"`, `"dhcpv4"`, or `"ipv6auto"`. Uses `#[serde(rename)]`
     /// because `type` is a reserved keyword in Rust.
     #[serde(rename = "type")]
     pub policy_type: String,

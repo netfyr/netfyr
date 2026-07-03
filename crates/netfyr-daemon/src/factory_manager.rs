@@ -25,6 +25,10 @@ pub struct FactoryStatus {
     pub factory_type: String,
     pub interface: String,
     pub has_lease: bool,
+    /// Whether a DHCP client is active for this factory.
+    /// Always `true` for DHCPv4; `true` for ipv6auto only when M or O flag
+    /// was received from a Router Advertisement.
+    pub dhcp_active: bool,
     /// The acquired IP address (without prefix length), if a lease is active.
     pub lease_ip: Option<String>,
     /// Full CIDR address from the lease (e.g., `"192.168.122.63/24"`).
@@ -328,6 +332,7 @@ impl FactoryManager {
                     factory_type: "dhcpv4".to_string(),
                     interface: factory.interface().to_string(),
                     has_lease,
+                    dhcp_active: true,
                     lease_ip,
                     lease_address,
                     lease_time_secs,
@@ -336,8 +341,9 @@ impl FactoryManager {
             })
             .collect();
 
-        // IPv6Auto factories: no lease concept — has_lease reflects whether
-        // at least one SLAAC address has been configured.
+        // IPv6Auto factories: has_lease reflects whether at least one SLAAC
+        // address has been configured; dhcp_active and lease timing come from
+        // the DHCPv6 client state (M/O flags from RAs).
         result.extend(self.ipv6auto_factories.iter().map(|(name, factory)| {
             let current = factory.current_state();
             let has_lease = current.as_ref().is_some_and(|s| {
@@ -349,15 +355,26 @@ impl FactoryManager {
                     .map(|l| !l.is_empty())
                     .unwrap_or(false)
             });
+            let dhcpv6 = factory.dhcpv6_info();
+            let (lease_time_secs, lease_remaining_secs) =
+                match (dhcpv6.active, dhcpv6.lease_time_secs, dhcpv6.acquired_at) {
+                    (true, Some(lease_time), Some(acquired_at)) => {
+                        let remaining =
+                            (lease_time as u64).saturating_sub(acquired_at.elapsed().as_secs());
+                        (Some(lease_time), Some(remaining))
+                    }
+                    _ => (None, None),
+                };
             FactoryStatus {
                 policy_name: name.clone(),
                 factory_type: "ipv6auto".to_string(),
                 interface: factory.interface().to_string(),
                 has_lease,
+                dhcp_active: dhcpv6.active,
                 lease_ip: None,
                 lease_address: None,
-                lease_time_secs: None,
-                lease_remaining_secs: None,
+                lease_time_secs,
+                lease_remaining_secs,
             }
         }));
 

@@ -1118,6 +1118,141 @@ mod tests {
         assert!(!iface_obj.contains_key("config_state"), "unmanaged interface must not have config_state");
     }
 
+    // ── format_text and format_json: ipv6auto factory ────────────────────────
+
+    fn make_ipv6auto_policy_info(name: &str) -> VarlinkPolicyInfo {
+        VarlinkPolicyInfo { name: name.to_string(), policy_type: "ipv6auto".to_string() }
+    }
+
+    /// Scenario: ipv6auto interface with DHCPv6 active (dhcp object present) —
+    /// format_text shows "DHCP: running" and a Lease line.
+    #[test]
+    fn test_format_text_ipv6auto_with_dhcpv6_running_shows_dhcp_line() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface(
+                "enp3s0",
+                Some(vec![make_ipv6auto_policy_info("v6-dhcp")]),
+                Some(make_running_dhcp("2001:db8::1", 3600, 3252)),
+            )],
+        );
+        let text = format_text(&info);
+        assert!(
+            text.contains("v6-dhcp (ipv6auto)"),
+            "ipv6auto policy must appear with type suffix, got:\n{text}"
+        );
+        assert!(
+            text.contains("DHCP:      running"),
+            "DHCPv6 active interface must show 'DHCP:      running', got:\n{text}"
+        );
+        assert!(
+            text.contains("Lease:"),
+            "DHCPv6 active interface must show Lease line, got:\n{text}"
+        );
+    }
+
+    /// Scenario: ipv6auto interface in SLAAC-only mode (no dhcp object) —
+    /// format_text shows the policy but omits DHCP and Lease lines.
+    #[test]
+    fn test_format_text_ipv6auto_slaac_only_omits_dhcp_and_lease_lines() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface(
+                "enp3s0",
+                Some(vec![make_ipv6auto_policy_info("v6-slaac")]),
+                None,
+            )],
+        );
+        let text = format_text(&info);
+        assert!(
+            text.contains("v6-slaac (ipv6auto)"),
+            "ipv6auto policy must appear with type suffix, got:\n{text}"
+        );
+        assert!(
+            !text.contains("DHCP:"),
+            "SLAAC-only interface must not show a DHCP line, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Lease:"),
+            "SLAAC-only interface must not show a Lease line, got:\n{text}"
+        );
+    }
+
+    /// Scenario: ipv6auto interface with DHCPv6 active — format_json includes
+    /// a "dhcp" object with state "running".
+    #[test]
+    fn test_format_json_ipv6auto_with_dhcpv6_running_has_dhcp_field() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface(
+                "enp3s0",
+                Some(vec![make_ipv6auto_policy_info("v6-dhcp")]),
+                Some(make_running_dhcp("2001:db8::1", 3600, 3252)),
+            )],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&format_json(&info).unwrap()).unwrap();
+        let iface = &parsed["interfaces"][0];
+        assert_eq!(iface["policies"][0]["type"], "ipv6auto");
+        assert_eq!(
+            iface["dhcp"]["state"],
+            "running",
+            "DHCPv6 active ipv6auto interface must have dhcp.state = 'running'"
+        );
+        assert!(
+            iface["dhcp"]["lease_time_secs"].as_i64().is_some(),
+            "running DHCPv6 lease must include lease_time_secs"
+        );
+    }
+
+    /// Scenario: ipv6auto interface in SLAAC-only mode — format_json has no
+    /// "dhcp" key in the interface object.
+    #[test]
+    fn test_format_json_ipv6auto_slaac_only_has_no_dhcp_field() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface(
+                "enp3s0",
+                Some(vec![make_ipv6auto_policy_info("v6-slaac")]),
+                None,
+            )],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&format_json(&info).unwrap()).unwrap();
+        let iface_obj = parsed["interfaces"][0]
+            .as_object()
+            .expect("interface must be a JSON object");
+        assert_eq!(iface_obj["policies"][0]["type"], "ipv6auto");
+        assert!(
+            !iface_obj.contains_key("dhcp"),
+            "SLAAC-only ipv6auto interface must not have a 'dhcp' field: {iface_obj:?}"
+        );
+    }
+
+    /// Scenario: Interface managed by both a dhcpv4 and an ipv6auto policy —
+    /// both policy names appear in the Policies line.
+    #[test]
+    fn test_format_text_ipv6auto_and_dhcpv4_policies_both_appear() {
+        let info = make_show_info(
+            make_daemon_running(100),
+            vec![make_iface(
+                "enp3s0",
+                Some(vec![
+                    make_dhcpv4_policy_info("v4-dhcp"),
+                    make_ipv6auto_policy_info("v6-auto"),
+                ]),
+                Some(make_running_dhcp("192.168.1.10/24", 3600, 3000)),
+            )],
+        );
+        let text = format_text(&info);
+        assert!(
+            text.contains("v4-dhcp (dhcpv4)"),
+            "dhcpv4 policy must appear, got:\n{text}"
+        );
+        assert!(
+            text.contains("v6-auto (ipv6auto)"),
+            "ipv6auto policy must appear, got:\n{text}"
+        );
+    }
+
     // ── CLI argument parsing ──────────────────────────────────────────────────
 
     /// Scenario: `netfyr show` can be parsed without arguments (defaults to text output).
