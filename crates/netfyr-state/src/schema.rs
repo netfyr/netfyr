@@ -342,8 +342,8 @@ impl<'a> SchemaCursor<'a> {
     }
 
     pub(crate) fn decode_string(self, text: &str) -> Value {
-        match semantic_type(self.node) {
-            Some(FieldType::IpNetwork) => parse_ip_network(text)
+        match semantic_type(self.node).expect("schema nodes are validated at registration") {
+            FieldType::IpNetwork => parse_ip_network(text)
                 .map(Value::IpNetwork)
                 // Preserve malformed text for the validator's InvalidFormat
                 // diagnostic at this exact schema path.
@@ -393,6 +393,84 @@ impl SchemaRegistry {
             Self::parse_fragment("ethernet", ETHERNET_JSON, Some("ethernet")),
         ];
         Self { fragments }
+    }
+
+    /// Add a schema node below an existing fragment root.
+    ///
+    /// Missing intermediate properties are created as writable closed objects.
+    /// This composes extension-owned schema into the same decoder and validator
+    /// used by the built-in state fragments.
+    ///
+    /// Every node, including nested properties and array items, must declare a
+    /// type compatible with its format. Invalid schemas, invalid paths, and
+    /// conflicts return an error without modifying the registry. Paths below a
+    /// fragment trigger must be added to that fragment, not to `base`.
+    pub fn add_schema_node(
+        &mut self,
+        fragment: &str,
+        path: &str,
+        json: &str,
+    ) -> Result<(), String> {
+        let node: SchemaNode = serde_json::from_str(json)
+            .map_err(|err| format!("schema node at '{path}' is malformed: {err}"))?;
+        validate_schema_node(&node)
+            .map_err(|err| format!("schema node at '{path}' is malformed: {err}"))?;
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+            return Err(
+                "schema node path must not be empty or contain empty components".to_string(),
+            );
+        }
+        // Even a nested base path would create a top-level property that
+        // shadows an existing fragment's decoder.
+        let target_is_base = self
+            .fragments
+            .iter()
+            .find(|f| f.name == fragment)
+            .is_some_and(|f| f.trigger_key.is_none());
+        if target_is_base {
+            let collides = self
+                .fragments
+                .iter()
+                .any(|f| f.trigger_key == Some(parts[0]));
+            if collides {
+                return Err(format!(
+                    "base property '{}' collides with a fragment trigger key",
+                    parts[0],
+                ));
+            }
+        }
+
+        let fragment = self
+            .fragments
+            .iter_mut()
+            .find(|candidate| candidate.name == fragment)
+            .ok_or_else(|| format!("unknown schema fragment '{fragment}'"))?;
+        let mut parent = &mut fragment.root;
+        for part in &parts[..parts.len() - 1] {
+            parent = parent
+                .properties
+                .get_or_insert_with(IndexMap::new)
+                .entry((*part).to_string())
+                .or_insert_with(writable_object);
+            if parent.r#type != Some(FieldType::Object) {
+                return Err(format!("schema path component '{part}' is not an object"));
+            }
+        }
+        let properties = parent.properties.get_or_insert_with(IndexMap::new);
+        let name = parts
+            .last()
+            .expect("non-empty path was checked")
+            .to_string();
+        if properties.contains_key(&name) {
+            return Err(format!("schema node '{path}' already exists"));
+        }
+        properties.insert(name, node);
+
+        fragment.fields.clear();
+        derive_fields(&fragment.root, "", &mut fragment.fields);
+        fragment.fields.sort_keys();
+        Ok(())
     }
 
     /// Decode YAML directly into model values using this registry's schema
@@ -461,7 +539,7 @@ impl SchemaRegistry {
     ///
     /// # Panics
     ///
-    /// Panics on malformed JSON or on a property without a `type`.
+    /// Panics on malformed JSON or an invalid schema node.
     fn parse_fragment(
         name: &'static str,
         json: &'static str,
@@ -469,7 +547,8 @@ impl SchemaRegistry {
     ) -> Fragment {
         let root: SchemaNode = serde_json::from_str(json)
             .unwrap_or_else(|err| panic!("embedded schema fragment '{name}' is malformed: {err}"));
-        validate_schema_node(&root);
+        validate_schema_node(&root)
+            .unwrap_or_else(|err| panic!("embedded schema fragment '{name}' is malformed: {err}"));
         let mut fields = IndexMap::new();
         derive_fields(&root, "", &mut fields);
         // Serde fills `properties` in JSON document order; the field map
@@ -623,11 +702,11 @@ impl SchemaRegistry {
                         writable_only,
                         &mut errors,
                     );
-                    // The model does not record whether this type was
-                    // explicit YAML or inferred from a technology fragment.
-                    // Current technology fields are read-only, so this does
-                    // not hide a writable policy; add origin tracking before
-                    // introducing writable technology-specific fields.
+                    // `device_type` is structural metadata carried by the
+                    // state model, not a field the policy writes to the
+                    // device.  Validate its value (must be a known string)
+                    // but never reject it as read-only: pass `false` for
+                    // the writable check regardless of the caller's mode.
                     if !state.device_type.is_empty() {
                         let type_node = fragment
                             .root
@@ -640,7 +719,7 @@ impl SchemaRegistry {
                             &Value::String(state.device_type.clone()),
                             "type",
                             fragment.name,
-                            writable_only,
+                            false,
                             &mut errors,
                         );
                     }
@@ -671,6 +750,22 @@ impl SchemaRegistry {
     }
 }
 
+fn writable_object() -> SchemaNode {
+    SchemaNode {
+        r#type: Some(FieldType::Object),
+        format: None,
+        writable: true,
+        minimum: None,
+        maximum: None,
+        r#enum: None,
+        properties: Some(IndexMap::new()),
+        required: None,
+        items: None,
+        additional_properties: Some(false),
+        implied_device_type: None,
+    }
+}
+
 impl Default for SchemaRegistry {
     fn default() -> Self {
         Self::new()
@@ -693,7 +788,8 @@ fn derive_fields(node: &SchemaNode, prefix: &str, out: &mut IndexMap<String, Fie
                 path.clone(),
                 FieldInfo {
                     writable: prop.writable,
-                    r#type: semantic_type(prop).expect("schema property without a 'type' keyword"),
+                    r#type: semantic_type(prop)
+                        .expect("schema nodes are validated at registration"),
                 },
             );
             derive_fields(prop, &path, out);
@@ -706,30 +802,29 @@ fn derive_fields(node: &SchemaNode, prefix: &str, out: &mut IndexMap<String, Fie
 
 /// Get a node's type as exposed by the state model, including semantic
 /// formats whose serialized JSON Schema type remains `string`.
-fn semantic_type(node: &SchemaNode) -> Option<FieldType> {
+fn semantic_type(node: &SchemaNode) -> Result<FieldType, &'static str> {
     match (node.r#type, node.format) {
-        (Some(FieldType::String), Some(SchemaFormat::Ipv4Cidr)) => Some(FieldType::IpNetwork),
+        (Some(FieldType::String), Some(SchemaFormat::Ipv4Cidr)) => Ok(FieldType::IpNetwork),
         (Some(_), Some(SchemaFormat::Ipv4Cidr)) => {
-            panic!("ipv4-cidr schema format requires type string")
+            Err("ipv4-cidr schema format requires type string")
         }
-        (None, Some(SchemaFormat::Ipv4Cidr)) => {
-            panic!("ipv4-cidr schema format requires a type keyword")
-        }
-        (field_type, None) => field_type,
+        (Some(field_type), None) => Ok(field_type),
+        (None, _) => Err("schema node without a 'type' keyword"),
     }
 }
 
-/// Reject internally inconsistent embedded schemas at registry construction.
-fn validate_schema_node(node: &SchemaNode) {
-    let _ = semantic_type(node);
+/// Check the complete schema subtree before it becomes part of a registry.
+fn validate_schema_node(node: &SchemaNode) -> Result<(), String> {
+    semantic_type(node)?;
     if let Some(properties) = &node.properties {
-        for property in properties.values() {
-            validate_schema_node(property);
+        for (name, property) in properties {
+            validate_schema_node(property).map_err(|err| format!("property '{name}': {err}"))?;
         }
     }
     if let Some(items) = &node.items {
-        validate_schema_node(items);
+        validate_schema_node(items).map_err(|err| format!("array items: {err}"))?;
     }
+    Ok(())
 }
 
 /// Validate one object: check each present key against the node's
@@ -813,11 +908,7 @@ fn walk_node(
     writable_only: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some(expected) = semantic_type(node) else {
-        // No `type` keyword: nothing to check (our fragments always
-        // define one).
-        return;
-    };
+    let expected = semantic_type(node).expect("schema nodes are validated at registration");
     let found = value_type(value);
     if !type_accepts(node, expected, found) {
         errors.push(ValidationError::WrongType {
@@ -999,5 +1090,119 @@ fn join_path(prefix: &str, key: &str) -> String {
         key.to_string()
     } else {
         format!("{prefix}.{key}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INTEGER_SCHEMA: &str = r#"{"type":"integer","x-netfyr-writable":true}"#;
+
+    #[test]
+    fn nested_base_extensions_cannot_shadow_fragment_triggers() {
+        for path in [
+            "ipv4.extension",
+            "ipv4.extension.nested",
+            "ethernet.extension",
+        ] {
+            let mut registry = SchemaRegistry::new();
+            let base_fields = registry.fragment_fields("base");
+            let error = registry
+                .add_schema_node("base", path, INTEGER_SCHEMA)
+                .unwrap_err();
+            assert!(
+                error.contains("collides with a fragment trigger key"),
+                "{error}"
+            );
+            assert_eq!(registry.fragment_fields("base"), base_fields);
+
+            // A rejected extension must not change the schema used by the
+            // decoder, even though validation also accepts CIDRs as strings.
+            let states = registry
+                .from_yaml("ipv4: { addresses: [{ ip: 192.0.2.1/24 }] }")
+                .unwrap();
+            let Value::Map(ipv4) = &states[0].fields["ipv4"] else {
+                panic!("ipv4 must be a map");
+            };
+            let Value::List(addresses) = &ipv4["addresses"] else {
+                panic!("addresses must be a list");
+            };
+            let Value::Map(address) = &addresses[0] else {
+                panic!("address must be a map");
+            };
+            assert_eq!(
+                address["ip"],
+                Value::IpNetwork(("192.0.2.1".parse().unwrap(), 24))
+            );
+            assert!(registry.validate_writable(&states[0]).is_empty());
+        }
+    }
+
+    fn assert_schema_rejected_without_mutation(json: &str, reason: &str) {
+        let mut registry = SchemaRegistry::new();
+        let base_fields = registry.fragment_fields("base");
+        let error = registry
+            .add_schema_node("base", "custom.nested", json)
+            .unwrap_err();
+        assert!(error.contains(reason), "{json}: {error}");
+        assert_eq!(registry.fragment_fields("base"), base_fields);
+        assert!(registry.top_level_schema("custom").is_none());
+
+        // Even the synthesized parents must be absent after rejection.
+        registry
+            .add_schema_node("base", "custom", INTEGER_SCHEMA)
+            .unwrap();
+    }
+
+    #[test]
+    fn schema_extensions_require_types_at_every_node() {
+        for json in [
+            "{}",
+            r#"{"type":"object","properties":{"child":{}}}"#,
+            r#"{"type":"array","items":{}}"#,
+            r#"{"type":"array","items":{"type":"object","properties":{"child":{}}}}"#,
+        ] {
+            assert_schema_rejected_without_mutation(json, "type");
+        }
+    }
+
+    #[test]
+    fn schema_extensions_reject_incompatible_formats_at_every_node() {
+        for json in [
+            r#"{"type":"integer","format":"ipv4-cidr"}"#,
+            r#"{"type":"object","properties":{"child":{"type":"boolean","format":"ipv4-cidr"}}}"#,
+            r#"{"type":"array","items":{"type":"integer","format":"ipv4-cidr"}}"#,
+        ] {
+            assert_schema_rejected_without_mutation(json, "ipv4-cidr");
+        }
+    }
+
+    #[test]
+    fn schema_extensions_decode_valid_formats_in_their_own_fragment() {
+        for (fragment, path, domain) in [
+            ("ipv4", "extension", "ipv4"),
+            ("base", "custom.extension", "custom"),
+        ] {
+            let mut registry = SchemaRegistry::new();
+            registry
+                .add_schema_node(
+                    fragment,
+                    path,
+                    r#"{"type":"string","format":"ipv4-cidr","x-netfyr-writable":true}"#,
+                )
+                .unwrap();
+            let states = registry
+                .from_yaml(&format!("{domain}: {{ extension: 192.0.2.1/24 }}"))
+                .unwrap();
+            let Value::Map(values) = &states[0].fields[domain] else {
+                panic!("extension's domain must be a map");
+            };
+            assert_eq!(
+                values["extension"],
+                Value::IpNetwork(("192.0.2.1".parse().unwrap(), 24))
+            );
+            assert!(registry.validate_writable(&states[0]).is_empty());
+        }
     }
 }

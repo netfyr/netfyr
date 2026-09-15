@@ -1,0 +1,12 @@
+[package]
+name = "netfyr-policy"
+description = "Policy loading and provider declarations for netfyr"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+indexmap = "2"
+netfyr-state = { path = "../netfyr-state" }
+serde_yaml = "0.9"

@@ -63,7 +63,10 @@ pub mod state;
 pub mod value;
 pub mod yaml;
 
-pub use apply::{ApplyOptions, ApplyOutcome, MatchBy, Warning, prepare_for_apply};
+pub use apply::{
+    ApplyOptions, ApplyOutcome, MatchBy, Warning, prepare_for_apply,
+    prepare_for_apply_with_registry,
+};
 pub use error::{Error, IndexedValidationError};
 pub use match_spec::Match;
 pub use schema::{DecodeMode, FieldInfo, FieldType, SchemaRegistry, ValidationError};

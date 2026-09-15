@@ -69,6 +69,18 @@ pub struct ApplyOutcome {
 /// Both input and final prepared states are schema-validated.
 pub fn prepare_for_apply(states: &[State], opts: &ApplyOptions) -> Result<ApplyOutcome, Error> {
     let registry = SchemaRegistry::new();
+    prepare_for_apply_with_registry(states, opts, &registry)
+}
+
+/// Prepare states for apply using a caller-composed schema registry.
+///
+/// This lets extensions add their own writable schema nodes without
+/// duplicating the query-to-apply normalization logic.
+pub fn prepare_for_apply_with_registry(
+    states: &[State],
+    opts: &ApplyOptions,
+    registry: &SchemaRegistry,
+) -> Result<ApplyOutcome, Error> {
     let mut states = states.to_vec();
     for state in &mut states {
         if state.source == crate::Source::Kernel
@@ -83,7 +95,7 @@ pub fn prepare_for_apply(states: &[State], opts: &ApplyOptions) -> Result<ApplyO
         }
     }
 
-    let validation_errors = collect_validation_errors(&states, &registry, false);
+    let validation_errors = collect_validation_errors(&states, registry, false);
     if !validation_errors.is_empty() {
         return Err(Error::Validation(validation_errors));
     }
@@ -140,7 +152,7 @@ pub fn prepare_for_apply(states: &[State], opts: &ApplyOptions) -> Result<ApplyO
         }
     }
 
-    let validation_errors = collect_validation_errors(&states, &registry, true);
+    let validation_errors = collect_validation_errors(&states, registry, true);
     if !validation_errors.is_empty() {
         return Err(Error::Validation(validation_errors));
     }
@@ -347,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_rejects_malformed_cidr_and_explicit_policy_type() {
+    fn apply_rejects_malformed_cidr() {
         let malformed =
             from_yaml("match:\n  name: eth0\nipv4:\n  addresses:\n    - ip: 10.0.0.1/33\n")
                 .unwrap();
@@ -363,19 +375,14 @@ mod tests {
                 error: crate::ValidationError::InvalidFormat { .. },
             }]
         ));
+    }
 
+    #[test]
+    fn explicit_policy_type_is_structural_and_accepted() {
         let typed = from_yaml("match:\n  name: eth0\ntype: ethernet\nmtu: 1500\n").unwrap();
-        let Error::Validation(errors) = err_of(prepare_for_apply(&typed, &ApplyOptions::default()))
-        else {
-            panic!("expected schema validation error");
-        };
-        assert!(matches!(
-            errors.as_slice(),
-            [IndexedValidationError {
-                state_index: 0,
-                error: crate::ValidationError::ReadOnlyField { path, .. },
-            }] if path == "type"
-        ));
+        // `device_type` is structural metadata, not a writable field; it
+        // must not be rejected as read-only.
+        prepare_for_apply(&typed, &ApplyOptions::default()).unwrap();
     }
 
     #[test]
