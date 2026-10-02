@@ -11,5 +11,9 @@ they name carry that history.
 
 ## [Unreleased]
 
+- Query namespace-bound interface state and execute explicit Ethernet/veth MTU,
+  administrative-state, and IPv4 operations with dry-run validation and
+  per-operation failure reports (core/004-network-backend).
+
 - Decode YAML values from their schema path instead of globally inferring IP
   types from string contents (core/002-schema-validation).

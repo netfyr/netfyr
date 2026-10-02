@@ -1,0 +1,20 @@
+[package]
+name = "netfyr-backend"
+description = "Namespace-bound Linux network observation and explicit plan execution"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+netfyr-state = { path = "../netfyr-state" }
+rtnetlink = "0.23"
+ethtool = "0.3"
+wl-nl80211 = "0.7"
+genetlink = "0.3"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
+futures-util = "0.3"
+libc = "0.2"
+indexmap = "2"

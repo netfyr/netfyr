@@ -1,0 +1,21 @@
+[package]
+name = "netfyr-backend-probe"
+description = "JSON-line driver of NetworkBackend for the acceptance harness"
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "backend-probe"
+path = "src/main.rs"
+
+[dependencies]
+netfyr-backend = { path = "../../../crates/netfyr-backend" }
+netfyr-state = { path = "../../../crates/netfyr-state" }
+futures-util = "0.3"
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
