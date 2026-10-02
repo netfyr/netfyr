@@ -251,6 +251,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "netfyr-backend-probe"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "netfyr-backend",
+ "netfyr-state",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "netfyr-policy"
 version = "0.1.0"
 dependencies = [

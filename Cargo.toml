@@ -4,6 +4,7 @@ members = [
     "crates/netfyr-state",
     "crates/netfyr-policy",
     "crates/netfyr-backend",
+    "tests/integration/probe",
 ]
 
 [workspace.package]
