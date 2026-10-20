@@ -966,10 +966,7 @@ fn observed_addresses_alone_do_not_trigger_address_planning() {
         extra
     };
     let mut incomplete = device_observation("eth0", 7, Vec::new(), false);
-    incomplete
-        .state
-        .fields
-        .extend(kernel_reported().into_iter());
+    incomplete.state.fields.extend(kernel_reported());
     let plan = reconcile(
         &[contribution(fields.clone())],
         &observation_of(vec![incomplete]),
@@ -1005,7 +1002,7 @@ fn observed_addresses_alone_do_not_trigger_address_planning() {
         }],
         true,
     );
-    scoped.state.fields.extend(kernel_reported().into_iter());
+    scoped.state.fields.extend(kernel_reported());
     let plan = reconcile(
         &[contribution(fields)],
         &observation_of(vec![scoped]),
