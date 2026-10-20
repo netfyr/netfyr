@@ -82,6 +82,8 @@ pub struct BindingConflict {
     pub policies: Vec<ConflictingPolicy>,
 }
 
+/// One selector that matched no device, even if another selector from the
+/// same policy matched. Identical selectors within a policy are reported once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnmatchedPolicy {
     pub policy: String,

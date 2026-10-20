@@ -2,8 +2,8 @@
 
 use serde_json::{Value as JsonValue, json};
 
-use netfyr_state::Value;
 use netfyr_state::plan::InterfaceId;
+use netfyr_state::{Match, Value};
 
 use crate::{Diagnostic, ReconcilePlan};
 
@@ -101,7 +101,11 @@ fn diagnostic_json(diagnostic: &Diagnostic) -> JsonValue {
             "winner": conflict.winner.source,
         }),
         Diagnostic::UnmatchedPolicy(unmatched) => {
-            json!({ "kind": "unmatched-policy", "policy": unmatched.policy })
+            json!({
+                "kind": "unmatched-policy",
+                "policy": unmatched.policy,
+                "selector": selector_json(&unmatched.selector),
+            })
         }
         Diagnostic::BindingConflict(conflict) => json!({
             "kind": "binding-conflict",
@@ -111,6 +115,22 @@ fn diagnostic_json(diagnostic: &Diagnostic) -> JsonValue {
     }
 }
 
+fn selector_json(selector: &Match) -> JsonValue {
+    let mut fields = serde_json::Map::new();
+    for (name, value) in [
+        ("name", &selector.name),
+        ("type", &selector.r#type),
+        ("driver", &selector.driver),
+        ("pci_path", &selector.pci_path),
+        ("mac", &selector.mac),
+    ] {
+        if let Some(value) = value {
+            fields.insert(name.into(), json!(value));
+        }
+    }
+    JsonValue::Object(fields)
+}
+
 pub(crate) fn diagnostic_text(diagnostic: &Diagnostic) -> String {
     match diagnostic {
         Diagnostic::ValueConflict(conflict) => format!(
@@ -118,7 +138,10 @@ pub(crate) fn diagnostic_text(diagnostic: &Diagnostic) -> String {
             conflict.target.name, conflict.identity
         ),
         Diagnostic::UnmatchedPolicy(unmatched) => {
-            format!("policy {} matched no interfaces", unmatched.policy)
+            format!(
+                "policy {} selector {} matched no interfaces",
+                unmatched.policy, unmatched.selector
+            )
         }
         Diagnostic::BindingConflict(conflict) => format!(
             "interface {} matched policies {}",

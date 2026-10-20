@@ -6,7 +6,10 @@ use crate::{BindingConflict, ConflictingPolicy, Contribution, UnmatchedPolicy};
 
 pub(super) struct BoundDevice<'a> {
     pub observation: &'a DeviceObservation,
-    pub policy: String,
+    /// The contributions whose own selector matched this device, in
+    /// precedence order (FR-002: every matching contribution is retained
+    /// through the selector that matched).
+    pub contributions: Vec<&'a Contribution>,
 }
 
 pub(super) struct Binding<'a> {
@@ -15,28 +18,10 @@ pub(super) struct Binding<'a> {
     pub unmatched: Vec<UnmatchedPolicy>,
 }
 
-pub(super) fn policy_contributions<'a>(
-    contributions: &'a [Contribution],
-    policy: &str,
-) -> Vec<&'a Contribution> {
-    let mut selected: Vec<_> = contributions
-        .iter()
-        .filter(|item| item.policy == policy)
-        .collect();
-    selected.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then_with(|| left.key.cmp(&right.key))
-    });
-    selected
-}
-
 pub(super) fn bind<'a>(
-    contributions: &[Contribution],
+    contributions: &'a [Contribution],
     observation: &'a Observation,
 ) -> Binding<'a> {
-    let mut selectors = BTreeMap::new();
     let mut ordered: Vec<_> = contributions.iter().collect();
     ordered.sort_by(|left, right| {
         right
@@ -44,38 +29,48 @@ pub(super) fn bind<'a>(
             .cmp(&left.priority)
             .then_with(|| left.key.cmp(&right.key))
     });
-    for contribution in ordered {
-        selectors
-            .entry(contribution.policy.clone())
-            .or_insert_with(|| contribution.match_spec.clone());
-    }
     let mut devices = Vec::new();
     let mut conflicts = Vec::new();
     let mut matched = BTreeSet::new();
     for device in &observation.devices {
-        let owners: Vec<_> = selectors
+        let matches: Vec<_> = ordered
             .iter()
-            .filter(|(_, selector)| selector.matches(&device.state.match_spec))
-            .map(|(policy, _)| policy.clone())
+            .filter(|contribution| contribution.match_spec.matches(&device.state.match_spec))
+            .copied()
             .collect();
-        match owners.as_slice() {
+        // The distinct policies matching this device, in precedence order.
+        let mut policies: Vec<&str> = Vec::new();
+        for contribution in &matches {
+            if !policies.contains(&contribution.policy.as_str()) {
+                policies.push(contribution.policy.as_str());
+            }
+        }
+        match policies.as_slice() {
             [] => {}
-            [policy] => {
-                matched.insert(policy.clone());
+            [_] => {
+                matched.extend(matches.iter().map(|contribution| contribution.key.as_str()));
                 devices.push(BoundDevice {
                     observation: device,
-                    policy: policy.clone(),
+                    contributions: matches,
                 });
             }
             _ => {
-                matched.extend(owners.iter().cloned());
+                matched.extend(matches.iter().map(|contribution| contribution.key.as_str()));
+                policies.sort_unstable();
                 conflicts.push(BindingConflict {
                     target: device.identity.clone(),
-                    policies: owners
+                    policies: policies
                         .into_iter()
                         .map(|name| ConflictingPolicy {
-                            selector: selectors[&name].clone(),
-                            name,
+                            // The selector that actually matched, not the
+                            // policy's highest-precedence one.
+                            selector: matches
+                                .iter()
+                                .find(|contribution| contribution.policy == name)
+                                .expect("a listed policy matched this device")
+                                .match_spec
+                                .clone(),
+                            name: name.to_string(),
                         })
                         .collect(),
                 });
@@ -96,13 +91,30 @@ pub(super) fn bind<'a>(
             conflict.target.index,
         )
     });
+    // A policy may have both matching and unmatched selectors. Report
+    // each distinct unmatched selector once, even when static and
+    // provider contributions share it.
+    let mut unmatched_by_policy: BTreeMap<&str, Vec<UnmatchedPolicy>> = BTreeMap::new();
+    for contribution in ordered {
+        if matched.contains(contribution.key.as_str()) {
+            continue;
+        }
+        let unmatched = unmatched_by_policy
+            .entry(contribution.policy.as_str())
+            .or_default();
+        if !unmatched
+            .iter()
+            .any(|entry| entry.selector == contribution.match_spec)
+        {
+            unmatched.push(UnmatchedPolicy {
+                policy: contribution.policy.clone(),
+                selector: contribution.match_spec.clone(),
+            });
+        }
+    }
     Binding {
         devices,
         conflicts,
-        unmatched: selectors
-            .into_iter()
-            .filter(|(policy, _)| !matched.contains(policy))
-            .map(|(policy, selector)| UnmatchedPolicy { policy, selector })
-            .collect(),
+        unmatched: unmatched_by_policy.into_values().flatten().collect(),
     }
 }

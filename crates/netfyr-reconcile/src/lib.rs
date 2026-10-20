@@ -61,14 +61,14 @@ pub fn reconcile(
     let mut provenance = Vec::new();
     let mut value_conflicts = Vec::new();
     for device in &binding.devices {
-        let policy_contributions = bind::policy_contributions(contributions, &device.policy);
         let merged = merge::merge(
             &device.observation.identity,
-            &policy_contributions,
+            &device.contributions,
             &device.observation.state.fields,
         );
         value_conflicts.extend(merged.conflicts);
-        let source_by_key: BTreeMap<_, _> = policy_contributions
+        let source_by_key: BTreeMap<_, _> = device
+            .contributions
             .iter()
             .map(|contribution| (contribution.key.as_str(), contribution.source.clone()))
             .collect();

@@ -5,6 +5,7 @@ use indexmap::IndexMap;
 use netfyr_backend::{BackendError, BackendFuture, DryRunReport, NetworkBackend};
 use netfyr_reconcile::{
     ConflictIdentity, Contribution, Diagnostic, MergeOptions, ReconcileError, reconcile,
+    render_json, render_text,
 };
 use netfyr_state::plan::{
     AddressObservation, DeviceObservation, InterfaceId, Ipv4Address, NamespaceId, Observation,
@@ -12,39 +13,56 @@ use netfyr_state::plan::{
 };
 use netfyr_state::{Match, SchemaRegistry, Source, State, Value};
 
-fn interface() -> InterfaceId {
+fn interface_named(name: &str, index: u32) -> InterfaceId {
     InterfaceId {
         namespace: NamespaceId {
             device: 1,
             inode: 2,
         },
-        index: 7,
+        index,
         generation: 3,
-        name: "eth0".into(),
+        name: name.into(),
         device_type: "ethernet".into(),
         mac: Some("02:00:00:00:00:01".into()),
     }
 }
 
-fn observation(addresses: Vec<AddressObservation>, complete: bool) -> Observation {
+fn interface() -> InterfaceId {
+    interface_named("eth0", 7)
+}
+
+fn device_observation(
+    name: &str,
+    index: u32,
+    addresses: Vec<AddressObservation>,
+    complete: bool,
+) -> DeviceObservation {
     let mut state = State::new(Source::Kernel);
     state.device_type = "ethernet".into();
     state.match_spec = Match {
-        name: Some("eth0".into()),
+        name: Some(name.into()),
         r#type: Some("ethernet".into()),
         ..Match::default()
     };
     state.fields.insert("mtu".into(), Value::U64(1500));
+    DeviceObservation {
+        identity: interface_named(name, index),
+        state,
+        addresses,
+        addresses_complete: complete,
+        observed_at: Instant::now(),
+    }
+}
+
+fn observation_of(devices: Vec<DeviceObservation>) -> Observation {
     Observation {
-        devices: vec![DeviceObservation {
-            identity: interface(),
-            state,
-            addresses,
-            addresses_complete: complete,
-            observed_at: Instant::now(),
-        }],
+        devices,
         diagnostics: Vec::new(),
     }
+}
+
+fn observation(addresses: Vec<AddressObservation>, complete: bool) -> Observation {
+    observation_of(vec![device_observation("eth0", 7, addresses, complete)])
 }
 
 fn contribution(fields: IndexMap<String, Value>) -> Contribution {
@@ -115,6 +133,194 @@ fn plans_exact_identity_and_backend_operations() {
             .addresses,
         Vec::<AddressObservation>::new()
     );
+}
+
+#[test]
+fn contributions_bind_through_their_own_selectors() {
+    // One policy, two contributions with distinct selectors: each device
+    // receives only the contribution whose own selector matched it
+    // (FR-002), not every contribution of the bound policy.
+    let mut eth0_fields = IndexMap::new();
+    eth0_fields.insert("mtu".into(), Value::U64(9000));
+    let mut eth1_fields = IndexMap::new();
+    eth1_fields.insert("mtu".into(), Value::U64(1400));
+    let contributions = vec![
+        Contribution::new(
+            "p",
+            "p:eth0",
+            Source::Static { policy: "p".into() },
+            "ethernet",
+            Match {
+                name: Some("eth0".into()),
+                ..Match::default()
+            },
+            eth0_fields,
+            100,
+        ),
+        Contribution::new(
+            "p",
+            "p:eth1",
+            Source::Static { policy: "p".into() },
+            "ethernet",
+            Match {
+                name: Some("eth1".into()),
+                ..Match::default()
+            },
+            eth1_fields,
+            100,
+        ),
+    ];
+    let plan = reconcile(
+        &contributions,
+        &observation_of(vec![
+            device_observation("eth0", 7, Vec::new(), true),
+            device_observation("eth1", 8, Vec::new(), true),
+        ]),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let mtu_by_device: Vec<(&str, &Value)> = plan
+        .diff()
+        .changes
+        .iter()
+        .map(|change| {
+            (
+                change.target.name.as_str(),
+                change.desired.as_ref().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        mtu_by_device,
+        vec![("eth0", &Value::U64(9000)), ("eth1", &Value::U64(1400))]
+    );
+    for operation in &plan.diff().operations {
+        match operation.target.index {
+            7 => assert!(matches!(operation.kind, OperationKind::SetMtu(9000))),
+            8 => assert!(matches!(operation.kind, OperationKind::SetMtu(1400))),
+            _ => panic!("operation targeted an unexpected device"),
+        }
+    }
+}
+
+#[test]
+fn unmatched_selector_reports_policy_without_inventing_devices() {
+    // US1-4: a selector with no matching device produces no operation and
+    // reports the unmatched policy; it does not invent a device.
+    let mut fields = IndexMap::new();
+    fields.insert("mtu".into(), Value::U64(9000));
+    let contribution = Contribution::new(
+        "q",
+        "q",
+        Source::Static { policy: "q".into() },
+        "ethernet",
+        Match {
+            name: Some("eth9".into()),
+            ..Match::default()
+        },
+        fields,
+        100,
+    );
+    let plan = reconcile(
+        &[contribution],
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert!(plan.diff().changes.is_empty());
+    assert!(plan.diff().operations.is_empty());
+    assert!(matches!(
+        &plan.diagnostics[..],
+        [Diagnostic::UnmatchedPolicy(unmatched)]
+            if unmatched.policy == "q"
+                && unmatched.selector.name.as_deref() == Some("eth9")
+    ));
+}
+
+#[test]
+fn unmatched_sibling_selector_is_reported() {
+    let mut fields = IndexMap::new();
+    fields.insert("mtu".into(), Value::U64(9000));
+    let mut matched = contribution(fields);
+    matched.key = "p:eth0".into();
+    let mut unmatched = matched.clone();
+    unmatched.key = "p:eth9".into();
+    unmatched.match_spec.name = Some("eth9".into());
+    for contributions in [
+        vec![matched.clone(), unmatched.clone()],
+        vec![unmatched, matched],
+    ] {
+        let plan = reconcile(
+            &contributions,
+            &observation(Vec::new(), true),
+            &SchemaRegistry::new(),
+            &MergeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.diff().operations.len(), 1);
+        assert_eq!(plan.diff().operations[0].target, interface());
+        assert!(matches!(
+            plan.diagnostics.as_slice(),
+            [Diagnostic::UnmatchedPolicy(unmatched)]
+                if unmatched.policy == "p"
+                    && unmatched.selector.name.as_deref() == Some("eth9")
+        ));
+        assert_eq!(
+            render_json(&plan)["diagnostics"][0]["selector"]["name"],
+            "eth9"
+        );
+        let message = "policy p selector name=eth9 matched no interfaces";
+        assert!(render_text(&plan).contains(message));
+        assert_eq!(plan.diff().diagnostics[0].message, message);
+    }
+}
+
+#[test]
+fn unmatched_selectors_are_distinct_and_deduplicated_per_policy() {
+    let mut fields = IndexMap::new();
+    fields.insert("mtu".into(), Value::U64(9000));
+    let mut first = contribution(fields);
+    first.key = "p:eth8".into();
+    first.match_spec.name = Some("eth8".into());
+    let mut second = first.clone();
+    second.key = "p:eth9".into();
+    second.match_spec.name = Some("eth9".into());
+    let mut duplicate = second.clone();
+    duplicate.key = "p:provider".into();
+    duplicate.source = Source::Dhcp { policy: "p".into() };
+    duplicate.priority = 50;
+    let mut other_policy = second.clone();
+    other_policy.policy = "q".into();
+    other_policy.key = "q".into();
+    other_policy.source = Source::Static { policy: "q".into() };
+    let contributions = vec![first, second, duplicate, other_policy];
+    for contributions in [
+        contributions.clone(),
+        contributions.into_iter().rev().collect(),
+    ] {
+        let plan = reconcile(
+            &contributions,
+            &observation_of(Vec::new()),
+            &SchemaRegistry::new(),
+            &MergeOptions::default(),
+        )
+        .unwrap();
+        assert!(plan.diff().operations.is_empty());
+        let selectors: Vec<_> = plan
+            .diagnostics
+            .iter()
+            .map(|diagnostic| match diagnostic {
+                Diagnostic::UnmatchedPolicy(unmatched) => (
+                    unmatched.policy.as_str(),
+                    unmatched.selector.name.as_deref().unwrap(),
+                ),
+                _ => panic!("expected an unmatched-selector diagnostic"),
+            })
+            .collect();
+        assert_eq!(selectors, vec![("p", "eth8"), ("p", "eth9"), ("q", "eth9")]);
+    }
 }
 
 #[test]
