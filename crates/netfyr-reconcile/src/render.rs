@@ -2,19 +2,23 @@
 
 use serde_json::{Value as JsonValue, json};
 
-use netfyr_state::plan::InterfaceId;
+use netfyr_state::plan::{FieldChange, InterfaceId};
 use netfyr_state::{Match, Value};
 
-use crate::{Diagnostic, ReconcilePlan};
+use crate::{ConflictIdentity, Diagnostic, ReconcilePlan};
+
+/// The winning contribution key recorded for one changed field, if any.
+fn change_source<'a>(plan: &'a ReconcilePlan, change: &FieldChange) -> Option<&'a str> {
+    plan.provenance
+        .iter()
+        .find(|entry| entry.target == change.target && entry.field == change.field)
+        .and_then(|entry| entry.source.as_deref())
+}
 
 pub fn render_text(plan: &ReconcilePlan) -> String {
     let mut text = String::new();
     for change in &plan.diff().changes {
-        let source = plan
-            .provenance
-            .iter()
-            .find(|entry| entry.target == change.target && entry.field == change.field)
-            .and_then(|entry| entry.source.as_deref())
+        let source = change_source(plan, change)
             .map(|source| format!(" (source: {source})"))
             .unwrap_or_default();
         text.push_str(&format!(
@@ -49,6 +53,7 @@ pub fn render_json(plan: &ReconcilePlan) -> JsonValue {
             "field": change.field,
             "old": change.old.as_ref().map(value_json),
             "desired": change.desired.as_ref().map(value_json),
+            "source": change_source(plan, change),
         })).collect::<Vec<_>>(),
         "operations": plan.diff().operations.iter().map(|operation| json!({
             "interface": interface_json(&operation.target),
@@ -97,8 +102,15 @@ fn diagnostic_json(diagnostic: &Diagnostic) -> JsonValue {
         Diagnostic::ValueConflict(conflict) => json!({
             "kind": "value-conflict",
             "interface": interface_json(&conflict.target),
-            "identity": format!("{:?}", conflict.identity),
-            "winner": conflict.winner.source,
+            "identity": identity_json(&conflict.identity),
+            "competing": conflict.competing.iter().map(|competing| json!({
+                "source": &competing.source,
+                "value": value_json(&competing.value),
+            })).collect::<Vec<_>>(),
+            "winner": json!({
+                "source": &conflict.winner.source,
+                "value": value_json(&conflict.winner.value),
+            }),
         }),
         Diagnostic::UnmatchedPolicy(unmatched) => {
             json!({
@@ -126,12 +138,37 @@ fn selector_json(selector: &Match) -> JsonValue {
     JsonValue::Object(fields)
 }
 
+/// The conflicted field path or address identity, as structured JSON.
+fn identity_json(identity: &ConflictIdentity) -> JsonValue {
+    match identity {
+        ConflictIdentity::Field { path } => json!({ "field": path }),
+        ConflictIdentity::Address { ip } => json!({ "address": value_json(ip) }),
+    }
+}
+
 pub(crate) fn diagnostic_text(diagnostic: &Diagnostic) -> String {
     match diagnostic {
-        Diagnostic::ValueConflict(conflict) => format!(
-            "value conflict on {}: {:?}",
-            conflict.target.name, conflict.identity
-        ),
+        Diagnostic::ValueConflict(conflict) => {
+            let identity = match &conflict.identity {
+                ConflictIdentity::Field { path } => format!("field {path}"),
+                ConflictIdentity::Address { ip } => format!("address {ip}"),
+            };
+            let winner = format!("{} ({})", conflict.winner.source, conflict.winner.value);
+            let losers: Vec<_> = conflict
+                .competing
+                .iter()
+                .filter(|competing| {
+                    competing.source != conflict.winner.source
+                        || competing.value != conflict.winner.value
+                })
+                .map(|competing| format!("{} ({})", competing.source, competing.value))
+                .collect();
+            format!(
+                "value conflict on {} {identity}: {winner} wins over {}",
+                conflict.target.name,
+                losers.join(", ")
+            )
+        }
         Diagnostic::UnmatchedPolicy(unmatched) => {
             format!(
                 "policy {} selector {} matched no interfaces",

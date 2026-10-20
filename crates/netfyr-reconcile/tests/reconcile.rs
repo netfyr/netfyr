@@ -943,6 +943,7 @@ fn empty_higher_precedence_list_keeps_winning_address_source() {
             plan.provenance[0].element_sources.as_deref(),
             Some(&["p:provider".to_string()][..])
         );
+        assert_eq!(render_json(&plan)["changes"][0]["source"], "p:provider");
         assert!(render_text(&plan).contains("(source: p:provider)"));
     }
 }
@@ -1081,6 +1082,55 @@ fn keeps_structured_conflict_and_mirrors_it_to_backend_diagnostics() {
     ));
     assert_eq!(plan.diff().diagnostics.len(), 1);
     assert_eq!(plan.provenance[0].source.as_deref(), Some("p"));
+}
+
+#[test]
+fn renders_conflict_evidence_and_winner_in_both_outputs() {
+    // FR-010 / FR-012: both outputs retain the competing sources and
+    // values and the selected winner, and JSON changes carry the winning
+    // source.
+    let mut high_fields = IndexMap::new();
+    high_fields.insert("mtu".into(), Value::U64(9000));
+    let mut low_fields = IndexMap::new();
+    low_fields.insert("mtu".into(), Value::U64(1400));
+    let high = contribution(high_fields);
+    let low = Contribution::new(
+        "p",
+        "p:provider",
+        Source::Dhcp { policy: "p".into() },
+        "ethernet",
+        Match {
+            name: Some("eth0".into()),
+            ..Match::default()
+        },
+        low_fields,
+        50,
+    );
+    let plan = reconcile(
+        &[high, low],
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let json = render_json(&plan);
+    let diagnostic = &json["diagnostics"][0];
+    assert_eq!(diagnostic["kind"], "value-conflict");
+    assert_eq!(diagnostic["identity"]["field"], "mtu");
+    assert_eq!(diagnostic["winner"]["source"], "p");
+    assert_eq!(diagnostic["winner"]["value"], 9000);
+    let competing = diagnostic["competing"].as_array().unwrap();
+    assert_eq!(competing.len(), 2);
+    assert_eq!(competing[0]["source"], "p");
+    assert_eq!(competing[0]["value"], 9000);
+    assert_eq!(competing[1]["source"], "p:provider");
+    assert_eq!(competing[1]["value"], 1400);
+    assert_eq!(json["changes"][0]["source"], "p");
+    let text = render_text(&plan);
+    assert!(
+        text.contains("value conflict on eth0 field mtu: p (9000) wins over p:provider (1400)"),
+        "unexpected diagnostics text: {text}"
+    );
 }
 
 struct DryRunBackend;
