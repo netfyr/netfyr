@@ -878,6 +878,76 @@ fn duplicate_addresses_with_different_attributes_conflict_within_one_contributio
 }
 
 #[test]
+fn explicit_empty_address_list_attributes_removals_to_its_contribution() {
+    // FR-005: an explicit empty address list has no first element, yet
+    // the removals it causes must carry the contributing policy's source
+    // instead of falling back to kernel provenance.
+    let observed = vec![AddressObservation {
+        address: Ipv4Address {
+            ip: Ipv4Addr::new(192, 0, 2, 10),
+            prefix_len: 24,
+            valid_lft: None,
+            preferred_lft: None,
+        },
+        flags: 0,
+        scope: 0,
+        peer: None,
+    }];
+    let plan = reconcile(
+        &[contribution(address_fields(vec![]))],
+        &observation(observed, true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let removals = plan
+        .diff()
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.kind, OperationKind::RemoveIpv4(_)))
+        .count();
+    assert_eq!(removals, 1);
+    let change = &plan.diff().changes[0];
+    assert_eq!(change.field, "ipv4.addresses");
+    assert_eq!(change.source, Source::Static { policy: "p".into() });
+    assert_eq!(plan.provenance[0].source.as_deref(), Some("p"));
+}
+
+#[test]
+fn empty_higher_precedence_list_keeps_winning_address_source() {
+    let high = contribution(address_fields(vec![]));
+    let low = Contribution::new(
+        "p",
+        "p:provider",
+        Source::Dhcp { policy: "p".into() },
+        "ethernet",
+        high.match_spec.clone(),
+        address_fields(vec![address(Ipv4Addr::new(192, 0, 2, 10), None, None)]),
+        50,
+    );
+    for contributions in [vec![high.clone(), low.clone()], vec![low, high]] {
+        let plan = reconcile(
+            &contributions,
+            &observation(Vec::new(), true),
+            &SchemaRegistry::new(),
+            &MergeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.diff().changes.len(), 1);
+        assert_eq!(
+            plan.diff().changes[0].source,
+            Source::Dhcp { policy: "p".into() }
+        );
+        assert_eq!(plan.provenance[0].source.as_deref(), Some("p:provider"));
+        assert_eq!(
+            plan.provenance[0].element_sources.as_deref(),
+            Some(&["p:provider".to_string()][..])
+        );
+        assert!(render_text(&plan).contains("(source: p:provider)"));
+    }
+}
+
+#[test]
 fn rejects_peer_or_scope_groups_that_backend_cannot_rebuild_safely() {
     let actual = Ipv4Address {
         ip: Ipv4Addr::new(192, 0, 2, 10),

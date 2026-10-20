@@ -76,8 +76,14 @@ pub(super) fn diff_device(
     }
     if let Some(desired) = lookup(effective, ADDRESS_PATH) {
         let address_source_keys = list_elements.get(ADDRESS_PATH).map(Vec::as_slice);
-        let source = address_source_keys
+        // The first element's contribution normally supplies the field's
+        // source; an explicit empty list has no element, so its owner —
+        // the contribution that set the empty list — attributes the
+        // removals it causes instead of falling back to the kernel.
+        let source_key = address_source_keys
             .and_then(|keys| keys.first())
+            .or_else(|| leaf_sources.get(ADDRESS_PATH));
+        let source = source_key
             .and_then(|key| source_by_key.get(key.as_str()))
             .cloned()
             .unwrap_or(Source::Kernel);
@@ -91,7 +97,7 @@ pub(super) fn diff_device(
             provenance.push(ChangeProvenance {
                 target: device.identity.clone(),
                 field: ADDRESS_PATH.into(),
-                source: None,
+                source: source_key.cloned(),
                 element_sources: address_source_keys.map(<[String]>::to_vec),
             });
             // Address dependencies index the address-only vector; shift

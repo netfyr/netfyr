@@ -33,7 +33,9 @@ pub(super) struct Merged {
     /// The effective desired fields, in stable order (contribution
     /// insertion order, then overlay order).
     pub fields: IndexMap<String, Value>,
-    /// The winning contribution key for each scalar or mapped leaf path.
+    /// The winning contribution key for each scalar leaf path; for a
+    /// list path, the first contribution to set the field, including an
+    /// empty one.
     pub leaf_sources: IndexMap<String, String>,
     /// The winning contribution key per element of each list path,
     /// aligned with the merged list.
@@ -80,6 +82,12 @@ impl Ctx {
                     .collect(),
             ),
             Value::List(items) => {
+                // The first contribution to set the field owns it, also
+                // when its list is empty (FR-005): an explicit empty list
+                // must still attribute the removals it causes.
+                self.leaf_sources
+                    .entry(path.to_string())
+                    .or_insert_with(|| key.to_string());
                 let mut existing = Vec::new();
                 self.on_union(path, key, &mut existing, items);
                 Value::List(existing)
