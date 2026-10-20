@@ -272,6 +272,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "netfyr-reconcile"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "netfyr-backend",
+ "netfyr-state",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "netfyr-state"
 version = "0.1.0"
 dependencies = [

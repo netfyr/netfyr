@@ -592,6 +592,47 @@ impl SchemaRegistry {
             .copied()
     }
 
+    /// Whether a policy may set the field at `root_path` (FR-007).
+    ///
+    /// The first dot segment is routed to a fragment: a segment equal to a
+    /// fragment's trigger key selects that fragment, with the remainder as
+    /// the in-fragment path; otherwise the full path is looked up in the
+    /// always-applied `base` fragment. `[n]` array indices are stripped
+    /// before lookup, mirroring the flat field map that describes list
+    /// shapes at the array's path. An unknown fragment or field returns
+    /// `false` (fail-closed).
+    pub fn is_writable(&self, root_path: &str) -> bool {
+        let segments: Vec<&str> = root_path.split('.').collect();
+        let (fragment, remainder) = match segments.first().copied() {
+            Some(first)
+                if self
+                    .fragments
+                    .iter()
+                    .any(|f| f.trigger_key == Some(strip_index(first))) =>
+            {
+                let fragment = self
+                    .fragments
+                    .iter()
+                    .find(|f| f.trigger_key == Some(strip_index(first)))
+                    .expect("fragment matched by the any() check above");
+                (fragment, &segments[1..])
+            }
+            _ => {
+                let Some(base) = self.fragments.iter().find(|f| f.trigger_key.is_none()) else {
+                    return false;
+                };
+                (base, segments.as_slice())
+            }
+        };
+        let path: String = remainder
+            .iter()
+            .copied()
+            .map(strip_index)
+            .collect::<Vec<_>>()
+            .join(".");
+        fragment.fields.get(&path).is_some_and(|info| info.writable)
+    }
+
     /// Look up the schema governing a top-level YAML state property. Base
     /// properties and registered fragment trigger keys use this one routing
     /// table, avoiding duplicated knowledge in the YAML codec.
@@ -1091,6 +1132,11 @@ fn join_path(prefix: &str, key: &str) -> String {
     } else {
         format!("{prefix}.{key}")
     }
+}
+
+/// Strip a `[n]` array index from one dot-path segment.
+fn strip_index(segment: &str) -> &str {
+    segment.split('[').next().unwrap_or(segment)
 }
 
 #[cfg(test)]

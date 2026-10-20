@@ -17,3 +17,11 @@ they name carry that history.
 
 - Decode YAML values from their schema path instead of globally inferring IP
   types from string contents (core/002-schema-validation).
+- Add `netfyr-reconcile`: pure reconciliation that binds policy
+  contributions to backend observations, merges a policy's sources by
+  priority, and plans backend-executable operations with diagnostics and
+  contribution provenance (core/005-reconciliation).
+- Add tiered policy loading: `load_policy_tiers` selects policy
+  definitions by name across an ordered search path
+  (`DEFAULT_POLICY_PATHS`), with the highest-precedence tier shadowing a
+  same-named policy (core/005-reconciliation).
