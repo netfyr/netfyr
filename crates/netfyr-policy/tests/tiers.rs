@@ -104,6 +104,33 @@ fn us6_2_distinct_names_coexist_across_tiers() {
     let _ = fs::remove_dir_all(&usrlib_dir);
 }
 
+/// FR-011: a root that cannot be stat'ed (here: a path below a regular
+/// file, ENOTDIR) is a hard Io error rather than a silently skipped
+/// tier; a merely absent root is skipped.
+#[test]
+fn unstattable_root_fails_hard_absent_root_is_skipped() {
+    let tier = tier_root("stat");
+    let tier_dir = tier.clone();
+    fs::write(tier.join("file.yaml"), "not a directory\n").unwrap();
+
+    let error = load_policy_tiers(
+        &[tier.join("file.yaml").join("policies")],
+        &ApplyOptions::default(),
+    )
+    .expect_err("a root that cannot be stat'ed must fail the load");
+    assert!(
+        matches!(&error, PolicyError::Io(_)),
+        "expected an Io error, got {error:?}"
+    );
+
+    let outcome = load_policy_tiers(&[tier.join("does-not-exist")], &ApplyOptions::default())
+        .expect("an absent root is skipped");
+    assert!(outcome.policies.is_empty());
+    assert!(outcome.warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&tier_dir);
+}
+
 /// US6-3: duplicate policy names within one tier return SPEC-003's
 /// duplicate-name error at load time, before planning.
 #[test]

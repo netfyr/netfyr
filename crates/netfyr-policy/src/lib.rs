@@ -430,9 +430,9 @@ pub const DEFAULT_POLICY_PATHS: &[&str] = &[
 /// wholesale (shadowing), while distinct names coexist across tiers.
 ///
 /// A root that is absent or not a directory is skipped; a root that
-/// exists but fails to read is a hard [`PolicyError::Io`]. Each tier is
-/// loaded with [`load_policy_dir`], so its duplicate and validation
-/// rules apply per tier.
+/// exists but cannot be stat'ed or read is a hard [`PolicyError::Io`].
+/// Each tier is loaded with [`load_policy_dir`], so its duplicate and
+/// validation rules apply per tier.
 pub fn load_policy_tiers(
     roots: &[impl AsRef<Path>],
     options: &ApplyOptions,
@@ -441,8 +441,13 @@ pub fn load_policy_tiers(
     let mut warnings = Vec::new();
     for root in roots {
         let root = root.as_ref();
-        if !root.is_dir() {
-            continue;
+        // `is_dir()` would turn metadata errors into false; only an
+        // absent root or a genuine non-directory is skipped.
+        match fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(PolicyError::Io(error.to_string())),
         }
         let tier = load_policy_dir(root, options.clone())?;
         for policy in tier.policies {
