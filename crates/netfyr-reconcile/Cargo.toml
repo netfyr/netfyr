@@ -9,7 +9,6 @@ rust-version.workspace = true
 [dependencies]
 # netfyr-state: state representation, backend plan contract, and schema registry.
 netfyr-state = { path = "../netfyr-state" }
-netfyr-backend = { path = "../netfyr-backend" }
 # indexmap: insertion-ordered maps for building and merging fields; std has no insertion-ordered
 # map, and the model's Value::Map is itself an IndexMap.
 indexmap = "2"
@@ -20,4 +19,7 @@ serde_json = "1"
 uuid = "1"
 
 [dev-dependencies]
+# netfyr-backend: the pure planner must not depend on the concrete backend; only tests exercise
+# the backend contract with a DryRunBackend.
+netfyr-backend = { path = "../netfyr-backend" }
 tokio = { version = "1", features = ["macros", "rt"] }
