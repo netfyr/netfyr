@@ -74,7 +74,19 @@ pub(super) fn diff_device(
             });
         }
     }
-    if let Some(desired) = lookup(effective, ADDRESS_PATH) {
+    // FR-006: only an explicitly configured address field is planned.
+    // `effective` also carries observed fields, so the field's presence
+    // alone does not mean a contribution requested it: an mtu-only policy
+    // must not fail on an incomplete address inventory or on a scoped or
+    // peer address the planner cannot rebuild. The merge records a list
+    // owner — including for an explicit empty list — only for fields a
+    // contribution set.
+    let desired = if leaf_sources.contains_key(ADDRESS_PATH) {
+        lookup(effective, ADDRESS_PATH)
+    } else {
+        None
+    };
+    if let Some(desired) = desired {
         let address_source_keys = list_elements.get(ADDRESS_PATH).map(Vec::as_slice);
         // The first element's contribution normally supplies the field's
         // source; an explicit empty list has no element, so its owner —

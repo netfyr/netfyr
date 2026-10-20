@@ -948,6 +948,85 @@ fn empty_higher_precedence_list_keeps_winning_address_source() {
 }
 
 #[test]
+fn observed_addresses_alone_do_not_trigger_address_planning() {
+    // FR-006: only explicitly configured fields produce operations. An
+    // mtu-only policy leaves addresses untouched even when the observed
+    // fields carry an address list and the inventory is incomplete or
+    // holds a scoped/peer address the planner could not rebuild.
+    let mut fields = IndexMap::new();
+    fields.insert("mtu".into(), Value::U64(9000));
+    let kernel_reported = || {
+        let mut ipv4 = IndexMap::new();
+        ipv4.insert(
+            "addresses".into(),
+            Value::List(vec![address(Ipv4Addr::new(192, 0, 2, 10), None, None)]),
+        );
+        let mut extra = IndexMap::new();
+        extra.insert("ipv4".into(), Value::Map(ipv4));
+        extra
+    };
+    let mut incomplete = device_observation("eth0", 7, Vec::new(), false);
+    incomplete
+        .state
+        .fields
+        .extend(kernel_reported().into_iter());
+    let plan = reconcile(
+        &[contribution(fields.clone())],
+        &observation_of(vec![incomplete]),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        plan.diff().operations.as_slice(),
+        [operation] if matches!(operation.kind, OperationKind::SetMtu(9000))
+    ));
+    assert!(
+        !plan
+            .diff()
+            .changes
+            .iter()
+            .any(|change| change.field == "ipv4.addresses")
+    );
+
+    let mut scoped = device_observation(
+        "eth0",
+        7,
+        vec![AddressObservation {
+            address: Ipv4Address {
+                ip: Ipv4Addr::new(192, 0, 2, 10),
+                prefix_len: 24,
+                valid_lft: None,
+                preferred_lft: None,
+            },
+            flags: 0,
+            scope: 254,
+            peer: Some(Ipv4Addr::new(198, 51, 100, 10)),
+        }],
+        true,
+    );
+    scoped.state.fields.extend(kernel_reported().into_iter());
+    let plan = reconcile(
+        &[contribution(fields)],
+        &observation_of(vec![scoped]),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        plan.diff().operations.as_slice(),
+        [operation] if matches!(operation.kind, OperationKind::SetMtu(9000))
+    ));
+    assert!(
+        !plan
+            .diff()
+            .changes
+            .iter()
+            .any(|change| change.field == "ipv4.addresses")
+    );
+}
+
+#[test]
 fn rejects_peer_or_scope_groups_that_backend_cannot_rebuild_safely() {
     let actual = Ipv4Address {
         ip: Ipv4Addr::new(192, 0, 2, 10),
