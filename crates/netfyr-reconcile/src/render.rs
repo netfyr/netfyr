@@ -107,11 +107,6 @@ fn diagnostic_json(diagnostic: &Diagnostic) -> JsonValue {
                 "selector": selector_json(&unmatched.selector),
             })
         }
-        Diagnostic::BindingConflict(conflict) => json!({
-            "kind": "binding-conflict",
-            "interface": interface_json(&conflict.target),
-            "policies": conflict.policies.iter().map(|policy| &policy.name).collect::<Vec<_>>(),
-        }),
     }
 }
 
@@ -143,15 +138,5 @@ pub(crate) fn diagnostic_text(diagnostic: &Diagnostic) -> String {
                 unmatched.policy, unmatched.selector
             )
         }
-        Diagnostic::BindingConflict(conflict) => format!(
-            "interface {} matched policies {}",
-            conflict.target.name,
-            conflict
-                .policies
-                .iter()
-                .map(|policy| policy.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
     }
 }

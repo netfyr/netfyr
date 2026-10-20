@@ -1,7 +1,8 @@
 //! User Story 6 - load administrative overrides (FR-011, SC-002):
 //! same-name shadowing selects the whole higher-tier definition before
 //! contributions are produced; differently named policies coexist in the
-//! loaded set and are rejected only at binding, as a binding conflict.
+//! loaded set and contribute under SPEC-005's merge rules when they bind
+//! to one device.
 
 use std::fs;
 use std::path::PathBuf;

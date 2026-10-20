@@ -3,13 +3,12 @@ use std::fmt;
 use netfyr_state::IndexedValidationError;
 use netfyr_state::plan::InterfaceId;
 
-use crate::{BindingConflict, ValueConflict};
+use crate::ValueConflict;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReconcileError {
     Validation(Vec<IndexedValidationError>),
     DuplicateContributionKeys(Vec<String>),
-    BindingConflicts(Vec<BindingConflict>),
     IncompleteAddressInventory {
         target: Box<InterfaceId>,
     },
@@ -30,9 +29,6 @@ impl fmt::Display for ReconcileError {
             Self::Validation(_) => f.write_str("contributions failed schema validation"),
             Self::DuplicateContributionKeys(keys) => {
                 write!(f, "duplicate contribution keys: {}", keys.join(", "))
-            }
-            Self::BindingConflicts(conflicts) => {
-                write!(f, "{} binding conflict(s)", conflicts.len())
             }
             Self::IncompleteAddressInventory { target } => {
                 write!(f, "{}: IPv4 inventory is incomplete", target.name)

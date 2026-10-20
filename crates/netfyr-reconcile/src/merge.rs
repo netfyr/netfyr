@@ -1,12 +1,12 @@
-//! Merging one policy's contributions against the observed baseline
-//! (FR-004..FR-006).
+//! Merging the contributions bound to one device — from any number of
+//! policies — against the observed baseline (FR-004..FR-006).
 //!
 //! Two phases, one result:
 //!
-//! 1. The policy's contributions merge into an empty result in
-//!    precedence order (highest priority, then key): maps merge key by
-//!    key, lists union — the address field by `ip` identity, any other
-//!    list structurally — and scalars keep the first value, with later
+//! 1. The bound contributions merge into an empty result in precedence
+//!    order (highest priority, then key): maps merge key by key, lists
+//!    union — the address field by `ip` identity, any other list
+//!    structurally — and scalars keep the first value, with later
 //!    disagreements recorded for conflict detection (FR-012).
 //! 2. The observed device fields overlay only the keys the contributions
 //!    did not set, so observed configuration the policy leaves untouched
@@ -208,8 +208,9 @@ impl Ctx {
     }
 }
 
-/// Merge one bound device: its policy's contributions in precedence
-/// order, then the observed baseline for keys they left unset.
+/// Merge one bound device: all contributions whose selector matched it,
+/// in precedence order, then the observed baseline for keys they left
+/// unset.
 pub(super) fn merge(
     target: &InterfaceId,
     contributions: &[&Contribution],

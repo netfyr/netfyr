@@ -52,9 +52,6 @@ pub fn reconcile(
     }
 
     let binding = bind::bind(contributions, observation);
-    if !binding.conflicts.is_empty() {
-        return Err(ReconcileError::BindingConflicts(binding.conflicts));
-    }
 
     let mut changes = Vec::new();
     let mut operations = Vec::new();
@@ -146,7 +143,6 @@ fn scratch_state(contribution: &Contribution) -> State {
 fn diagnostic_target(diagnostic: &Diagnostic) -> Option<InterfaceId> {
     match diagnostic {
         Diagnostic::ValueConflict(conflict) => Some(conflict.target.clone()),
-        Diagnostic::BindingConflict(conflict) => Some(conflict.target.clone()),
         Diagnostic::UnmatchedPolicy(_) => None,
     }
 }

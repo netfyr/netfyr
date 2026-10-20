@@ -70,18 +70,6 @@ pub struct ValueConflict {
     pub winner: CompetingValue,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConflictingPolicy {
-    pub name: String,
-    pub selector: Match,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BindingConflict {
-    pub target: InterfaceId,
-    pub policies: Vec<ConflictingPolicy>,
-}
-
 /// One selector that matched no device, even if another selector from the
 /// same policy matched. Identical selectors within a policy are reported once.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,7 +84,6 @@ pub struct UnmatchedPolicy {
 pub enum Diagnostic {
     ValueConflict(ValueConflict),
     UnmatchedPolicy(UnmatchedPolicy),
-    BindingConflict(BindingConflict),
 }
 
 /// Contribution-key provenance for one backend field change.

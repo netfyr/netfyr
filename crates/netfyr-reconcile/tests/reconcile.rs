@@ -4,8 +4,8 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use netfyr_backend::{BackendError, BackendFuture, DryRunReport, NetworkBackend};
 use netfyr_reconcile::{
-    ConflictIdentity, Contribution, Diagnostic, MergeOptions, ReconcileError, reconcile,
-    render_json, render_text,
+    ConflictIdentity, ConflictPolicy, Contribution, Diagnostic, MergeOptions, ReconcileError,
+    reconcile, render_json, render_text,
 };
 use netfyr_state::plan::{
     AddressObservation, DeviceObservation, InterfaceId, Ipv4Address, NamespaceId, Observation,
@@ -42,6 +42,7 @@ fn device_observation(
     state.match_spec = Match {
         name: Some(name.into()),
         r#type: Some("ethernet".into()),
+        mac: Some("02:00:00:00:00:01".into()),
         ..Match::default()
     };
     state.fields.insert("mtu".into(), Value::U64(1500));
@@ -321,6 +322,130 @@ fn unmatched_selectors_are_distinct_and_deduplicated_per_policy() {
             .collect();
         assert_eq!(selectors, vec![("p", "eth8"), ("p", "eth9"), ("q", "eth9")]);
     }
+}
+
+#[test]
+fn differently_named_policies_matching_one_device_both_contribute() {
+    // US1-3 / FR-002: a name-selected and a MAC-selected policy that both
+    // identify eth0 contribute to the same device; disjoint fields from
+    // both are retained instead of one policy rejecting the other.
+    let mut mtu_fields = IndexMap::new();
+    mtu_fields.insert("mtu".into(), Value::U64(9000));
+    let mut enabled_fields = IndexMap::new();
+    enabled_fields.insert("enabled".into(), Value::Bool(false));
+    let contributions = vec![
+        Contribution::new(
+            "mtu-policy",
+            "mtu-policy",
+            Source::Static {
+                policy: "mtu-policy".into(),
+            },
+            "ethernet",
+            Match {
+                name: Some("eth0".into()),
+                ..Match::default()
+            },
+            mtu_fields,
+            100,
+        ),
+        Contribution::new(
+            "enabled-policy",
+            "enabled-policy",
+            Source::Static {
+                policy: "enabled-policy".into(),
+            },
+            "ethernet",
+            Match {
+                mac: Some("02:00:00:00:00:01".into()),
+                ..Match::default()
+            },
+            enabled_fields,
+            100,
+        ),
+    ];
+    let plan = reconcile(
+        &contributions,
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let changed: Vec<(&str, &Value)> = plan
+        .diff()
+        .changes
+        .iter()
+        .map(|change| (change.field.as_str(), change.desired.as_ref().unwrap()))
+        .collect();
+    assert_eq!(
+        changed,
+        vec![("enabled", &Value::Bool(false)), ("mtu", &Value::U64(9000))]
+    );
+    assert!(plan.diagnostics.is_empty());
+    assert!(plan.diff().diagnostics.is_empty());
+}
+
+#[test]
+fn cross_policy_field_conflict_resolves_or_rejects() {
+    // FR-002 / FR-012: two policies configuring the same field of one
+    // device are per-field value conflicts decided by precedence, not
+    // binding errors.
+    let mut high_fields = IndexMap::new();
+    high_fields.insert("mtu".into(), Value::U64(9000));
+    let mut low_fields = IndexMap::new();
+    low_fields.insert("mtu".into(), Value::U64(1400));
+    let contributions = vec![
+        Contribution::new(
+            "a",
+            "a",
+            Source::Static { policy: "a".into() },
+            "ethernet",
+            Match {
+                name: Some("eth0".into()),
+                ..Match::default()
+            },
+            high_fields,
+            100,
+        ),
+        Contribution::new(
+            "b",
+            "b",
+            Source::Static { policy: "b".into() },
+            "ethernet",
+            Match {
+                name: Some("eth0".into()),
+                ..Match::default()
+            },
+            low_fields,
+            100,
+        ),
+    ];
+    let plan = reconcile(
+        &contributions,
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &plan.diagnostics[..],
+        [Diagnostic::ValueConflict(conflict)]
+            if matches!(conflict.identity, ConflictIdentity::Field { ref path } if path == "mtu")
+                && conflict.winner.source == "a"
+    ));
+    assert_eq!(
+        plan.diff().changes[0].desired.as_ref().unwrap(),
+        &Value::U64(9000)
+    );
+    let error = reconcile(
+        &contributions,
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions {
+            conflict_policy: ConflictPolicy::Reject,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, ReconcileError::ValueConflicts(_)));
 }
 
 #[test]
