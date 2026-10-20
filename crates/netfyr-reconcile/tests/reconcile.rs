@@ -717,6 +717,66 @@ fn group_operations_have_snapshot_and_a_complete_dependency_chain() {
 }
 
 #[test]
+fn address_dependencies_account_for_prepended_scalar_operations() {
+    // A scalar change is planned before the address operations, so the
+    // address chain must be offset by it: the second removal depends on
+    // the first removal, not on the mtu assignment (failure propagation
+    // and the backend's cascade checks walk these edges).
+    let first = Ipv4Address {
+        ip: Ipv4Addr::new(192, 0, 2, 10),
+        prefix_len: 24,
+        valid_lft: None,
+        preferred_lft: None,
+    };
+    let second = Ipv4Address {
+        ip: Ipv4Addr::new(192, 0, 2, 11),
+        prefix_len: 24,
+        valid_lft: None,
+        preferred_lft: None,
+    };
+    let observed = vec![
+        AddressObservation {
+            address: second.clone(),
+            flags: 0,
+            scope: 0,
+            peer: None,
+        },
+        AddressObservation {
+            address: first.clone(),
+            flags: 0,
+            scope: 0,
+            peer: None,
+        },
+    ];
+    let mut fields = address_fields(vec![
+        address(first.ip, None, None),
+        address(second.ip, None, None),
+    ]);
+    fields.insert("mtu".into(), Value::U64(9000));
+    let plan = reconcile(
+        &[contribution(fields)],
+        &observation(observed, true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let operations = &plan.diff().operations;
+    assert_eq!(operations.len(), 5);
+    assert!(matches!(operations[0].kind, OperationKind::SetMtu(9000)));
+    assert!(matches!(operations[1].kind, OperationKind::RemoveIpv4(_)));
+    assert!(operations[1].address_group.is_some());
+    assert_eq!(operations[2].depends_on, vec![1]);
+    assert_eq!(operations[3].depends_on, vec![2]);
+    assert_eq!(operations[4].depends_on, vec![3]);
+    assert!(operations[2..].iter().all(|operation| {
+        operation
+            .depends_on
+            .iter()
+            .all(|dependency| *dependency >= 1)
+    }));
+}
+
+#[test]
 fn rejects_peer_or_scope_groups_that_backend_cannot_rebuild_safely() {
     let actual = Ipv4Address {
         ip: Ipv4Addr::new(192, 0, 2, 10),

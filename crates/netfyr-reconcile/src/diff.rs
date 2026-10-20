@@ -94,7 +94,17 @@ pub(super) fn diff_device(
                 source: None,
                 element_sources: address_source_keys.map(<[String]>::to_vec),
             });
-            operations.extend(address_operations);
+            // Address dependencies index the address-only vector; shift
+            // them past this device's scalar operations so they address
+            // rows of the combined operation list.
+            let base = operations.len();
+            operations.extend(address_operations.into_iter().map(|mut operation| {
+                operation
+                    .depends_on
+                    .iter_mut()
+                    .for_each(|dependency| *dependency += base);
+                operation
+            }));
         }
     }
     Ok(DeviceDiff {
