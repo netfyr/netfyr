@@ -42,6 +42,7 @@ fn device_observation(
     state.match_spec = Match {
         name: Some(name.into()),
         r#type: Some("ethernet".into()),
+        driver: Some("ixgbe".into()),
         mac: Some("02:00:00:00:00:01".into()),
         ..Match::default()
     };
@@ -446,6 +447,155 @@ fn cross_policy_field_conflict_resolves_or_rejects() {
     )
     .unwrap_err();
     assert!(matches!(error, ReconcileError::ValueConflicts(_)));
+}
+
+#[test]
+fn equal_priority_breaks_ties_by_selector_specificity() {
+    // US2-3: equal-priority conflicting MTUs selected by driver and by
+    // name: the name-selected contribution wins, even when its key sorts
+    // after the driver-selected one.
+    let mut driver_fields = IndexMap::new();
+    driver_fields.insert("mtu".into(), Value::U64(9000));
+    let mut name_fields = IndexMap::new();
+    name_fields.insert("mtu".into(), Value::U64(1400));
+    let driver = Contribution::new(
+        "a",
+        "a",
+        Source::Static { policy: "a".into() },
+        "ethernet",
+        Match {
+            driver: Some("ixgbe".into()),
+            ..Match::default()
+        },
+        driver_fields,
+        100,
+    );
+    let name = Contribution::new(
+        "z",
+        "z",
+        Source::Static { policy: "z".into() },
+        "ethernet",
+        Match {
+            name: Some("eth0".into()),
+            ..Match::default()
+        },
+        name_fields,
+        100,
+    );
+    for contributions in [vec![driver.clone(), name.clone()], vec![name, driver]] {
+        let plan = reconcile(
+            &contributions,
+            &observation(Vec::new(), true),
+            &SchemaRegistry::new(),
+            &MergeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.diff().changes[0].desired.as_ref().unwrap(),
+            &Value::U64(1400),
+            "the name-selected contribution must win at equal priority"
+        );
+        assert!(matches!(
+            &plan.diagnostics[..],
+            [Diagnostic::ValueConflict(conflict)] if conflict.winner.source == "z"
+        ));
+    }
+}
+
+#[test]
+fn equal_priority_equal_specificity_breaks_ties_by_policy_name() {
+    // US2-4: equal-priority, equally specific policies: the policy name
+    // breaks the tie before the contribution key, regardless of input
+    // order.
+    fn policy(name: &str, key: &str, mtu: u64) -> Contribution {
+        let mut fields = IndexMap::new();
+        fields.insert("mtu".into(), Value::U64(mtu));
+        Contribution::new(
+            name,
+            key,
+            Source::Static {
+                policy: name.into(),
+            },
+            "ethernet",
+            Match {
+                name: Some("eth0".into()),
+                ..Match::default()
+            },
+            fields,
+            100,
+        )
+    }
+    // `aaa` sorts before `zzz` by policy name even though its key sorts
+    // after `zzz`'s.
+    for contributions in [
+        vec![policy("zzz", "a", 9000), policy("aaa", "z", 1400)],
+        vec![policy("aaa", "z", 1400), policy("zzz", "a", 9000)],
+    ] {
+        let plan = reconcile(
+            &contributions,
+            &observation(Vec::new(), true),
+            &SchemaRegistry::new(),
+            &MergeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.diff().changes[0].desired.as_ref().unwrap(),
+            &Value::U64(1400),
+            "the policy named `aaa` must win the tie"
+        );
+        assert!(matches!(
+            &plan.diagnostics[..],
+            [Diagnostic::ValueConflict(conflict)] if conflict.winner.source == "z"
+        ));
+    }
+}
+
+#[test]
+fn priority_beats_selector_specificity() {
+    // US2-2: a higher explicit priority wins regardless of selector
+    // specificity.
+    let mut name_fields = IndexMap::new();
+    name_fields.insert("mtu".into(), Value::U64(9000));
+    let mut driver_fields = IndexMap::new();
+    driver_fields.insert("mtu".into(), Value::U64(1400));
+    let contributions = vec![
+        Contribution::new(
+            "a",
+            "a",
+            Source::Static { policy: "a".into() },
+            "ethernet",
+            Match {
+                name: Some("eth0".into()),
+                ..Match::default()
+            },
+            name_fields,
+            100,
+        ),
+        Contribution::new(
+            "z",
+            "z",
+            Source::Static { policy: "z".into() },
+            "ethernet",
+            Match {
+                driver: Some("ixgbe".into()),
+                ..Match::default()
+            },
+            driver_fields,
+            200,
+        ),
+    ];
+    let plan = reconcile(
+        &contributions,
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.diff().changes[0].desired.as_ref().unwrap(),
+        &Value::U64(1400),
+        "the higher-priority contribution must win"
+    );
 }
 
 #[test]
