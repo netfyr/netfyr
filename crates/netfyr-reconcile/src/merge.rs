@@ -6,7 +6,8 @@
 //! 1. The bound contributions merge into an empty result in precedence
 //!    order (highest priority, then key): maps merge key by key, lists
 //!    union — the address field by `ip` identity, any other list
-//!    structurally — and scalars keep the first value, with later
+//!    structurally, and within one contribution's list as across
+//!    contributions — and scalars keep the first value, with later
 //!    disagreements recorded for conflict detection (FR-012).
 //! 2. The observed device fields overlay only the keys the contributions
 //!    did not set, so observed configuration the policy leaves untouched
@@ -56,29 +57,32 @@ struct Ctx {
 }
 
 impl Ctx {
-    /// A value was newly inserted at `path` (first contribution to set
-    /// this position): record its provenance. A map is inserted
-    /// wholesale, so its inner leaves and lists were never visited by
-    /// [`merge_child`]; the recording recurses into them, or nested
-    /// scalars would lose their winning source (FR-005) and a later
-    /// conflicting value would be the only recorded evidence (FR-012).
-    fn on_insert(&mut self, path: &str, key: &str, value: &Value) {
+    /// Build the value for a position no contribution has set yet,
+    /// recording provenance and conflict evidence. Lists deduplicate on
+    /// insertion exactly as they do when a later contribution unions into
+    /// them (FR-004: the ordered union keeps the first occurrence of each
+    /// element, also within one contribution's list). A map is inserted
+    /// wholesale, so the recursion must record its inner leaves and
+    /// lists, or nested scalars would lose their winning source (FR-005)
+    /// and a later conflicting value would be the only recorded evidence
+    /// (FR-012).
+    fn fresh_value(&mut self, path: &str, key: &str, value: &Value) -> Value {
         match value {
-            Value::Map(entries) => {
-                for (field, inner) in entries {
-                    self.on_insert(&join(path, field), key, inner);
-                }
-            }
+            Value::Map(entries) => Value::Map(
+                entries
+                    .iter()
+                    .map(|(field, inner)| {
+                        (
+                            field.clone(),
+                            self.fresh_value(&join(path, field), key, inner),
+                        )
+                    })
+                    .collect(),
+            ),
             Value::List(items) => {
-                self.list_elements
-                    .entry(path.to_string())
-                    .or_default()
-                    .extend(std::iter::repeat_n(key.to_string(), items.len()));
-                if path == ADDRESS_PATH {
-                    for element in items {
-                        self.record_address(key, element);
-                    }
-                }
+                let mut existing = Vec::new();
+                self.on_union(path, key, &mut existing, items);
+                Value::List(existing)
             }
             scalar => {
                 self.leaf_sources.insert(path.to_string(), key.to_string());
@@ -86,6 +90,7 @@ impl Ctx {
                     .entry(path.to_string())
                     .or_default()
                     .push((key.to_string(), scalar.clone()));
+                scalar.clone()
             }
         }
     }
@@ -250,8 +255,7 @@ fn merge_child(
         let path = join(prefix, field);
         match map.get_mut(field) {
             None => {
-                map.insert(field.clone(), value.clone());
-                ctx.on_insert(&path, key, value);
+                map.insert(field.clone(), ctx.fresh_value(&path, key, value));
             }
             Some(existing) => merge_pair(ctx, existing, key, value, &path),
         }
@@ -268,8 +272,7 @@ fn merge_pair(ctx: &mut Ctx, existing: &mut Value, key: &str, incoming: &Value, 
                 let sub_path = join(path, field);
                 match existing_map.get_mut(field) {
                     None => {
-                        existing_map.insert(field.clone(), value.clone());
-                        ctx.on_insert(&sub_path, key, value);
+                        existing_map.insert(field.clone(), ctx.fresh_value(&sub_path, key, value));
                     }
                     Some(slot) => merge_pair(ctx, slot, key, value, &sub_path),
                 }

@@ -777,6 +777,107 @@ fn address_dependencies_account_for_prepended_scalar_operations() {
 }
 
 #[test]
+fn invalid_duplicate_addresses_are_rejected_before_merge() {
+    let ip = Ipv4Addr::new(192, 0, 2, 10);
+    let overflow = u64::from(u32::MAX) + 1;
+    for invalid in [
+        address(ip, Some(0), None),
+        address(ip, Some(overflow), None),
+        address(ip, Some(3600), Some(3601)),
+        address(ip, None, Some(overflow)),
+    ] {
+        for conflict_policy in [ConflictPolicy::Resolve, ConflictPolicy::Reject] {
+            let options = MergeOptions { conflict_policy };
+            let inputs = vec![contribution(address_fields(vec![
+                address(ip, None, None),
+                invalid.clone(),
+            ]))];
+            let high = contribution(address_fields(vec![address(ip, None, None)]));
+            let low = Contribution::new(
+                "p",
+                "p:provider",
+                Source::Dhcp { policy: "p".into() },
+                "ethernet",
+                high.match_spec.clone(),
+                address_fields(vec![invalid.clone()]),
+                50,
+            );
+            for contributions in [inputs, vec![high, low]] {
+                let result = reconcile(
+                    &contributions,
+                    &observation(Vec::new(), true),
+                    &SchemaRegistry::new(),
+                    &options,
+                );
+                assert!(
+                    matches!(&result, Err(ReconcileError::InvalidAddress { target, .. })
+                        if **target == interface()),
+                    "invalid duplicate {invalid:?} must fail in {conflict_policy:?} mode: {result:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_addresses_within_one_contribution_collapse_to_one() {
+    // FR-004: the ordered union keeps the first occurrence of each
+    // element, also when a single policy lists the same CIDR twice: one
+    // copy in the desired state, one add operation, no conflict.
+    let fields = address_fields(vec![
+        address(Ipv4Addr::new(192, 0, 2, 10), None, None),
+        address(Ipv4Addr::new(192, 0, 2, 10), None, None),
+    ]);
+    let plan = reconcile(
+        &[contribution(fields)],
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let additions = plan
+        .diff()
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation.kind, OperationKind::AddIpv4(_)))
+        .count();
+    assert_eq!(additions, 1);
+    assert!(plan.diagnostics.is_empty());
+}
+
+#[test]
+fn duplicate_addresses_with_different_attributes_conflict_within_one_contribution() {
+    // FR-012: duplicate-address attributes are structured conflicts; the
+    // first occurrence supplies the complete winning address object.
+    let fields = address_fields(vec![
+        address(Ipv4Addr::new(192, 0, 2, 10), None, None),
+        address(Ipv4Addr::new(192, 0, 2, 10), Some(3600), None),
+    ]);
+    let plan = reconcile(
+        &[contribution(fields)],
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &plan.diagnostics[..],
+        [Diagnostic::ValueConflict(conflict)]
+            if matches!(conflict.identity, ConflictIdentity::Address { .. })
+                && conflict.competing.len() == 2
+    ));
+    assert!(
+        plan.diff()
+            .operations
+            .iter()
+            .all(|operation| match &operation.kind {
+                OperationKind::AddIpv4(address) => address.valid_lft.is_none(),
+                _ => true,
+            })
+    );
+}
+
+#[test]
 fn rejects_peer_or_scope_groups_that_backend_cannot_rebuild_safely() {
     let actual = Ipv4Address {
         ip: Ipv4Addr::new(192, 0, 2, 10),

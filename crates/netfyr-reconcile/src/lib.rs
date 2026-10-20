@@ -58,6 +58,9 @@ pub fn reconcile(
     let mut provenance = Vec::new();
     let mut value_conflicts = Vec::new();
     for device in &binding.devices {
+        for contribution in &device.contributions {
+            address::validate_fields(&contribution.fields, &device.observation.identity)?;
+        }
         let merged = merge::merge(
             &device.observation.identity,
             &device.contributions,

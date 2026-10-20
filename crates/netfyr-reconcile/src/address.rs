@@ -14,6 +14,24 @@ const ADDRESS_PATH: &str = "ipv4.addresses";
 
 type Group = (Ipv4Addr, u8);
 
+/// Check every supplied address before merging can discard duplicate CIDRs.
+/// Schema validation has already checked the field and element shapes.
+pub(super) fn validate_fields(
+    fields: &IndexMap<String, Value>,
+    target: &InterfaceId,
+) -> Result<(), ReconcileError> {
+    let Some(Value::Map(ipv4)) = fields.get("ipv4") else {
+        return Ok(());
+    };
+    let Some(Value::List(addresses)) = ipv4.get("addresses") else {
+        return Ok(());
+    };
+    for address in addresses {
+        parse_address(address, target)?;
+    }
+    Ok(())
+}
+
 pub(super) fn plan_addresses(
     device: &DeviceObservation,
     desired: &Value,
