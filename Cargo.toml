@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/netfyr-state", "crates/netfyr-policy"]
+members = [
+    "crates/netfyr-state",
+    "crates/netfyr-policy",
+    "crates/netfyr-backend",
+    "tests/integration/probe",
+]
 
 [workspace.package]
 edition = "2024"
