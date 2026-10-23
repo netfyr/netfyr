@@ -6,7 +6,7 @@
 #   run-tests.sh TAGS=ipv4+routing  tests tagged ipv4 AND routing
 #
 # Env: TAGS is read when no argument gives one, SKIP_BUILD=1 skips the cargo build,
-# TESTS_DIR overrides the test directory.
+# TESTS_DIR overrides the test directory; REQUIRE_TEST_SELECTION=1 rejects an empty selection.
 
 set -uo pipefail
 
@@ -15,6 +15,11 @@ tests_dir="${TESTS_DIR:-$repo_root/tests}"
 
 filter="${TAGS:-}"
 skip_build="${SKIP_BUILD:-}"
+require_selection="${REQUIRE_TEST_SELECTION:-0}"
+case "$require_selection" in
+    0|1) ;;
+    *) echo "FAIL: REQUIRE_TEST_SELECTION must be 0 or 1" >&2; exit 1 ;;
+esac
 for arg in "$@"; do
     case "$arg" in
         TAGS=*) filter="${arg#TAGS=}" ;;
@@ -25,7 +30,7 @@ done
 # These are the runner's inputs, read once above. A test that runs the runner
 # would otherwise inherit them and narrow, or skip the build of, a run it meant
 # to control itself. NETFYR_TARGET_DIR below is the only thing a test inherits.
-unset TAGS SKIP_BUILD TESTS_DIR
+unset TAGS SKIP_BUILD TESTS_DIR REQUIRE_TEST_SELECTION
 
 command -v cargo >/dev/null || { echo "FAIL: cargo not found" >&2; exit 1; }
 
@@ -105,6 +110,10 @@ for script in "${scripts[@]}"; do
 done
 
 if [ "$total" -eq 0 ]; then
+    if [ "$require_selection" = 1 ]; then
+        echo "FAIL: required selection matched no tests: TAGS=$filter" >&2
+        exit 1
+    fi
     echo "no tests matched TAGS=$filter"
     exit 0
 fi

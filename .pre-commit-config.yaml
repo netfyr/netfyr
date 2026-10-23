@@ -1,4 +1,4 @@
-default_install_hook_types: [pre-commit, pre-push]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 
 repos:
   - repo: local
@@ -10,6 +10,20 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-commit]
+
+      - id: spec-ref
+        name: spec reference trailer
+        entry: scripts/check-spec-ref.sh --msg
+        language: system
+        stages: [commit-msg]
+
+      - id: spec-approved
+        name: spec merged in netfyr/specs
+        entry: scripts/check-spec-ref.sh --push
+        language: system
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
 
       - id: cargo-clippy
         name: cargo clippy

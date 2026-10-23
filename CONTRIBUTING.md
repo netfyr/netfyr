@@ -28,9 +28,18 @@ make hooks                     # install the git hooks (do this once)
 
 `make hooks` needs [pre-commit](https://pre-commit.com) on your `PATH` and installs the
 hooks it declares: `cargo fmt --check` on commits that touch Rust files, `cargo clippy`
-before pushes that do. A commit touching only docs or shell runs neither. An existing
-hook of the same type is preserved as `<hook>.legacy` and still runs; hooks of other
-types, `commit-msg` included, are left alone.
+before pushes that do, a `commit-msg` reference check, and merged-spec resolution
+before pushes. Local message checks work offline; publication checks need `curl`.
+Run `make hooks` again after pulling changes to the declared hook types. Existing
+hooks of the same type are preserved as `<hook>.legacy` and still run.
+
+The `Rust and host checks` workflow runs formatting, a locked build, Rust tests,
+host shell checks and Clippy. Its shell lane selects `build,meta` with
+`REQUIRE_TEST_SELECTION=1`, so an accidentally empty required selection fails.
+Ordinary focused runs can still select nothing successfully. Privileged backend
+acceptance belongs in a disposable VM, following `tests/integration/coverage.md`.
+CI retains source/tool identity and actual step outcomes; skipped or cancelled
+steps remain incomplete. Workflow files do not configure repository required-status rules.
 
 ## Code conventions
 
@@ -142,6 +151,25 @@ policy touches an unrelated field on the same interface.
 
 Spec: core/201-reconciliation-merge
 ```
+
+The checker is `scripts/check-spec-ref.sh --msg MESSAGE_FILE` or
+`--range BASE..HEAD`. It rejects missing references, mixed-spec branches,
+mismatched completion references and completion before the final non-exempt
+commit. `VERIFY_SPEC_EXISTS=1` resolves against published requirements; CI pins
+the requirements revision before resolving paths. The PR description, independent
+of its title, must end with the same trailer. An exempt-only PR still needs that
+description reference.
+
+Published root-level top-level requirements use their slug. Their reviewed
+classification is listed in `scripts/top-level-specs`; adding an entry requires
+confirming that the document is published as top-level. CI also checks its file
+exists. Top-level requirements remain approved and cannot carry an `implements`
+closer. Feature references retain their numbered path, and only a completing
+commit additionally carries `implements netfyr/specs#N`, using the original spec
+publication PR number rather than its filename number.
+
+Commit messages describe what changed and why. Report commands and verification
+results separately in review evidence rather than in commit messages.
 
 When fixing a bug introduced by an earlier commit, add a
 `Fixes: HASH12 ("COMMIT SUBJECT")` trailer with the 12-character hash.

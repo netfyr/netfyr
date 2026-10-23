@@ -56,6 +56,13 @@ check "" "a tag that is only a prefix of a real one matches nothing" TAGS=ipv
 check "" "a bare + matches nothing" TAGS=+
 check "" "a bare comma matches nothing" TAGS=,
 
+REQUIRE_TEST_SELECTION=1 runs "$tmp" TAGS=nosuchtag \
+    && fail "a required empty selection reported success"
+REQUIRE_TEST_SELECTION=1 runs "$tmp" TAGS=ipv4 \
+    || fail "a required nonempty selection failed"
+REQUIRE_TEST_SELECTION=invalid runs "$tmp" TAGS=ipv4 \
+    && fail "an invalid required-selection policy was accepted"
+
 # Tags are literal. Globbing would make results depend on the working directory,
 # so this runs from a directory holding a file named after a real tag.
 touch "$tmp/ipv4"
