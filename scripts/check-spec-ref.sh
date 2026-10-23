@@ -1,0 +1,228 @@
+#!/bin/bash
+# Enforce the Spec: trailer that ties a change back to a spec in netfyr/specs.
+#
+#   check-spec-ref.sh --msg FILE     one commit message (used by the commit-msg hook)
+#   check-spec-ref.sh --range A..B   every commit in a range, all naming one spec
+#   check-spec-ref.sh --push         the range being pushed, against merged specs only
+#
+# The commit that finishes a spec also carries an 'implements <specs-repo>#N' line, which
+# is what moves the spec board's card. That number and the Spec: path come from different
+# places, so when the network is available they are checked against each other.
+#
+# Env: VERIFY_SPEC_EXISTS=1 resolves refs against the specs repo (needs network),
+# NETFYR_SPECS_RAW and NETFYR_SPECS_API override the URLs resolution goes through,
+# NETFYR_SPECS_REPO overrides the owner/repo the implements line must name,
+# GITHUB_TOKEN is used for the API call when set.
+
+set -uo pipefail
+
+specs_repo="${NETFYR_SPECS_REPO:-netfyr/specs}"
+specs_raw="${NETFYR_SPECS_RAW:-https://raw.githubusercontent.com/$specs_repo/main}"
+specs_api="${NETFYR_SPECS_API:-https://api.github.com/repos/$specs_repo}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+top_level_specs="${NETFYR_TOP_LEVEL_SPECS_FILE:-$script_dir/top-level-specs}"
+
+# Mirrors the specs repo layout: NNN-slug.md at the root or under an area directory.
+ref_re='^([a-z0-9][a-z0-9-]*/)?[0-9]{3}-[a-z0-9-]+$'
+top_level_re='^[a-z][a-z0-9-]*$'
+
+status=0
+last_ref=""
+last_impl=""
+
+fail() { echo "FAIL: $*" >&2; status=1; }
+
+short() { git log --no-walk --format=%h "$@" | tr '\n' ' ' | sed 's/ $//'; }
+
+need_curl() {
+    command -v curl >/dev/null || { echo "FAIL: curl not found, cannot verify spec refs" >&2; exit 1; }
+}
+
+spec_exists() {
+    need_curl
+    curl -sfL --max-time 20 -o /dev/null "$specs_raw/$1.md"
+}
+
+# The files a spec's pull request touched, one per line.
+pr_files() {
+    need_curl
+    local auth=()
+    [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    curl -sfL --max-time 20 -H "Accept: application/vnd.github+json" "${auth[@]}" \
+        "$specs_api/pulls/$1/files" \
+        | sed -n 's/.*"filename"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# Only the commit that completes a spec carries this, so its absence is not an error.
+check_implements() {
+    local label="$1" ref="$2" line="$3" repo num files
+
+    if [[ ! "$line" =~ ^implements[[:space:]]+([^[:space:]#]*)#([0-9]+)$ ]]; then
+        fail "$label: '$line' is not 'implements $specs_repo#<number>'"
+        return
+    fi
+    repo="${BASH_REMATCH[1]}"
+    num="${BASH_REMATCH[2]}"
+
+    # A bare '#N' resolves against whichever repo the board is scanning, which
+    # outside the specs repo silently points at an unrelated issue.
+    if [ -z "$repo" ]; then
+        fail "$label: 'implements #$num' needs the repository: implements $specs_repo#$num"
+        return
+    fi
+    if [ "$repo" != "$specs_repo" ]; then
+        fail "$label: implements names $repo, specs live in $specs_repo"
+        return
+    fi
+    last_impl="$repo#$num"
+
+    [ "${VERIFY_SPEC_EXISTS:-}" = "1" ] || return
+
+    files="$(pr_files "$num")"
+    if [ -z "$files" ]; then
+        fail "$label: $specs_repo#$num has no files, so it is not a spec pull request"
+        return
+    fi
+    grep -qxF "$ref.md" <<<"$files" \
+        || fail "$label: implements $specs_repo#$num, which did not touch $ref.md"
+}
+
+# A commit that carries someone else's message, or that will be squashed into a
+# commit that has already been checked, has no reference of its own to give.
+exempt_subject() {
+    case "$1" in
+        Merge\ *|Revert\ *|fixup!\ *|squash!\ *|amend!\ *) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_message() {
+    local label="$1" msg subject block refs count ref impl top_level=0 allow_exempt="${3:-1}"
+    msg="$(git stripspace --strip-comments <<<"$2")"
+    last_ref=""
+    last_impl=""
+
+    subject="$(head -1 <<<"$msg")"
+    [ -n "$subject" ] || { fail "$label: empty commit message"; return; }
+    if [ "$allow_exempt" = 1 ] && exempt_subject "$subject"; then return; fi
+
+    # The final paragraph, read directly rather than through git interpret-trailers:
+    # the implements line carries no 'Key: value' separator, and one such line makes
+    # git disown the whole block.
+    block="$(awk 'BEGIN{RS=""} END{print}' <<<"$msg")"
+    refs="$(sed -n 's/^Spec:[[:space:]]*//p' <<<"$block")"
+    count="$(grep -c . <<<"$refs")"
+
+    if [ "$count" -eq 0 ]; then
+        fail "$label: no 'Spec: <area>/<NNN>-<slug>' trailer in the final paragraph"
+        return
+    fi
+    if [ "$count" -gt 1 ]; then
+        fail "$label: $count Spec: trailers, a commit implements exactly one spec"
+        return
+    fi
+
+    ref="$refs"
+    if [[ ! "$ref" =~ $ref_re ]]; then
+        if [[ "$ref" =~ $top_level_re ]] && [ -r "$top_level_specs" ] \
+            && grep -qxF -- "$ref" "$top_level_specs"; then
+            top_level=1
+        else
+            fail "$label: 'Spec: $ref' is not a feature path or a registered published top-level slug"
+            return
+        fi
+    fi
+    if [ "${VERIFY_SPEC_EXISTS:-}" = "1" ] && ! spec_exists "$ref"; then
+        fail "$label: $ref.md does not exist in the specs repo"
+        return
+    fi
+
+    # Matched case-insensitively so a capitalised line is reported rather than
+    # silently ignored here and by the board.
+    impl="$(grep -iE '^implements[[:space:]]' <<<"$block")"
+    if [ -n "$impl" ] && [ "$(wc -l <<<"$impl")" -gt 1 ]; then
+        fail "$label: more than one implements trailer"
+        return
+    fi
+    if [ -n "$impl" ] && [ "$top_level" = 1 ]; then
+        fail "$label: top-level specs stay approved and cannot carry implements"
+        return
+    fi
+    [ -n "$impl" ] && check_implements "$label" "$ref" "$impl"
+
+    last_ref="$ref"
+}
+
+usage() { echo "usage: ${0##*/} --msg FILE | --description FILE | --range BASE..HEAD | --push" >&2; exit 2; }
+
+# Publication checks use the merged requirements repository; local message checks
+# remain available offline.
+if [ "${1:-}" = "--push" ]; then
+    export VERIFY_SPEC_EXISTS=1
+    to="${PRE_COMMIT_TO_REF:-HEAD}"
+    from="${PRE_COMMIT_FROM_REF:-}"
+    # A branch the remote has never seen arrives as the all-zero sha; fall back to
+    # what the remote's default branch already carries, or to the whole history.
+    if [ -z "$from" ] || [[ "$from" =~ ^0+$ ]]; then
+        from="$(git rev-parse --verify -q origin/HEAD || git rev-parse --verify -q origin/main)" \
+            || from=""
+    fi
+    if [ -n "$from" ]; then set -- --range "$from..$to"; else set -- --range "$to"; fi
+fi
+
+[ $# -eq 2 ] || usage
+
+case "$1" in
+    --msg)
+        [ -r "$2" ] || { echo "FAIL: cannot read commit message file '$2'" >&2; exit 1; }
+        check_message "commit message" "$(cat "$2")"
+        ;;
+    --description)
+        [ -r "$2" ] || { echo "FAIL: cannot read pull request description '$2'" >&2; exit 1; }
+        check_message "pull request description" "$(cat "$2")" 0
+        ;;
+    --range)
+        commits="$(git rev-list --reverse "$2")" \
+            || { echo "FAIL: '$2' is not a revision range" >&2; exit 1; }
+        # An empty range means nothing was checked, which must not read as approval.
+        [ -n "$commits" ] || { echo "FAIL: no commits in $2" >&2; exit 1; }
+
+        refs=()
+        closers=()
+        # The last commit that had to carry a reference; an exempt commit after the
+        # closer, a revert or a fixup, does not make the spec unfinished.
+        tip=""
+        while read -r sha; do
+            parents="$(git show -s --format=%P "$sha")"
+            if [[ "$parents" == *' '* ]]; then
+                continue
+            fi
+            check_message "$(git log -1 --format='%h ("%s")' "$sha")" "$(git log -1 --format=%B "$sha")"
+            [ -n "$last_ref" ] && { refs+=("$last_ref"); tip="$sha"; }
+            [ -n "$last_impl" ] && closers+=("$sha")
+        done <<<"$commits"
+
+        # A spec is finished once. Two closing trailers means two commits each
+        # claim the work is done, and the board acts on whichever it sees first.
+        if [ ${#closers[@]} -gt 1 ]; then
+            fail "${#closers[@]} commits carry an implements trailer: $(short "${closers[@]}")"
+        elif [ ${#closers[@]} -eq 1 ] && [ "${closers[0]}" != "$tip" ]; then
+            fail "$(short "${closers[0]}") completes the spec but is not the last commit, $(short "$tip") is"
+        fi
+
+        # One spec per pull request: reviewers read a branch against a single spec.
+        if [ ${#refs[@]} -gt 1 ]; then
+            distinct="$(printf '%s\n' "${refs[@]}" | sort -u)"
+            [ "$(grep -c . <<<"$distinct")" -eq 1 ] \
+                || fail "commits reference more than one spec: ${distinct//$'\n'/ }"
+        fi
+        [ ${#refs[@]} -gt 0 ] && last_ref="${refs[0]}"
+        ;;
+    *) usage ;;
+esac
+
+# The accepted reference goes to stdout so a caller can compare what a branch
+# implements against what its pull request claims. Diagnostics go to stderr.
+[ "$status" -eq 0 ] && [ -n "$last_ref" ] && echo "$last_ref"
+
+exit "$status"
