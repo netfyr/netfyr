@@ -92,6 +92,22 @@ fn may_match(selector: &Match, spec: &Match) -> bool {
     .matches(spec)
 }
 
+fn filter_query(
+    selector: &Match,
+    mut observation: Observation,
+) -> Result<Observation, BackendError> {
+    observation
+        .devices
+        .retain(|device| selector.matches(&device.state.match_spec));
+    if observation.devices.is_empty() && selector.name.is_some() {
+        return Err(BackendError::new(
+            BackendErrorKind::NotFound,
+            format!("no interface matches {selector:?}"),
+        ));
+    }
+    Ok(observation)
+}
+
 impl NetlinkBackend {
     /// Open a network namespace (for example `/run/netns/test`). This never
     /// changes the calling thread's namespace. Opening the current namespace
@@ -173,19 +189,7 @@ impl NetlinkBackend {
                                 let result = transport
                                     .inventory(|spec| may_match(&selector, spec))
                                     .await
-                                    .and_then(|mut observation| {
-                                        observation.devices.retain(|device| {
-                                            selector.matches(&device.state.match_spec)
-                                        });
-                                        if observation.devices.is_empty() && selector.name.is_some()
-                                        {
-                                            return Err(BackendError::new(
-                                                BackendErrorKind::NotFound,
-                                                format!("no interface matches {selector:?}"),
-                                            ));
-                                        }
-                                        Ok(observation)
-                                    });
+                                    .and_then(|observation| filter_query(&selector, observation));
                                 let _ = response.send(result);
                             }
                             Request::Apply(diff, response) => {
