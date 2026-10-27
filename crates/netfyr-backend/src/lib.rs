@@ -34,7 +34,9 @@ pub trait NetworkBackend: Send + Sync {
         !matches!(kind, OperationKind::AddEntity | OperationKind::RemoveEntity)
     }
 
-    /// No matches returns `NotFound` for name selectors, otherwise an empty observation.
+    /// A selector naming an interface that does not exist returns `NotFound`;
+    /// any other miss, including a named interface failing another
+    /// criterion, returns an empty observation.
     fn query<'a>(
         &'a self,
         selector: &'a Match,
