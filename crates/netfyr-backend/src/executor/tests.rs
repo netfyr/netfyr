@@ -85,6 +85,13 @@ impl Io for MockIo {
         })
     }
 
+    fn confirm_identity<'a>(
+        &'a mut self,
+        _: &'a InterfaceId,
+    ) -> IoFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn execute<'a>(
         &'a mut self,
         target: &'a InterfaceId,

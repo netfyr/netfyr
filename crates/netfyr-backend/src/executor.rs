@@ -22,6 +22,11 @@ type IoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub(crate) trait Io {
     fn namespace(&self) -> NamespaceId;
     fn inventory(&mut self) -> IoFuture<'_, Result<Observation, BackendError>>;
+    fn confirm_identity<'a>(
+        &'a mut self,
+        target: &'a InterfaceId,
+    ) -> IoFuture<'a, Result<(), BackendError>>;
+    // Writes without checking identity; confirm_identity must precede it.
     fn execute<'a>(
         &'a mut self,
         target: &'a InterfaceId,
@@ -35,6 +40,12 @@ impl Io for LinuxTransport {
     }
     fn inventory(&mut self) -> IoFuture<'_, Result<Observation, BackendError>> {
         Box::pin(LinuxTransport::inventory(self, |_| false))
+    }
+    fn confirm_identity<'a>(
+        &'a mut self,
+        target: &'a InterfaceId,
+    ) -> IoFuture<'a, Result<(), BackendError>> {
+        Box::pin(LinuxTransport::confirm_identity(self, target))
     }
     fn execute<'a>(
         &'a mut self,
@@ -685,6 +696,7 @@ impl<I: Io> Execution<'_, I> {
                 return Err(cancelled_error("plan execution cancelled before write"));
             }
             self.current = None;
+            self.io.confirm_identity(&op.target).await?;
             self.io.execute(&op.target, &kind).await?;
             rebase_lifetimes(&mut predicted, Instant::now());
             project(&mut predicted, &kind);
