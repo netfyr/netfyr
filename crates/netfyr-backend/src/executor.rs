@@ -697,6 +697,9 @@ impl<I: Io> Execution<'_, I> {
             }
             self.current = None;
             self.io.confirm_identity(&op.target).await?;
+            if cancelled() {
+                return Err(cancelled_error("plan execution cancelled before write"));
+            }
             self.io.execute(&op.target, &kind).await?;
             rebase_lifetimes(&mut predicted, Instant::now());
             project(&mut predicted, &kind);
