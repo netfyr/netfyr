@@ -12,13 +12,13 @@ repos:
         stages: [pre-commit]
 
       - id: spec-ref
-        name: spec reference trailer
+        name: change declaration trailer
         entry: scripts/check-spec-ref.sh --msg
         language: system
         stages: [commit-msg]
 
       - id: spec-approved
-        name: spec merged in netfyr/specs
+        name: merged spec references
         entry: scripts/check-spec-ref.sh --push
         language: system
         stages: [pre-push]

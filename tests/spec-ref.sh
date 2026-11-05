@@ -1,7 +1,6 @@
 #!/bin/bash
 # tags: meta policy
-# The Spec: trailer check: format, placement, exemptions, and the one-spec-per-branch
-# rule that the range mode enforces.
+# Change declarations: spec references, explained maintenance and range scope.
 
 set -uo pipefail
 
@@ -39,6 +38,8 @@ msg_check reject "a trailer stranded above the last paragraph" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\n\nOne more thought.')"
 msg_check reject "two specs in one commit" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nSpec: core/002-schema-validation')"
+msg_check reject "an empty Spec beside a real reference" \
+    "$(printf 'Do a thing\n\nSpec:\nSpec: core/003-policies')"
 msg_check reject "a bare number" "$(printf 'Do a thing\n\nSpec: 003')"
 msg_check reject "a bare slug" "$(printf 'Do a thing\n\nSpec: policies')"
 msg_check reject "a two-digit number" "$(printf 'Do a thing\n\nSpec: core/03-policies')"
@@ -52,18 +53,64 @@ msg_check reject "an unregistered top-level slug" "$(printf 'Do a thing\n\nSpec:
 msg_check reject "completion on top-level requirements" \
     "$(printf 'Clarify a principle\n\nSpec: netfyr-philosophy\nimplements netfyr/specs#12')"
 
+msg_check accept "maintenance with a reason" \
+    "$(printf 'Correct README spelling\n\nNo-Spec: Spelling only; behavior is unchanged.')"
+msg_check accept "maintenance with a signoff" \
+    "$(printf 'Correct README spelling\n\nNo-Spec: Spelling only.\nSigned-off-by: A <a@b.c>')"
+msg_check reject "an empty maintenance reason" "$(printf 'Tidy docs\n\nNo-Spec:')"
+msg_check reject "a whitespace maintenance reason" "$(printf 'Tidy docs\n\nNo-Spec: \t')"
+msg_check reject "two maintenance declarations" \
+    "$(printf 'Tidy docs\n\nNo-Spec: Spelling only.\nNo-Spec: Formatting only.')"
+msg_check reject "an empty maintenance declaration beside a reason" \
+    "$(printf 'Tidy docs\n\nNo-Spec:\nNo-Spec: Spelling only.')"
+msg_check reject "a spec and maintenance declaration" \
+    "$(printf 'Tidy docs\n\nSpec: core/003-policies\nNo-Spec: Spelling only.')"
+msg_check reject "maintenance and an empty spec declaration" \
+    "$(printf 'Tidy docs\n\nNo-Spec: Spelling only.\nSpec:')"
+msg_check reject "a stranded maintenance declaration" \
+    "$(printf 'Tidy docs\n\nNo-Spec: Spelling only.\n\nA later paragraph.')"
+msg_check reject "a docs subject without a declaration" "docs: Correct spelling"
+msg_check reject "Spec none without a real reference" "$(printf 'Tidy docs\n\nSpec: none')"
+msg_check reject "maintenance claiming completion" \
+    "$(printf 'Tidy docs\n\nNo-Spec: Spelling only.\nimplements netfyr/specs#12')"
+msg_check reject "maintenance with a malformed completion line" \
+    "$(printf 'Tidy docs\n\nNo-Spec: Spelling only.\nimplements no-number')"
+msg_check reject "maintenance with a completion claim in prose" \
+    "$(printf 'Tidy docs\n\nThis Implements netfyr/specs#12.\n\nNo-Spec: Spelling only.')"
+msg_check reject "maintenance with a bare completion reference in prose" \
+    "$(printf 'Tidy docs\n\nThis implements #12.\n\nNo-Spec: Spelling only.')"
+msg_check reject "maintenance with a completion claim in a raw comment" \
+    "$(printf 'Tidy docs\n\nNo-Spec: Spelling only.\n# implements netfyr/specs#12')"
+for subject in "Merge a topic" "Revert a topic" "fixup! A topic" "squash! A topic" "amend! A topic"; do
+    msg_check accept "explicit maintenance after $subject" \
+        "$(printf '%s\n\nNo-Spec: Spelling only.' "$subject")"
+    msg_check reject "completion hidden after $subject" \
+        "$(printf '%s\n\nThis implements netfyr/specs#12.\n\nNo-Spec: Spelling only.' "$subject")"
+    msg_check reject "conflicting declarations after $subject" \
+        "$(printf '%s\n\nSpec: core/003-policies\nNo-Spec: Spelling only.' "$subject")"
+done
+
 msg_check accept "a merge commit" "$(printf 'Merge branch feature into main')"
 msg_check accept "a revert" "$(printf 'Revert "Do a thing"\n\nThis reverts commit abc123.')"
 msg_check accept "a fixup awaiting squash" "$(printf 'fixup! Do a thing')"
 
 printf 'Merge a maintenance change\n' >"$tmp/description"
 if bash "$checker" --description "$tmp/description" >/dev/null 2>&1; then
-    echo "FAIL: an exempt-looking description bypassed its required reference" >&2
+    echo "FAIL: an exempt-looking description bypassed its required declaration" >&2
     status=1
 fi
 printf 'Merge a maintenance change\n\nSpec: core/003-policies\n' >"$tmp/description"
 bash "$checker" --description "$tmp/description" >/dev/null 2>&1 \
     || { echo "FAIL: rejected an exempt-looking description with its reference" >&2; status=1; }
+printf 'Maintenance only\n\nNo-Spec: Correct README spelling.\n' >"$tmp/description"
+out="$(bash "$checker" --description "$tmp/description" 2>/dev/null)"
+[ "$out" = "No-Spec" ] \
+    || { echo "FAIL: a maintenance description did not return its declaration" >&2; status=1; }
+printf 'Merge maintenance\n\nNo-Spec: Correct README spelling.\nimplements netfyr/specs#12\n' >"$tmp/description"
+if bash "$checker" --description "$tmp/description" >/dev/null 2>&1; then
+    echo "FAIL: accepted completion in a maintenance description" >&2
+    status=1
+fi
 
 msg_check accept "an implements line on the completing commit" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nimplements netfyr/specs#12')"
@@ -86,6 +133,9 @@ mkdir -p "$specs/core"
 : >"$specs/core/002-schema-validation.md"
 : >"$specs/netfyr-philosophy.md"
 export NETFYR_SPECS_RAW="file://$specs"
+VERIFY_SPEC_EXISTS=1 NETFYR_SPECS_RAW="file://$tmp/missing-requirements" \
+    bash "$checker" --msg <(printf 'Tidy docs\n\nNo-Spec: Spelling only.\n') >/dev/null 2>&1 \
+    || { echo "FAIL: maintenance tried to resolve a requirements reference" >&2; status=1; }
 VERIFY_SPEC_EXISTS=1 bash "$checker" --msg <(printf 'Do a thing\n\nSpec: core/003-policies\n') >/dev/null 2>&1 \
     || { echo "FAIL: rejected a ref that exists in the specs repo" >&2; status=1; }
 if VERIFY_SPEC_EXISTS=1 bash "$checker" --msg <(printf 'Do a thing\n\nSpec: core/404-ghost\n') >/dev/null 2>&1; then
@@ -147,6 +197,10 @@ base="$(git -C "$work" rev-parse HEAD)"
 commit "$(printf 'Second\n\nSpec: core/003-policies')"
 (cd "$work" && bash "$checker" --range "$base..HEAD") >/dev/null 2>&1 \
     || { echo "FAIL: rejected a range where every commit names the same spec" >&2; status=1; }
+commit "$(printf 'Tidy docs\n\nNo-Spec: Correct spelling without changing behavior.')"
+out="$(cd "$work" && bash "$checker" --range "$base..HEAD" 2>/dev/null)"
+[ "$out" = "core/003-policies" ] \
+    || { echo "FAIL: maintenance changed a branch's governing spec" >&2; status=1; }
 
 # A branch may finish its spec or not, so zero closing trailers is fine and one is
 # fine; two commits both claiming the spec is done is not.
@@ -156,6 +210,12 @@ commit "$(printf 'Close it\n\nSpec: core/003-policies\nimplements netfyr/specs#1
     || { echo "FAIL: rejected a range whose last commit completes the spec" >&2; status=1; }
 
 range_out() { { (cd "$work" && bash "$checker" --range "$1") >/dev/null; } 2>&1; }
+
+commit "$(printf 'Tidy docs\n\nNo-Spec: Correct spelling without changing behavior.')"
+out="$(cd "$work" && bash "$checker" --range "$closer..HEAD" 2>/dev/null)"
+[ "$out" = "core/003-policies" ] \
+    || { echo "FAIL: maintenance after completion unseated the closer" >&2; status=1; }
+git -C "$work" reset -q --hard HEAD~1
 
 commit "$(printf 'Close it again\n\nSpec: core/003-policies\nimplements netfyr/specs#12')"
 out="$(range_out "$closer..HEAD")"
@@ -236,5 +296,46 @@ grep -q 'does not exist in the specs repo' <<<"$out" \
     || { echo "FAIL: an unseen branch skipped the approval check: $out" >&2; status=1; }
 
 unset NETFYR_SPECS_RAW NETFYR_SPECS_API
+
+maintenance_base="$(git -C "$work" rev-parse HEAD)"
+commit "$(printf 'Tidy docs\n\nNo-Spec: Correct README spelling.')"
+commit "$(printf 'Normalize whitespace\n\nNo-Spec: Formatting only.')"
+maintenance_ref="$(cd "$work" && bash "$checker" --range "$maintenance_base..HEAD" 2>/dev/null)"
+[ "$maintenance_ref" = "No-Spec" ] \
+    || { echo "FAIL: a maintenance-only range did not return its declaration" >&2; status=1; }
+msg_ref="$(bash "$checker" --msg <(printf 'Tidy docs\n\nNo-Spec: Spelling only.\n') 2>/dev/null)"
+[ "$msg_ref" = "No-Spec" ] \
+    || { echo "FAIL: a maintenance message did not return its declaration" >&2; status=1; }
+
+exempt_base="$(git -C "$work" rev-parse HEAD)"
+commit "fixup! Existing work"
+out="$(cd "$work" && bash "$checker" --range "$exempt_base..HEAD" 2>/dev/null)"
+[ -z "$out" ] \
+    || { echo "FAIL: a mechanically exempt range gained a declaration" >&2; status=1; }
+
+merge_parent="$(git -C "$work" rev-parse HEAD)"
+merge_tree="$(git -C "$work" rev-parse 'HEAD^{tree}')"
+merge_commit() {
+    printf '%s\n' "$1" | git -C "$work" -c user.name=t -c user.email=t@t \
+        -c commit.gpgsign=false commit-tree "$merge_tree" -p "$merge_parent" -p "$base"
+}
+merged="$(merge_commit 'Combine the histories')"
+out="$(cd "$work" && bash "$checker" --range "$merge_parent..$merged" 2>/dev/null)"
+[ -z "$out" ] \
+    || { echo "FAIL: a genuine merge with a custom subject lost its exemption" >&2; status=1; }
+merged="$(merge_commit "$(printf 'Combine the histories\n\nNo-Spec: Reconcile maintenance branches.')")"
+out="$(cd "$work" && bash "$checker" --range "$merge_parent..$merged" 2>/dev/null)"
+[ "$out" = "No-Spec" ] \
+    || { echo "FAIL: a genuine merge ignored its maintenance declaration" >&2; status=1; }
+merged="$(merge_commit "$(printf 'Combine the histories\n\nThis implements netfyr/specs#12.\n\nNo-Spec: Reconcile maintenance branches.')")"
+if (cd "$work" && bash "$checker" --range "$merge_parent..$merged") >/dev/null 2>&1; then
+    echo "FAIL: a genuine merge hid completion behind maintenance" >&2
+    status=1
+fi
+merged="$(merge_commit "$(printf 'Combine the histories\n\nNo-Spec: Reconcile maintenance branches.\nSpec: core/003-policies')")"
+if (cd "$work" && bash "$checker" --range "$merge_parent..$merged") >/dev/null 2>&1; then
+    echo "FAIL: a genuine merge hid conflicting declarations" >&2
+    status=1
+fi
 
 exit "$status"

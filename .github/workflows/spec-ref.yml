@@ -29,7 +29,7 @@ jobs:
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo 'Cannot resolve merged requirements revision' >&2; exit 1; }
           printf 'requirements_sha=%s\n' "$revision" >> "$GITHUB_OUTPUT"
           printf 'NETFYR_SPECS_RAW=https://raw.githubusercontent.com/netfyr/specs/%s\n' "$revision" >> "$GITHUB_ENV"
-      - name: Check commits and description
+      - name: Check change declarations
         id: references
         env:
           VERIFY_SPEC_EXISTS: "1"
@@ -38,13 +38,13 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          commit_ref="$(scripts/check-spec-ref.sh --range "$BASE_SHA..$HEAD_SHA")"
+          commit_scope="$(scripts/check-spec-ref.sh --range "$BASE_SHA..$HEAD_SHA")"
           message="$(mktemp)"
           trap 'rm -f "$message"' EXIT
           printf '%s\n' "$PR_BODY" > "$message"
-          description_ref="$(scripts/check-spec-ref.sh --description "$message")"
-          if [ -n "$commit_ref" ] && [ "$description_ref" != "$commit_ref" ]; then
-            echo "FAIL: description names $description_ref; commits name $commit_ref" >&2
+          description_scope="$(scripts/check-spec-ref.sh --description "$message")"
+          if [ -n "$commit_scope" ] && [ "$description_scope" != "$commit_scope" ]; then
+            echo "FAIL: description declares $description_scope; commits declare $commit_scope" >&2
             exit 1
           fi
       - name: Record reference-check outcome

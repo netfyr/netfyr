@@ -1,8 +1,9 @@
 #!/bin/bash
-# Enforce the Spec: trailer that ties a change back to a spec in netfyr/specs.
+# Check a governing Spec: reference or an explained No-Spec: maintenance declaration.
 #
 #   check-spec-ref.sh --msg FILE     one commit message (used by the commit-msg hook)
-#   check-spec-ref.sh --range A..B   every commit in a range, all naming one spec
+#   check-spec-ref.sh --description FILE   the pull request's declaration
+#   check-spec-ref.sh --range A..B   one governing spec, with maintenance allowed
 #   check-spec-ref.sh --push         the range being pushed, against merged specs only
 #
 # The commit that finishes a spec also carries an 'implements <specs-repo>#N' line, which
@@ -29,6 +30,7 @@ top_level_re='^[a-z][a-z0-9-]*$'
 status=0
 last_ref=""
 last_impl=""
+last_kind=""
 
 fail() { echo "FAIL: $*" >&2; status=1; }
 
@@ -97,24 +99,53 @@ exempt_subject() {
 }
 
 check_message() {
-    local label="$1" msg subject block refs count ref impl top_level=0 allow_exempt="${3:-1}"
-    msg="$(git stripspace --strip-comments <<<"$2")"
+    local label="$1" raw="$2" mode="${3:-commit}" msg subject block refs count ref impl
+    local maintenance_count reason top_level=0
+    msg="$(git stripspace --strip-comments <<<"$raw")"
     last_ref=""
     last_impl=""
+    last_kind=""
 
     subject="$(head -1 <<<"$msg")"
     [ -n "$subject" ] || { fail "$label: empty commit message"; return; }
-    if [ "$allow_exempt" = 1 ] && exempt_subject "$subject"; then return; fi
 
     # The final paragraph, read directly rather than through git interpret-trailers:
     # the implements line carries no 'Key: value' separator, and one such line makes
     # git disown the whole block.
     block="$(awk 'BEGIN{RS=""} END{print}' <<<"$msg")"
+    count="$(grep -c '^Spec:' <<<"$block")"
+    maintenance_count="$(grep -c '^No-Spec:' <<<"$block")"
+
+    if [ "$maintenance_count" -gt 0 ]; then
+        if [ "$maintenance_count" -ne 1 ]; then
+            fail "$label: more than one No-Spec: declaration"
+            return
+        fi
+        if [ "$count" -gt 0 ]; then
+            fail "$label: use either Spec: or No-Spec:, not both"
+            return
+        fi
+        reason="$(sed -n 's/^No-Spec:[[:space:]]*//p' <<<"$block")"
+        if [[ ! "$reason" =~ [^[:space:]] ]]; then
+            fail "$label: No-Spec: needs a maintenance reason"
+            return
+        fi
+        # The board scans the original full message for completion references.
+        if LC_ALL=C grep -qiE '(^|[^A-Za-z0-9_])implements ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' <<<"$raw" \
+            || grep -qiE '^implements[[:space:]]' <<<"$block"; then
+            fail "$label: No-Spec: maintenance cannot carry implements references"
+            return
+        fi
+        last_kind=maintenance
+        return
+    fi
+
+    if [ "$mode" = merge ] || { [ "$mode" = commit ] && exempt_subject "$subject"; }; then return; fi
+
     refs="$(sed -n 's/^Spec:[[:space:]]*//p' <<<"$block")"
-    count="$(grep -c . <<<"$refs")"
 
     if [ "$count" -eq 0 ]; then
-        fail "$label: no 'Spec: <area>/<NNN>-<slug>' trailer in the final paragraph"
+        fail "$label: the final paragraph needs Spec: <path> or No-Spec: <maintenance reason>"
         return
     fi
     if [ "$count" -gt 1 ]; then
@@ -151,6 +182,7 @@ check_message() {
     [ -n "$impl" ] && check_implements "$label" "$ref" "$impl"
 
     last_ref="$ref"
+    last_kind=spec
 }
 
 usage() { echo "usage: ${0##*/} --msg FILE | --description FILE | --range BASE..HEAD | --push" >&2; exit 2; }
@@ -179,7 +211,7 @@ case "$1" in
         ;;
     --description)
         [ -r "$2" ] || { echo "FAIL: cannot read pull request description '$2'" >&2; exit 1; }
-        check_message "pull request description" "$(cat "$2")" 0
+        check_message "pull request description" "$(cat "$2")" description
         ;;
     --range)
         commits="$(git rev-list --reverse "$2")" \
@@ -189,17 +221,19 @@ case "$1" in
 
         refs=()
         closers=()
-        # The last commit that had to carry a reference; an exempt commit after the
-        # closer, a revert or a fixup, does not make the spec unfinished.
+        maintenance=0
+        # Only spec-bearing work advances the spec's final contributing commit.
         tip=""
         while read -r sha; do
             parents="$(git show -s --format=%P "$sha")"
+            mode=commit
             if [[ "$parents" == *' '* ]]; then
-                continue
+                mode=merge
             fi
-            check_message "$(git log -1 --format='%h ("%s")' "$sha")" "$(git log -1 --format=%B "$sha")"
+            check_message "$(git log -1 --format='%h ("%s")' "$sha")" "$(git log -1 --format=%B "$sha")" "$mode"
             [ -n "$last_ref" ] && { refs+=("$last_ref"); tip="$sha"; }
             [ -n "$last_impl" ] && closers+=("$sha")
+            [ "$last_kind" = maintenance ] && maintenance=1
         done <<<"$commits"
 
         # A spec is finished once. Two closing trailers means two commits each
@@ -216,13 +250,26 @@ case "$1" in
             [ "$(grep -c . <<<"$distinct")" -eq 1 ] \
                 || fail "commits reference more than one spec: ${distinct//$'\n'/ }"
         fi
-        [ ${#refs[@]} -gt 0 ] && last_ref="${refs[0]}"
+        if [ ${#refs[@]} -gt 0 ]; then
+            last_ref="${refs[0]}"
+            last_kind=spec
+        elif [ "$maintenance" -eq 1 ]; then
+            last_ref=""
+            last_kind=maintenance
+        else
+            last_ref=""
+            last_kind=""
+        fi
         ;;
     *) usage ;;
 esac
 
-# The accepted reference goes to stdout so a caller can compare what a branch
-# implements against what its pull request claims. Diagnostics go to stderr.
-[ "$status" -eq 0 ] && [ -n "$last_ref" ] && echo "$last_ref"
+# Return the real path, No-Spec for maintenance, or nothing for mechanical exemptions.
+if [ "$status" -eq 0 ]; then
+    case "$last_kind" in
+        spec) printf '%s\n' "$last_ref" ;;
+        maintenance) printf 'No-Spec\n' ;;
+    esac
+fi
 
 exit "$status"
