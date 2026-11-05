@@ -1,0 +1,66 @@
+name: spec reference
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  spec-ref:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Allocate fresh evidence path
+        id: evidence
+        run: |
+          directory="$(mktemp -d "$RUNNER_TEMP/netfyr-references.XXXXXXXX")"
+          printf 'file=%s/checks.json\n' "$directory" >> "$GITHUB_OUTPUT"
+      - name: Pin the merged requirements revision
+        id: requirements
+        run: |
+          set -euo pipefail
+          revision="$(git ls-remote https://github.com/netfyr/specs.git refs/heads/main | cut -f1)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo 'Cannot resolve merged requirements revision' >&2; exit 1; }
+          printf 'requirements_sha=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+          printf 'NETFYR_SPECS_RAW=https://raw.githubusercontent.com/netfyr/specs/%s\n' "$revision" >> "$GITHUB_ENV"
+      - name: Check change declarations
+        id: references
+        env:
+          VERIFY_SPEC_EXISTS: "1"
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          commit_scope="$(scripts/check-spec-ref.sh --range "$BASE_SHA..$HEAD_SHA")"
+          message="$(mktemp)"
+          trap 'rm -f "$message"' EXIT
+          printf '%s\n' "$PR_BODY" > "$message"
+          description_scope="$(scripts/check-spec-ref.sh --description "$message")"
+          if [ -n "$commit_scope" ] && [ "$description_scope" != "$commit_scope" ]; then
+            echo "FAIL: description declares $description_scope; commits declare $commit_scope" >&2
+            exit 1
+          fi
+      - name: Record reference-check outcome
+        id: record
+        if: always() && steps.evidence.outputs.file != ''
+        env:
+          REQUIREMENTS_REVISION: ${{ steps.requirements.outputs.requirements_sha }}
+          REFERENCE_OUTCOME: ${{ steps.references.outcome }}
+          EVIDENCE_FILE: ${{ steps.evidence.outputs.file }}
+        run: |
+          python3 scripts/ci-evidence.py --output "$EVIDENCE_FILE" \
+            --check "references=$REFERENCE_OUTCOME" --requirements-revision "$REQUIREMENTS_REVISION"
+      - name: Retain evidence
+        if: always() && steps.record.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spec-reference-check
+          path: ${{ steps.evidence.outputs.file }}
+          if-no-files-found: error

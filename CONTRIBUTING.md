@@ -2,8 +2,14 @@
 
 ## How work is organized
 
-Work is driven by specs in [netfyr/specs](https://github.com/netfyr/specs). Each spec is
-an independent deliverable assigned to one developer and lands as one pull request.
+Behavior changes are driven by specs in [netfyr/specs](https://github.com/netfyr/specs).
+Keep behavior-changing pull requests focused on one governing spec; a spec may
+take several pull requests. Behavior-preserving maintenance can use an explained
+`No-Spec:` declaration, as described under Submitting changes.
+
+The maintenance declaration is pending a change to SPEC-009. The currently
+published spec still requires a spec reference for non-exempt commits; publish
+that amendment before enabling this candidate's maintenance policy.
 
 Before starting, read your spec's dependencies. Specs reference each other backwards
 only, never forwards, so everything your spec depends on is already merged and
@@ -28,9 +34,20 @@ make hooks                     # install the git hooks (do this once)
 
 `make hooks` needs [pre-commit](https://pre-commit.com) on your `PATH` and installs the
 hooks it declares: `cargo fmt --check` on commits that touch Rust files, `cargo clippy`
-before pushes that do. A commit touching only docs or shell runs neither. An existing
-hook of the same type is preserved as `<hook>.legacy` and still runs; hooks of other
-types, `commit-msg` included, are left alone.
+before pushes that do, a `commit-msg` change-declaration check, and resolution of real
+spec references in individual pushed messages. CI checks the pull request's
+one-spec scope and completion order. Local message checks work offline; resolving spec
+references needs `curl`.
+Run `make hooks` again after pulling changes to the declared hook types. Existing
+hooks of the same type are preserved as `<hook>.legacy` and still run.
+
+The `Rust and host checks` workflow runs formatting, a locked build, Rust tests,
+host shell checks and Clippy. Its shell lane selects `build,meta` with
+`REQUIRE_TEST_SELECTION=1`, so an accidentally empty required selection fails.
+Ordinary focused runs can still select nothing successfully. Privileged backend
+acceptance belongs in a disposable VM, following `tests/integration/coverage.md`.
+CI retains source/tool identity and actual step outcomes; skipped or cancelled
+steps remain incomplete. Workflow files do not configure repository required-status rules.
 
 ## Code conventions
 
@@ -128,10 +145,13 @@ steps. Reserve unit tests for verifying a single function.
 
 ## Submitting changes
 
-One spec per pull request.
+Keep spec-driven work within one spec per pull request. Maintenance that preserves
+observable behavior and compatibility can use `No-Spec: <reason>` instead of naming
+an unrelated spec. Explain what changed and why it needs no spec; reviewers assess
+that declaration. Project-wide rules still apply.
 
-Commit messages use the imperative mood, explain why rather than what, and reference the
-spec they implement with a `Spec:` trailer naming the spec's path in
+Commit messages use the imperative mood and explain why the change is needed.
+Spec-bearing commits carry a `Spec:` trailer naming the spec's path in
 [netfyr/specs](https://github.com/netfyr/specs), without the `.md`:
 
 ```
@@ -142,6 +162,49 @@ policy touches an unrelated field on the same interface.
 
 Spec: core/201-reconciliation-merge
 ```
+
+For maintenance, use one explained declaration in the same final-paragraph position:
+
+```
+Correct README spelling
+
+No-Spec: Spelling only; behavior is unchanged.
+```
+
+Every ordinary commit needs exactly one declaration. A missing declaration, an
+empty reason, or a message carrying both forms is rejected. The changed paths and
+subject prefixes such as `docs:` or `chore:` never classify a change automatically.
+Merge, revert and autosquash commits can omit a declaration, but explicit
+maintenance and completion declarations on them are still checked.
+
+The checker is `scripts/check-spec-ref.sh --msg MESSAGE_FILE` or
+`--range BASE..HEAD`. It rejects missing declarations, multiple real specs,
+mismatched completion references and completion before later spec-bearing work.
+`VERIFY_SPEC_EXISTS=1` resolves real references against published requirements;
+CI pins the requirements revision before resolving paths.
+
+A branch may mix maintenance with work toward one spec. Its PR description ends
+with that spec's trailer. A maintenance-only PR instead ends with its own
+`No-Spec: <reason>`; its reason need not repeat every commit's explanation. A PR
+containing only mechanically exempt commits still needs one of these declarations
+in its description. PR titles carry neither.
+
+Published root-level top-level requirements use their slug. Their reviewed
+classification is listed in `scripts/top-level-specs`; adding an entry requires
+confirming that the document is published as top-level. CI also checks its file
+exists. Top-level requirements remain approved and cannot carry an `implements`
+closer. Feature references retain their numbered path, and only a completing
+commit additionally carries `implements netfyr/specs#N`, using the original spec
+publication PR number rather than its filename number. Maintenance after that
+commit does not claim more work toward the spec. A `No-Spec:` message must contain
+no completion references, including in prose: the board scans the whole message.
+All completion references must be the single canonical trailer in the final
+paragraph. Quoting one in body prose can otherwise mark that spec implemented.
+
+Commit messages and PR descriptions describe what changed, why, and material
+behavior or compatibility limits. Keep testing and validation sections, commands,
+counts, results and verification summaries out of both. Report verification
+separately in chat or review evidence.
 
 When fixing a bug introduced by an earlier commit, add a
 `Fixes: HASH12 ("COMMIT SUBJECT")` trailer with the 12-character hash.
