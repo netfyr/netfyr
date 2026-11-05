@@ -138,7 +138,7 @@ check_message() {
             fail "$label: No-Spec: needs a maintenance reason"
             return
         fi
-        if [ -n "$board_matches" ] || [ -n "$impl" ]; then
+        if [[ -n "$board_matches" || -n "$impl" ]]; then
             fail "$label: No-Spec: maintenance cannot carry implements references"
             return
         fi
