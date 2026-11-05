@@ -64,4 +64,3 @@ jobs:
           name: spec-reference-check
           path: ${{ steps.evidence.outputs.file }}
           if-no-files-found: error
-
