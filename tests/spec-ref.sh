@@ -3,6 +3,7 @@
 # Change declarations: spec references, explained maintenance and range scope.
 
 set -uo pipefail
+unset VERIFY_SPEC_EXISTS NETFYR_SPECS_RAW NETFYR_SPECS_API NETFYR_SPECS_REPO NETFYR_TOP_LEVEL_SPECS_FILE GITHUB_TOKEN
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 checker="$repo_root/scripts/check-spec-ref.sh"
@@ -31,6 +32,8 @@ msg_check accept "other trailers alongside" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nSigned-off-by: A <a@b.c>')"
 msg_check accept "a comment block appended by git" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\n# Please enter the commit message\n# On branch main')"
+msg_check accept "a verbose commit diff below Git's scissors" \
+    "$(printf 'Do a thing\n\nSpec: core/003-policies\n# ------------------------ >8 ------------------------\ndiff --git a/example b/example\n\n+This implements netfyr/specs#999.')"
 
 msg_check reject "no trailer at all" "$(printf 'Do a thing\n\nBecause of a reason.')"
 msg_check reject "an empty message" ""
@@ -88,6 +91,12 @@ for subject in "Merge a topic" "Revert a topic" "fixup! A topic" "squash! A topi
         "$(printf '%s\n\nThis implements netfyr/specs#12.\n\nNo-Spec: Spelling only.' "$subject")"
     msg_check reject "conflicting declarations after $subject" \
         "$(printf '%s\n\nSpec: core/003-policies\nNo-Spec: Spelling only.' "$subject")"
+    msg_check reject "completion prose hidden by $subject" \
+        "$(printf '%s\n\nThis implements netfyr/specs#12.\n\nSpec: core/003-policies' "$subject")"
+    msg_check reject "completion without a governing spec after $subject" \
+        "$(printf '%s\n\nimplements netfyr/specs#12' "$subject")"
+    msg_check accept "a checked completion declaration after $subject" \
+        "$(printf '%s\n\nSpec: core/003-policies\nimplements netfyr/specs#12' "$subject")"
 done
 
 msg_check accept "a merge commit" "$(printf 'Merge branch feature into main')"
@@ -120,12 +129,18 @@ msg_check reject "an implements line naming another repository" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nimplements netfyr/netfyr#12')"
 msg_check reject "an implements line with no number" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nimplements netfyr/specs')"
-msg_check reject "a capitalised implements line the board would ignore" \
+msg_check reject "a capitalised implements line outside the canonical grammar" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nImplements netfyr/specs#12')"
 msg_check reject "two completion lines in one message" \
     "$(printf 'Do a thing\n\nSpec: core/003-policies\nimplements netfyr/specs#12\nimplements netfyr/specs#44')"
 msg_check accept "implements prose above the trailer block" \
     "$(printf 'Do a thing\n\nimplements whatever it feels like\n\nSpec: core/003-policies')"
+msg_check reject "a board completion reference in body prose" \
+    "$(printf 'Do a thing\n\nThis does not mean it implements netfyr/specs#999.\n\nSpec: core/003-policies')"
+msg_check reject "a second board completion reference above the trailer" \
+    "$(printf 'Do a thing\n\nThis implements netfyr/specs#44.\n\nSpec: core/003-policies\nimplements netfyr/specs#12')"
+msg_check reject "a board completion reference in a raw comment" \
+    "$(printf 'Do a thing\n\nSpec: core/003-policies\n# implements netfyr/specs#12')"
 
 specs="$tmp/specs"
 mkdir -p "$specs/core"
@@ -282,6 +297,15 @@ approved="$(git -C "$work" rev-parse HEAD)"
 commit "$(printf 'Work on a merged spec\n\nSpec: core/003-policies')"
 out="$(push_out "$approved" HEAD)"
 [ -z "$out" ] || { echo "FAIL: blocked a push for an approved spec: $out" >&2; status=1; }
+commit "$(printf 'Work inherited from newer main\n\nSpec: core/002-schema-validation')"
+if ! (cd "$work" && PRE_COMMIT_FROM_REF="$approved" PRE_COMMIT_TO_REF=HEAD bash "$checker" --push) >/dev/null 2>&1; then
+    echo "FAIL: push applied one-PR scope to commits inherited from newer main" >&2
+    status=1
+fi
+if (cd "$work" && bash "$checker" --range "$approved..HEAD") >/dev/null 2>&1; then
+    echo "FAIL: a PR range spanning two specs bypassed its scope rule" >&2
+    status=1
+fi
 
 unapproved="$(git -C "$work" rev-parse HEAD)"
 commit "$(printf 'Work on a draft spec\n\nSpec: core/404-ghost')"
@@ -289,8 +313,7 @@ out="$(push_out "$unapproved" HEAD)"
 grep -q 'does not exist in the specs repo' <<<"$out" \
     || { echo "FAIL: let through a spec that was never merged: $out" >&2; status=1; }
 
-# A new branch arrives with an all-zero from-ref and no remote to fall back on,
-# so everything on it gets checked rather than nothing.
+# Direct callers with no from-ref still check the available history.
 out="$(push_out 0000000000000000000000000000000000000000 HEAD)"
 grep -q 'does not exist in the specs repo' <<<"$out" \
     || { echo "FAIL: an unseen branch skipped the approval check: $out" >&2; status=1; }
@@ -335,6 +358,17 @@ fi
 merged="$(merge_commit "$(printf 'Combine the histories\n\nNo-Spec: Reconcile maintenance branches.\nSpec: core/003-policies')")"
 if (cd "$work" && bash "$checker" --range "$merge_parent..$merged") >/dev/null 2>&1; then
     echo "FAIL: a genuine merge hid conflicting declarations" >&2
+    status=1
+fi
+merged="$(merge_commit "$(printf 'Combine the histories\n\nThis implements netfyr/specs#12.\n\nSpec: core/003-policies')")"
+if (cd "$work" && bash "$checker" --range "$merge_parent..$merged") >/dev/null 2>&1; then
+    echo "FAIL: a genuine merge hid a completion reference in prose" >&2
+    status=1
+fi
+commit "$(printf 'Complete a spec\n\nSpec: core/003-policies\nimplements netfyr/specs#12')"
+commit "$(printf 'amend! Complete a spec\n\nSpec: core/003-policies\nimplements netfyr/specs#12')"
+if (cd "$work" && bash "$checker" --range "$merge_parent..HEAD") >/dev/null 2>&1; then
+    echo "FAIL: an autosquash commit hid a second completion declaration" >&2
     status=1
 fi
 

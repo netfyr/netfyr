@@ -7,6 +7,10 @@ Keep behavior-changing pull requests focused on one governing spec; a spec may
 take several pull requests. Behavior-preserving maintenance can use an explained
 `No-Spec:` declaration, as described under Submitting changes.
 
+The maintenance declaration is pending a change to SPEC-009. The currently
+published spec still requires a spec reference for non-exempt commits; publish
+that amendment before enabling this candidate's maintenance policy.
+
 Before starting, read your spec's dependencies. Specs reference each other backwards
 only, never forwards, so everything your spec depends on is already merged and
 implemented. If it is not, say so rather than implementing it yourself: that belongs to
@@ -31,7 +35,8 @@ make hooks                     # install the git hooks (do this once)
 `make hooks` needs [pre-commit](https://pre-commit.com) on your `PATH` and installs the
 hooks it declares: `cargo fmt --check` on commits that touch Rust files, `cargo clippy`
 before pushes that do, a `commit-msg` change-declaration check, and resolution of real
-spec references before pushes. Local message checks work offline; resolving spec
+spec references in individual pushed messages. CI checks the pull request's
+one-spec scope and completion order. Local message checks work offline; resolving spec
 references needs `curl`.
 Run `make hooks` again after pulling changes to the declared hook types. Existing
 hooks of the same type are preserved as `<hook>.legacy` and still run.
@@ -169,8 +174,8 @@ No-Spec: Spelling only; behavior is unchanged.
 Every ordinary commit needs exactly one declaration. A missing declaration, an
 empty reason, or a message carrying both forms is rejected. The changed paths and
 subject prefixes such as `docs:` or `chore:` never classify a change automatically.
-Merge, revert and autosquash commits can omit a declaration, but an explicit
-`No-Spec:` on one must still be valid.
+Merge, revert and autosquash commits can omit a declaration, but explicit
+maintenance and completion declarations on them are still checked.
 
 The checker is `scripts/check-spec-ref.sh --msg MESSAGE_FILE` or
 `--range BASE..HEAD`. It rejects missing declarations, multiple real specs,
@@ -193,6 +198,8 @@ commit additionally carries `implements netfyr/specs#N`, using the original spec
 publication PR number rather than its filename number. Maintenance after that
 commit does not claim more work toward the spec. A `No-Spec:` message must contain
 no completion references, including in prose: the board scans the whole message.
+All completion references must be the single canonical trailer in the final
+paragraph. Quoting one in body prose can otherwise mark that spec implemented.
 
 Commit messages and PR descriptions describe what changed, why, and material
 behavior or compatibility limits. Keep testing and validation sections, commands,
