@@ -1,4 +1,4 @@
-.PHONY: test fmt clippy hooks
+.PHONY: test fmt clippy hooks docs
 
 # make exports a command-line TAGS into the recipe environment, which the runner
 # reads. Interpolating it into the command line instead would let a tag containing
@@ -14,3 +14,6 @@ clippy:
 
 hooks:
 	@scripts/setup-hooks.sh
+
+docs:
+	python3 scripts/build-docs.py

@@ -27,6 +27,12 @@ The workspace's first crate is `netfyr-state`, a library, so `cargo test` runs i
 unit tests now; the shell suite under `make test` will exercise the CLI once a later
 story lands one.
 
+## API documentation
+
+Run `make docs` to generate the public Rust API reference in `target/pages`.
+The GitHub Pages workflow publishes `main` at `https://netfyr.github.io/netfyr/`.
+See [documentation hosting](docs/hosting.md) for local preview and initial setup.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
