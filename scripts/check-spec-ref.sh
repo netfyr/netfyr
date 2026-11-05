@@ -4,7 +4,7 @@
 #   check-spec-ref.sh --msg FILE     one commit message (used by the commit-msg hook)
 #   check-spec-ref.sh --description FILE   the pull request's declaration
 #   check-spec-ref.sh --range A..B   one governing spec, with maintenance allowed
-#   check-spec-ref.sh --push         the range being pushed, against merged specs only
+#   check-spec-ref.sh --push         individual pushed messages, against merged specs only
 #
 # The commit that finishes a spec also carries an 'implements <specs-repo>#N' line, which
 # is what moves the spec board's card. That number and the Spec: path come from different
@@ -26,6 +26,8 @@ top_level_specs="${NETFYR_TOP_LEVEL_SPECS_FILE:-$script_dir/top-level-specs}"
 # Mirrors the specs repo layout: NNN-slug.md at the root or under an area directory.
 ref_re='^([a-z0-9][a-z0-9-]*/)?[0-9]{3}-[a-z0-9-]+$'
 top_level_re='^[a-z][a-z0-9-]*$'
+# SpecDoc scans the whole original message with this grammar.
+completion_re='(^|[^A-Za-z0-9_])implements ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+'
 
 status=0
 last_ref=""
@@ -59,7 +61,7 @@ pr_files() {
 check_implements() {
     local label="$1" ref="$2" line="$3" repo num files
 
-    if [[ ! "$line" =~ ^implements[[:space:]]+([^[:space:]#]*)#([0-9]+)$ ]]; then
+    if [[ ! "$line" =~ ^implements\ ([^[:space:]#]*)#([0-9]+)$ ]]; then
         fail "$label: '$line' is not 'implements $specs_repo#<number>'"
         return
     fi
@@ -100,7 +102,7 @@ exempt_subject() {
 
 check_message() {
     local label="$1" raw="$2" mode="${3:-commit}" msg subject block refs count ref impl
-    local maintenance_count reason top_level=0
+    local maintenance_count reason board_matches top_level=0
     msg="$(git stripspace --strip-comments <<<"$raw")"
     last_ref=""
     last_impl=""
@@ -115,6 +117,12 @@ check_message() {
     block="$(awk 'BEGIN{RS=""} END{print}' <<<"$msg")"
     count="$(grep -c '^Spec:' <<<"$block")"
     maintenance_count="$(grep -c '^No-Spec:' <<<"$block")"
+    impl="$(grep -iE '^implements[[:space:]]' <<<"$block")"
+    board_matches="$(LC_ALL=C grep -oiE "$completion_re" <<<"$raw")"
+    if [ -n "$board_matches" ] && [ "$board_matches" != "$impl" ]; then
+        fail "$label: completion references must appear only as one final-paragraph implements trailer"
+        return
+    fi
 
     if [ "$maintenance_count" -gt 0 ]; then
         if [ "$maintenance_count" -ne 1 ]; then
@@ -130,9 +138,7 @@ check_message() {
             fail "$label: No-Spec: needs a maintenance reason"
             return
         fi
-        # The board scans the original full message for completion references.
-        if LC_ALL=C grep -qiE '(^|[^A-Za-z0-9_])implements ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+' <<<"$raw" \
-            || grep -qiE '^implements[[:space:]]' <<<"$block"; then
+        if [ -n "$board_matches" ] || [ -n "$impl" ]; then
             fail "$label: No-Spec: maintenance cannot carry implements references"
             return
         fi
@@ -140,7 +146,7 @@ check_message() {
         return
     fi
 
-    if [ "$mode" = merge ] || { [ "$mode" = commit ] && exempt_subject "$subject"; }; then return; fi
+    if [ -z "$impl" ] && { [ "$mode" = merge ] || { [ "$mode" = commit ] && exempt_subject "$subject"; }; }; then return; fi
 
     refs="$(sed -n 's/^Spec:[[:space:]]*//p' <<<"$block")"
 
@@ -168,9 +174,6 @@ check_message() {
         return
     fi
 
-    # Matched case-insensitively so a capitalised line is reported rather than
-    # silently ignored here and by the board.
-    impl="$(grep -iE '^implements[[:space:]]' <<<"$block")"
     if [ -n "$impl" ] && [ "$(wc -l <<<"$impl")" -gt 1 ]; then
         fail "$label: more than one implements trailer"
         return
@@ -189,12 +192,13 @@ usage() { echo "usage: ${0##*/} --msg FILE | --description FILE | --range BASE..
 
 # Publication checks use the merged requirements repository; local message checks
 # remain available offline.
+push_only=0
 if [ "${1:-}" = "--push" ]; then
+    push_only=1
     export VERIFY_SPEC_EXISTS=1
     to="${PRE_COMMIT_TO_REF:-HEAD}"
     from="${PRE_COMMIT_FROM_REF:-}"
-    # A branch the remote has never seen arrives as the all-zero sha; fall back to
-    # what the remote's default branch already carries, or to the whole history.
+    # Direct callers may omit the previous tip; pre-commit normally supplies one.
     if [ -z "$from" ] || [[ "$from" =~ ^0+$ ]]; then
         from="$(git rev-parse --verify -q origin/HEAD || git rev-parse --verify -q origin/main)" \
             || from=""
@@ -207,7 +211,10 @@ fi
 case "$1" in
     --msg)
         [ -r "$2" ] || { echo "FAIL: cannot read commit message file '$2'" >&2; exit 1; }
-        check_message "commit message" "$(cat "$2")"
+        comment="$(git config --get core.commentString || git config --get core.commentChar || printf '#')"
+        [ "$comment" != auto ] || comment='#'
+        message="$(awk -v marker="$comment ------------------------ >8 ------------------------" '$0 == marker {exit} {print}' "$2")"
+        check_message "commit message" "$message"
         ;;
     --description)
         [ -r "$2" ] || { echo "FAIL: cannot read pull request description '$2'" >&2; exit 1; }
@@ -235,6 +242,10 @@ case "$1" in
             [ -n "$last_impl" ] && closers+=("$sha")
             [ "$last_kind" = maintenance ] && maintenance=1
         done <<<"$commits"
+
+        # A push range can include commits inherited from newer main. PR scope
+        # belongs to the base/head range supplied by CI, not the old remote tip.
+        [ "$push_only" -eq 0 ] || exit "$status"
 
         # A spec is finished once. Two closing trailers means two commits each
         # claim the work is done, and the board acts on whichever it sees first.
