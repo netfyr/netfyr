@@ -4,6 +4,7 @@ members = [
     "crates/netfyr-state",
     "crates/netfyr-policy",
     "crates/netfyr-backend",
+    "crates/netfyr-reconcile",
     "tests/integration/probe",
 ]
 

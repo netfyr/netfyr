@@ -1,0 +1,25 @@
+[package]
+name = "netfyr-reconcile"
+description = "Pure reconciliation: bind contributions to devices, merge, and plan operations"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# netfyr-state: state representation, backend plan contract, and schema registry.
+netfyr-state = { path = "../netfyr-state" }
+# indexmap: insertion-ordered maps for building and merging fields; std has no insertion-ordered
+# map, and the model's Value::Map is itself an IndexMap.
+indexmap = "2"
+# serde_json: deterministic reconciliation-owned JSON rendering.
+serde_json = "1"
+# uuid: building validation scratch States without calling StateMetadata::new(), which reads the
+# clock; reconciliation must not read a clock (FR-001).
+uuid = "1"
+
+[dev-dependencies]
+# netfyr-backend: the pure planner must not depend on the concrete backend; only tests exercise
+# the backend contract with a DryRunBackend.
+netfyr-backend = { path = "../netfyr-backend" }
+tokio = { version = "1", features = ["macros", "rt"] }
