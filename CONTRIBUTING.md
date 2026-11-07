@@ -12,17 +12,16 @@ only, never forwards, so everything your spec depends on is already merged and
 implemented. If it is not, say so rather than implementing it yourself: that belongs to
 whoever owns the dependency.
 
-A spec creates its own crates under `crates/` and adds them to the workspace `members`
-list. The workspace starts empty by design.
+Add new crates under `crates/` and list them in the workspace `members`.
 
 ## Development workflow
 
 ```
 cargo build                    # compile the workspace
 cargo test                     # unit tests
-make test                      # shell integration tests
-make test TAGS=ipv4,routing    # integration tests tagged ipv4 OR routing
-make test TAGS=ipv4+routing    # integration tests tagged ipv4 AND routing
+make test                      # shell checks
+make test TAGS=build,meta       # shell checks tagged build OR meta
+make test TAGS=meta+policy      # shell checks tagged meta AND policy
 make fmt                       # format
 make clippy                    # lint
 make hooks                     # install the git hooks (do this once)
@@ -208,9 +207,8 @@ When fixing a bug introduced by an earlier commit, add a
 Split work into logical commits: one reviewable increment each. Reviewers read per
 commit, so do not bundle a refactor with the feature that motivated it.
 
-Before opening a pull request, make sure `make test` passes, and once the workspace has
-crates, that `cargo test` and `make clippy` do too. State what the change does and why,
-and update the affected documentation.
+Before opening a pull request, make sure `make test`, `cargo test` and `make clippy`
+pass. State what the change does and why, and update the affected documentation.
 
 Add a `CHANGELOG.md` entry under `## [Unreleased]`, naming the spec in parentheses, only
 when a user or packager would notice the change. Scaffolding, test infrastructure, and
