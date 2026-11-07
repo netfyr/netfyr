@@ -27,6 +27,12 @@ The workspace's first crate is `netfyr-state`, a library, so `cargo test` runs i
 unit tests now; the shell suite under `make test` will exercise the CLI once a later
 story lands one.
 
+## API documentation
+
+Run `make docs` to generate the library API reference. Open
+`target/doc/netfyr_state/index.html`; use the Crates sidebar to switch libraries.
+User guides and configuration reference are at [docs.netfyr.io](https://docs.netfyr.io/).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
