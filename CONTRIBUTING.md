@@ -7,10 +7,6 @@ Keep behavior-changing pull requests focused on one governing spec; a spec may
 take several pull requests. Behavior-preserving maintenance can use an explained
 `No-Spec:` declaration, as described under Submitting changes.
 
-The maintenance declaration is pending a change to SPEC-009. The currently
-published spec still requires a spec reference for non-exempt commits; publish
-that amendment before enabling this candidate's maintenance policy.
-
 Before starting, read your spec's dependencies. Specs reference each other backwards
 only, never forwards, so everything your spec depends on is already merged and
 implemented. If it is not, say so rather than implementing it yourself: that belongs to
