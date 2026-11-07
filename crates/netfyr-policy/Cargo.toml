@@ -5,8 +5,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [dependencies]
 indexmap = "2"
-netfyr-state = { path = "../netfyr-state" }
+netfyr-state = { path = "../netfyr-state", version = "0.1.0" }
 serde_yaml = "0.9"
