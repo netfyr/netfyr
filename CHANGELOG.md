@@ -20,8 +20,11 @@ they name carry that history.
 - Add `netfyr-reconcile`: pure reconciliation that binds policy
   contributions to backend observations, merges the fields of every
   policy matching a device by priority, and plans backend-executable
-  operations with diagnostics and contribution provenance
-  (core/005-reconciliation).
+  operations with diagnostics and contribution provenance. Duplicate IPv4
+  addresses are not reported as conflicts when only attribute order differs.
+  Programmatic contributions accept IPv4 CIDR strings as well as typed network
+  values, merging equivalent addresses without losing host bits or winning
+  provenance (core/005-reconciliation).
 - Add tiered policy loading: `load_policy_tiers` selects policy
   definitions by name across an ordered search path
   (`DEFAULT_POLICY_PATHS`), with the highest-precedence tier shadowing a
