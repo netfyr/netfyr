@@ -15,6 +15,7 @@ struct MockIo {
     inventory_override_at: Option<(usize, Observation)>,
     cancel_after_write: Option<Arc<AtomicBool>>,
     cancel_on_inventory: Option<Arc<AtomicBool>>,
+    cancel_on_identity: Option<Arc<AtomicBool>>,
     cascade_primary: bool,
 }
 
@@ -32,6 +33,7 @@ impl MockIo {
             inventory_override_at: None,
             cancel_after_write: None,
             cancel_on_inventory: None,
+            cancel_on_identity: None,
             cascade_primary: false,
         }
     }
@@ -82,6 +84,18 @@ impl Io for MockIo {
                 ));
             }
             Ok(self.observation.clone())
+        })
+    }
+
+    fn confirm_identity<'a>(
+        &'a mut self,
+        _: &'a InterfaceId,
+    ) -> IoFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            if let Some(cancelled) = &self.cancel_on_identity {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(())
         })
     }
 
@@ -1218,6 +1232,26 @@ fn cancellation_during_inventory_stops_before_the_write() {
         [BackendErrorKind::ApplyFailed]
     );
     assert_eq!(io.inventory_calls, 1);
+    assert!(io.attempts.is_empty());
+}
+
+#[test]
+fn cancellation_during_identity_confirmation_stops_before_the_write() {
+    let target = device(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut io = MockIo::new(vec![target.clone()]);
+    io.cancel_on_identity = Some(Arc::clone(&cancelled));
+    let report = apply_plan(
+        &mut io,
+        &plan(vec![op(&target, OperationKind::SetMtu(1800), &[])]),
+        &|| cancelled.load(Ordering::SeqCst),
+    )
+    .now_or_never()
+    .unwrap();
+    assert_eq!(
+        failed_kinds(&report.failed),
+        [BackendErrorKind::ApplyFailed]
+    );
     assert!(io.attempts.is_empty());
 }
 

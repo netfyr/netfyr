@@ -163,12 +163,14 @@ impl BackendRegistry {
         let results = join_all(backends.iter().map(|backend| backend.query(selector))).await;
         let mut result = Observation::default();
         let mut seen = HashMap::new();
+        let mut answered = false;
         for (backend, observation) in backends.into_iter().zip(results) {
             let observation = match observation {
                 Ok(observation) => observation,
                 Err(error) if error.kind == BackendErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
+            answered = true;
             result.diagnostics.extend(observation.diagnostics);
             let entities = backend.supported_entities();
             for device in observation.devices {
@@ -193,7 +195,7 @@ impl BackendRegistry {
                 }
             }
         }
-        if selector.name.is_some() && result.devices.is_empty() {
+        if selector.name.is_some() && !answered {
             return Err(BackendError::new(
                 BackendErrorKind::NotFound,
                 "named interface was not found in the registered namespaces",
@@ -248,6 +250,18 @@ mod tests {
             Box::pin(async move {
                 if let Some(kind) = self.failure {
                     return Err(BackendError::new(kind, "stub failure"));
+                }
+                if let Some(name) = &selector.name {
+                    if !self
+                        .devices
+                        .iter()
+                        .any(|device| device.identity.name == *name)
+                    {
+                        return Err(BackendError::new(
+                            BackendErrorKind::NotFound,
+                            "stub has no such interface",
+                        ));
+                    }
                 }
                 Ok(Observation {
                     devices: self
@@ -475,6 +489,21 @@ mod tests {
                 .devices
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_named_interface_missing_another_criterion_is_an_empty_result() {
+        let mut registry = BackendRegistry::new();
+        registry
+            .register(backend(device(1, "ethernet"), "ethernet"))
+            .unwrap();
+        let selector = Match {
+            name: Some("eth0".into()),
+            mac: Some("02:00:00:00:00:ff".into()),
+            ..Match::default()
+        };
+        let result = registry.query(&selector).now_or_never().unwrap().unwrap();
+        assert!(result.devices.is_empty());
     }
 
     #[test]
