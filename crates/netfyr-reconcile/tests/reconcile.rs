@@ -83,8 +83,12 @@ fn contribution(fields: IndexMap<String, Value>) -> Contribution {
 }
 
 fn address(ip: Ipv4Addr, valid: Option<u64>, preferred: Option<u64>) -> Value {
+    address_with_ip(Value::IpNetwork((IpAddr::V4(ip), 24)), valid, preferred)
+}
+
+fn address_with_ip(ip: Value, valid: Option<u64>, preferred: Option<u64>) -> Value {
     let mut map = IndexMap::new();
-    map.insert("ip".into(), Value::IpNetwork((IpAddr::V4(ip), 24)));
+    map.insert("ip".into(), ip);
     if let Some(valid) = valid {
         map.insert("valid_lft".into(), Value::U64(valid));
     }
@@ -941,6 +945,160 @@ fn duplicate_addresses_within_one_contribution_collapse_to_one() {
         .count();
     assert_eq!(additions, 1);
     assert!(plan.diagnostics.is_empty());
+}
+
+#[test]
+fn string_cidr_addresses_preserve_host_bits_and_prefix_identity() {
+    let addresses = ["192.0.2.10/24", "192.0.2.11/24", "192.0.2.10/25"]
+        .into_iter()
+        .map(|text| address_with_ip(Value::String(text.into()), None, None))
+        .collect();
+    let plan = reconcile(
+        &[contribution(address_fields(addresses))],
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    let mut identities: Vec<_> = plan
+        .diff()
+        .operations
+        .iter()
+        .map(|operation| match &operation.kind {
+            OperationKind::AddIpv4(address) => (address.ip, address.prefix_len),
+            other => panic!("expected an address addition, got {other:?}"),
+        })
+        .collect();
+    identities.sort();
+    assert_eq!(
+        identities,
+        [
+            (Ipv4Addr::new(192, 0, 2, 10), 24),
+            (Ipv4Addr::new(192, 0, 2, 10), 25),
+            (Ipv4Addr::new(192, 0, 2, 11), 24),
+        ]
+    );
+    assert!(plan.diagnostics.is_empty());
+}
+
+#[test]
+fn string_cidr_duplicates_merge_with_typed_addresses() {
+    let ip = Ipv4Addr::new(192, 0, 2, 10);
+    let typed = address(ip, Some(3600), Some(1800));
+    let text = address_with_ip(
+        Value::String("192.0.2.10/24".into()),
+        Some(3600),
+        Some(1800),
+    );
+    assert_ne!(typed, text);
+    for (winner, other) in [(typed.clone(), text.clone()), (text, typed)] {
+        let high = contribution(address_fields(vec![winner.clone()]));
+        let low = Contribution::new(
+            "p",
+            "p:provider",
+            Source::Dhcp { policy: "p".into() },
+            "ethernet",
+            high.match_spec.clone(),
+            address_fields(vec![other.clone()]),
+            50,
+        );
+        for contributions in [
+            vec![contribution(address_fields(vec![winner, other]))],
+            vec![high.clone(), low.clone()],
+            vec![low, high],
+        ] {
+            for conflict_policy in [ConflictPolicy::Resolve, ConflictPolicy::Reject] {
+                let plan = reconcile(
+                    &contributions,
+                    &observation(Vec::new(), true),
+                    &SchemaRegistry::new(),
+                    &MergeOptions { conflict_policy },
+                )
+                .unwrap();
+                assert!(plan.diagnostics.is_empty());
+                assert!(matches!(
+                    &plan.diff().operations[..],
+                    [operation] if matches!(&operation.kind, OperationKind::AddIpv4(address)
+                        if address.ip == ip && address.prefix_len == 24
+                            && address.lifetimes() == (3600, 1800))
+                ));
+                assert_eq!(plan.provenance[0].source.as_deref(), Some("p"));
+                assert_eq!(
+                    plan.provenance[0].element_sources.as_deref(),
+                    Some(&["p".to_string()][..])
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn string_cidr_conflicts_preserve_winning_values_and_omitted_attributes() {
+    let ip = Ipv4Addr::new(192, 0, 2, 10);
+    for (winner_lifetime, other_lifetime) in [(None, Some(3600)), (Some(3600), None)] {
+        let Value::Map(attributes) =
+            address_with_ip(Value::String("192.0.2.10/24".into()), winner_lifetime, None)
+        else {
+            unreachable!()
+        };
+        let winner = Value::Map(attributes.into_iter().rev().collect());
+        let other = address(ip, other_lifetime, None);
+        let plan = reconcile(
+            &[contribution(address_fields(vec![
+                winner.clone(),
+                other.clone(),
+            ]))],
+            &observation(Vec::new(), true),
+            &SchemaRegistry::new(),
+            &MergeOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &plan.diagnostics[..],
+            [Diagnostic::ValueConflict(conflict)]
+                if conflict.identity == ConflictIdentity::Address { ip: Value::IpNetwork((IpAddr::V4(ip), 24)) }
+                    && conflict.winner.value == winner
+                    && conflict.winner.source == "p"
+                    && conflict.competing.len() == 2
+                    && conflict.competing[1].value == other
+        ));
+        assert!(matches!(
+            &plan.diff().operations[..],
+            [operation] if matches!(&operation.kind, OperationKind::AddIpv4(address)
+                if address.valid_lft == winner_lifetime.map(|value| value as u32))
+        ));
+        assert_eq!(
+            plan.provenance[0].element_sources.as_deref(),
+            Some(&["p".to_string()][..])
+        );
+    }
+}
+
+#[test]
+fn string_cidr_invalid_values_fail_schema_validation() {
+    for text in [
+        "192.0.2.10",
+        "192.0.2.10/33",
+        "192.0.2.10/no",
+        "2001:db8::1/64",
+    ] {
+        for conflict_policy in [ConflictPolicy::Resolve, ConflictPolicy::Reject] {
+            let result = reconcile(
+                &[contribution(address_fields(vec![address_with_ip(
+                    Value::String(text.into()),
+                    None,
+                    None,
+                )]))],
+                &observation(Vec::new(), true),
+                &SchemaRegistry::new(),
+                &MergeOptions { conflict_policy },
+            );
+            assert!(
+                matches!(result, Err(ReconcileError::Validation(_))),
+                "{text}: {result:?}"
+            );
+        }
+    }
 }
 
 fn assert_duplicate_address_property_order(conflict_policy: ConflictPolicy) {
