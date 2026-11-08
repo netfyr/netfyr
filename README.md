@@ -3,9 +3,9 @@
 Declarative network configuration for Linux, applied over netlink.
 
 Configuration uses YAML. The workspace contains libraries for network state,
-policy loading and validation, and the Linux network backend. The reconciliation
-layer and end-user CLI are still in development. The intended query and apply
-paths need no daemon.
+policy loading and validation, reconciliation, and the Linux network backend. The
+end-user CLI is still in development. The intended query and apply paths need no
+daemon.
 
 YAML values are decoded using the embedded schema at each property path. For
 example, an address-looking interface name remains a string, while an
