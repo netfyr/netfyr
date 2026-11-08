@@ -1,5 +1,7 @@
 //! The `Match` type: a selector identifying which device a state targets.
 
+use std::fmt;
+
 /// Identifies which system device a [`crate::State`] targets.
 ///
 /// All fields are optional. Matching is AND over the fields set in `self`
@@ -47,6 +49,34 @@ impl Match {
             && self.driver.is_none()
             && self.pci_path.is_none()
             && self.mac.is_none()
+    }
+}
+
+impl fmt::Display for Match {
+    /// The set fields as `name=value` pairs in a fixed order, or `*` when no
+    /// field is set (the empty selector matches every device).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        if let Some(name) = &self.name {
+            parts.push(format!("name={name}"));
+        }
+        if let Some(value) = &self.r#type {
+            parts.push(format!("type={value}"));
+        }
+        if let Some(driver) = &self.driver {
+            parts.push(format!("driver={driver}"));
+        }
+        if let Some(pci_path) = &self.pci_path {
+            parts.push(format!("pci_path={pci_path}"));
+        }
+        if let Some(mac) = &self.mac {
+            parts.push(format!("mac={mac}"));
+        }
+        if parts.is_empty() {
+            f.write_str("*")
+        } else {
+            f.write_str(&parts.join(", "))
+        }
     }
 }
 
