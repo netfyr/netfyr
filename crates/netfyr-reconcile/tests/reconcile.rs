@@ -943,6 +943,106 @@ fn duplicate_addresses_within_one_contribution_collapse_to_one() {
     assert!(plan.diagnostics.is_empty());
 }
 
+fn assert_duplicate_address_property_order(conflict_policy: ConflictPolicy) {
+    let ip = Ipv4Addr::new(192, 0, 2, 10);
+    let ordered = address(ip, Some(3600), Some(1800));
+    let Value::Map(attributes) = ordered.clone() else {
+        unreachable!()
+    };
+    let reordered = Value::Map(attributes.into_iter().rev().collect());
+    assert_ne!(ordered, reordered);
+    let high = contribution(address_fields(vec![reordered.clone()]));
+    let low = Contribution::new(
+        "p",
+        "p:provider",
+        Source::Dhcp { policy: "p".into() },
+        "ethernet",
+        high.match_spec.clone(),
+        address_fields(vec![ordered.clone()]),
+        50,
+    );
+    let inputs = [
+        vec![contribution(address_fields(vec![reordered, ordered]))],
+        vec![high.clone(), low.clone()],
+        vec![low, high],
+    ];
+    for contributions in &inputs {
+        let result = reconcile(
+            contributions,
+            &observation(Vec::new(), true),
+            &SchemaRegistry::new(),
+            &MergeOptions { conflict_policy },
+        );
+        let plan = result.unwrap_or_else(|error| {
+            panic!("property order must not conflict in {conflict_policy:?} mode: {error:?}")
+        });
+        assert!(
+            plan.diagnostics.is_empty(),
+            "property order produced diagnostics in {conflict_policy:?} mode: {:?}",
+            plan.diagnostics
+        );
+        assert_eq!(plan.diff().operations.len(), 1);
+        assert!(matches!(
+            &plan.diff().operations[0].kind,
+            OperationKind::AddIpv4(address)
+                if address.ip == ip && address.lifetimes() == (3600, 1800)
+        ));
+        assert_eq!(plan.provenance[0].source.as_deref(), Some("p"));
+        assert_eq!(
+            plan.provenance[0].element_sources.as_deref(),
+            Some(&["p".to_string()][..])
+        );
+    }
+}
+
+#[test]
+fn duplicate_address_property_order_is_accepted_in_resolve_mode() {
+    assert_duplicate_address_property_order(ConflictPolicy::Resolve);
+}
+
+#[test]
+fn duplicate_address_property_order_is_accepted_in_reject_mode() {
+    assert_duplicate_address_property_order(ConflictPolicy::Reject);
+}
+
+#[test]
+fn address_attribute_conflict_preserves_the_winning_object() {
+    let ip = Ipv4Addr::new(192, 0, 2, 10);
+    let Value::Map(attributes) = address(ip, Some(3600), Some(1800)) else {
+        unreachable!()
+    };
+    let winner = Value::Map(attributes.into_iter().rev().collect());
+    let high = contribution(address_fields(vec![winner.clone()]));
+    let low = Contribution::new(
+        "p",
+        "p:provider",
+        Source::Dhcp { policy: "p".into() },
+        "ethernet",
+        high.match_spec.clone(),
+        address_fields(vec![address(ip, Some(7200), Some(1800))]),
+        50,
+    );
+    let plan = reconcile(
+        &[low, high],
+        &observation(Vec::new(), true),
+        &SchemaRegistry::new(),
+        &MergeOptions::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &plan.diagnostics[..],
+        [Diagnostic::ValueConflict(conflict)]
+            if matches!(conflict.identity, ConflictIdentity::Address { .. })
+                && conflict.winner.source == "p"
+                && conflict.winner.value == winner
+                && conflict.competing.len() == 2
+    ));
+    assert_eq!(
+        plan.provenance[0].element_sources.as_deref(),
+        Some(&["p".to_string()][..])
+    );
+}
+
 #[test]
 fn duplicate_addresses_with_different_attributes_conflict_within_one_contribution() {
     // FR-012: duplicate-address attributes are structured conflicts; the

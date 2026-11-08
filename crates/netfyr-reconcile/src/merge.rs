@@ -197,7 +197,11 @@ impl Ctx {
             }
         }
         for (_, entries) in &self.address_seen {
-            if entries.len() >= 2 && entries[1..].iter().any(|(_, v, _)| v != &entries[0].1) {
+            if entries.len() >= 2
+                && entries[1..]
+                    .iter()
+                    .any(|(_, value, _)| !same_address_attributes(value, &entries[0].1))
+            {
                 out.push(ValueConflict {
                     target: target.clone(),
                     identity: ConflictIdentity::Address {
@@ -344,4 +348,14 @@ fn address_ip(address: &Value) -> Option<(&std::net::IpAddr, u8)> {
         },
         _ => None,
     }
+}
+
+fn same_address_attributes(first: &Value, other: &Value) -> bool {
+    let (Value::Map(first), Value::Map(other)) = (first, other) else {
+        return false;
+    };
+    first.len() == other.len()
+        && first
+            .iter()
+            .all(|(key, value)| other.get(key) == Some(value))
 }
