@@ -92,6 +92,28 @@ fn may_match(selector: &Match, spec: &Match) -> bool {
     .matches(spec)
 }
 
+fn filter_query(
+    selector: &Match,
+    mut observation: Observation,
+) -> Result<Observation, BackendError> {
+    if let Some(name) = &selector.name {
+        if !observation
+            .devices
+            .iter()
+            .any(|device| device.identity.name == *name)
+        {
+            return Err(BackendError::new(
+                BackendErrorKind::NotFound,
+                format!("no interface named {name}"),
+            ));
+        }
+    }
+    observation
+        .devices
+        .retain(|device| selector.matches(&device.state.match_spec));
+    Ok(observation)
+}
+
 impl NetlinkBackend {
     /// Open a network namespace (for example `/run/netns/test`). This never
     /// changes the calling thread's namespace. Opening the current namespace
@@ -173,19 +195,7 @@ impl NetlinkBackend {
                                 let result = transport
                                     .inventory(|spec| may_match(&selector, spec))
                                     .await
-                                    .and_then(|mut observation| {
-                                        observation.devices.retain(|device| {
-                                            selector.matches(&device.state.match_spec)
-                                        });
-                                        if observation.devices.is_empty() && selector.name.is_some()
-                                        {
-                                            return Err(BackendError::new(
-                                                BackendErrorKind::NotFound,
-                                                format!("no interface matches {selector:?}"),
-                                            ));
-                                        }
-                                        Ok(observation)
-                                    });
+                                    .and_then(|observation| filter_query(&selector, observation));
                                 let _ = response.send(result);
                             }
                             Request::Apply(diff, response) => {
@@ -279,6 +289,11 @@ impl NetworkBackend for NetlinkBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use netfyr_state::plan::{DeviceObservation, InterfaceId};
+    use netfyr_state::{Source, State};
+
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -330,5 +345,50 @@ mod tests {
         };
         assert!(!may_match(&other, &spec));
         assert!(may_match(&Match::default(), &spec));
+    }
+
+    #[test]
+    fn only_an_absent_named_interface_is_not_found() {
+        let identity = InterfaceId {
+            namespace: NamespaceId {
+                device: 4,
+                inode: 1,
+            },
+            index: 7,
+            generation: 1,
+            name: "eth0".into(),
+            device_type: ETHERNET.into(),
+            mac: Some("02:00:00:00:00:01".into()),
+        };
+        let mut state = State::new(Source::Kernel);
+        state.match_spec = Match {
+            name: Some(identity.name.clone()),
+            r#type: Some(ETHERNET.into()),
+            mac: identity.mac.clone(),
+            ..Match::default()
+        };
+        let observation = Observation {
+            devices: vec![DeviceObservation {
+                identity,
+                state,
+                addresses: Vec::new(),
+                addresses_complete: true,
+                observed_at: Instant::now(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        let query = |selector: Match| filter_query(&selector, observation.clone());
+        let named = |name: &str| Match {
+            name: Some(name.into()),
+            ..Match::default()
+        };
+        assert_eq!(query(named("eth0")).unwrap().devices.len(), 1);
+        let other_mac = Match {
+            mac: Some("02:00:00:00:00:02".into()),
+            ..named("eth0")
+        };
+        assert!(query(other_mac).unwrap().devices.is_empty());
+        let error = query(named("eth1")).unwrap_err();
+        assert_eq!(error.kind, BackendErrorKind::NotFound);
     }
 }

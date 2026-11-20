@@ -596,14 +596,16 @@ impl LinuxTransport {
                 ));
             }
         };
-        self.confirm_identity(target).await?;
         self.request(message, Exchange::Write, flags).await?;
         Ok(())
     }
 
     // Notifications arrive in socket order, so once this reply arrives every
     // earlier deletion has been recorded.
-    async fn confirm_identity(&mut self, target: &InterfaceId) -> Result<(), BackendError> {
+    pub(crate) async fn confirm_identity(
+        &mut self,
+        target: &InterfaceId,
+    ) -> Result<(), BackendError> {
         let stale = || {
             BackendError::new(
                 BackendErrorKind::StaleState,
