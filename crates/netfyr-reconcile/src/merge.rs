@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use netfyr_state::Value;
 use netfyr_state::plan::InterfaceId;
 
+use crate::address::address_identity;
 use crate::{CompetingValue, ConflictIdentity, Contribution, ValueConflict};
 
 /// The address field's path; its list elements merge by address identity
@@ -111,14 +112,14 @@ impl Ctx {
     fn on_union(&mut self, path: &str, key: &str, existing: &mut Vec<Value>, incoming: &[Value]) {
         for element in incoming {
             let identity = if path == ADDRESS_PATH {
-                address_ip(element)
+                address_identity(element)
             } else {
                 None
             };
             let present = match identity {
                 Some((addr, prefix)) => existing
                     .iter()
-                    .any(|e| address_ip(e).is_some_and(|(a, p)| a == addr && p == prefix)),
+                    .any(|e| address_identity(e) == Some((addr, prefix))),
                 None => existing.iter().any(|e| e == element),
             };
             if present {
@@ -160,14 +161,14 @@ impl Ctx {
 
     /// Record an address-list element under its `ip` identity.
     fn record_address(&mut self, key: &str, element: &Value) {
-        let Some((addr, prefix)) = address_ip(element) else {
+        let Some((addr, prefix)) = address_identity(element) else {
             return;
         };
         let identity = format!("{addr}/{prefix}");
         self.address_seen.entry(identity).or_default().push((
             key.to_string(),
             element.clone(),
-            Value::IpNetwork((*addr, prefix)),
+            Value::IpNetwork((addr.into(), prefix)),
         ));
     }
 
@@ -197,7 +198,11 @@ impl Ctx {
             }
         }
         for (_, entries) in &self.address_seen {
-            if entries.len() >= 2 && entries[1..].iter().any(|(_, v, _)| v != &entries[0].1) {
+            if entries.len() >= 2
+                && entries[1..]
+                    .iter()
+                    .any(|(_, value, _)| !same_address_attributes(value, &entries[0].1))
+            {
                 out.push(ValueConflict {
                     target: target.clone(),
                     identity: ConflictIdentity::Address {
@@ -336,12 +341,18 @@ fn join(prefix: &str, field: &str) -> String {
     }
 }
 
-fn address_ip(address: &Value) -> Option<(&std::net::IpAddr, u8)> {
-    match address {
-        Value::Map(map) => match map.get("ip") {
-            Some(Value::IpNetwork((address, prefix))) => Some((address, *prefix)),
-            _ => None,
-        },
-        _ => None,
+fn same_address_attributes(first: &Value, other: &Value) -> bool {
+    let Some(identity) = address_identity(first) else {
+        return false;
+    };
+    if address_identity(other) != Some(identity) {
+        return false;
     }
+    let (Value::Map(first), Value::Map(other)) = (first, other) else {
+        return false;
+    };
+    first.len() == other.len()
+        && first
+            .iter()
+            .all(|(key, value)| key == "ip" || other.get(key) == Some(value))
 }

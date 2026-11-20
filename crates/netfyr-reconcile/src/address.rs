@@ -115,16 +115,31 @@ fn parse_desired(value: &Value, target: &InterfaceId) -> Result<Vec<Ipv4Address>
         .collect()
 }
 
+pub(super) fn address_identity(value: &Value) -> Option<(Ipv4Addr, u8)> {
+    let Value::Map(fields) = value else {
+        return None;
+    };
+    let (ip, prefix_len) = match fields.get("ip")? {
+        Value::IpNetwork((IpAddr::V4(ip), prefix_len)) => (*ip, *prefix_len),
+        Value::String(text) => {
+            let (ip, prefix_len) = text.split_once('/')?;
+            (ip.parse().ok()?, prefix_len.parse().ok()?)
+        }
+        _ => return None,
+    };
+    (prefix_len <= 32).then_some((ip, prefix_len))
+}
+
 fn parse_address(value: &Value) -> Result<Ipv4Address, String> {
     let Value::Map(fields) = value else {
         return Err("address must be an object".into());
     };
-    let Some(Value::IpNetwork((IpAddr::V4(ip), prefix_len))) = fields.get("ip") else {
+    let Some((ip, prefix_len)) = address_identity(value) else {
         return Err("address ip must be an IPv4 CIDR".into());
     };
     let address = Ipv4Address {
-        ip: *ip,
-        prefix_len: *prefix_len,
+        ip,
+        prefix_len,
         valid_lft: lifetime(fields, "valid_lft")?,
         preferred_lft: lifetime(fields, "preferred_lft")?,
     };
