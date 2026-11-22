@@ -2,30 +2,33 @@
 
 Declarative network configuration for Linux, applied over netlink.
 
-You describe the network state you want in YAML. netfyr reads the current state from
-the kernel, works out the difference, and applies it over netlink. The query and apply
-paths need no daemon.
+Configuration uses YAML. The workspace contains libraries for network state,
+policy loading and validation, reconciliation, and the Linux network backend. The
+end-user CLI is still in development. The intended query and apply paths need no
+daemon.
 
 YAML values are decoded using the embedded schema at each property path. For
 example, an address-looking interface name remains a string, while an
 `ipv4.addresses[].ip` value uses the declared CIDR format.
 
 Work here is driven spec by spec from
-[netfyr/specs](https://github.com/netfyr/specs).
+[netfyr/specs](https://github.com/netfyr/specs). See the
+[development guide](https://netfyr.io/development/) for the contribution workflow
+and [CONTRIBUTING.md](CONTRIBUTING.md) for this repository's commands and rules.
 
 ## Build and test
 
 ```
 cargo build                    # compile the workspace
 cargo test                     # unit tests
-make test                      # shell integration tests
-make test TAGS=ipv4,routing    # integration tests tagged ipv4 OR routing
-make test TAGS=ipv4+routing    # integration tests tagged ipv4 AND routing
+make test                      # shell checks
+make test TAGS=build,meta       # shell checks tagged build OR meta
+make test TAGS=meta+policy      # shell checks tagged meta AND policy
 ```
 
-The workspace's first crate is `netfyr-state`, a library, so `cargo test` runs its
-unit tests now; the shell suite under `make test` will exercise the CLI once a later
-story lands one.
+`cargo test` runs the library tests. The shell suite checks the build and repository
+conventions. Run privileged backend acceptance checks in a disposable VM, following
+[the integration suite instructions](tests/integration/coverage.md).
 
 ## API documentation
 

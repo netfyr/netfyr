@@ -1,0 +1,71 @@
+name: development checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: Rust and host checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Allocate fresh evidence path
+        id: evidence
+        run: |
+          directory="$(mktemp -d "$RUNNER_TEMP/netfyr-ci.XXXXXXXX")"
+          printf 'file=%s/checks.json\n' "$directory" >> "$GITHUB_OUTPUT"
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Formatting
+        id: format
+        run: cargo +stable fmt --all -- --check
+      - name: Build
+        id: build
+        run: cargo +stable build --locked --workspace --all-targets
+      - name: Rust tests
+        id: rust
+        run: cargo +stable test --locked --workspace --all-targets
+      - name: Host shell checks
+        id: shell
+        env:
+          REQUIRE_TEST_SELECTION: "1"
+          RUSTUP_TOOLCHAIN: stable
+        run: make test TAGS=build,meta
+      - name: Clippy
+        id: clippy
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+      - name: Evidence recorder regressions
+        id: evidence_tests
+        run: python3 -m unittest discover -s tests -p test_ci_evidence.py
+      - name: Record candidate and check outcomes
+        id: record
+        if: always() && steps.evidence.outputs.file != ''
+        env:
+          FORMAT_OUTCOME: ${{ steps.format.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          RUST_OUTCOME: ${{ steps.rust.outcome }}
+          SHELL_OUTCOME: ${{ steps.shell.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
+          EVIDENCE_TESTS_OUTCOME: ${{ steps.evidence_tests.outcome }}
+          RUSTUP_TOOLCHAIN: stable
+          EVIDENCE_FILE: ${{ steps.evidence.outputs.file }}
+        run: |
+          python3 scripts/ci-evidence.py --output "$EVIDENCE_FILE" \
+            --check "format=$FORMAT_OUTCOME" --check "build=$BUILD_OUTCOME" \
+            --check "rust=$RUST_OUTCOME" --check "shell=$SHELL_OUTCOME" \
+            --check "clippy=$CLIPPY_OUTCOME" --check "evidence_tests=$EVIDENCE_TESTS_OUTCOME"
+      - name: Retain evidence
+        if: always() && steps.record.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: development-checks
+          path: ${{ steps.evidence.outputs.file }}
+          if-no-files-found: error
