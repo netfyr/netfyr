@@ -10,22 +10,20 @@ YAML values are decoded using the embedded schema at each property path. For
 example, an address-looking interface name remains a string, while an
 `ipv4.addresses[].ip` value uses the declared CIDR format.
 
-Work here is driven spec by spec from
-[netfyr/specs](https://github.com/netfyr/specs).
+Core features follow the merged requirements in [netfyr/specs](https://github.com/netfyr/specs).
+See [Contributing to netfyr](CONTRIBUTING.md) for the development and review workflow.
 
 ## Build and test
 
 ```
 cargo build                    # compile the workspace
-cargo test                     # unit tests
-make test                      # shell integration tests
-make test TAGS=ipv4,routing    # integration tests tagged ipv4 OR routing
-make test TAGS=ipv4+routing    # integration tests tagged ipv4 AND routing
+cargo test                     # Rust workspace tests
+make test                      # build and run host shell checks
 ```
 
-The workspace's first crate is `netfyr-state`, a library, so `cargo test` runs its
-unit tests now; the shell suite under `make test` will exercise the CLI once a later
-story lands one.
+The workspace contains the state, policy, reconciliation and backend libraries.
+For live-kernel checks, follow the [backend acceptance guide](tests/integration/coverage.md)
+to run the probe and pytest suite in a disposable VM.
 
 ## API documentation
 
