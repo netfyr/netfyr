@@ -2,35 +2,39 @@
 
 ## How work is organized
 
-Work is driven by specs in [netfyr/specs](https://github.com/netfyr/specs). Each spec is
-an independent deliverable assigned to one developer and lands as one pull request.
+Choose work and coordinate with the assigned implementers on the
+[core planning page](https://specs.netfyr.io/roadmap?ns=netfyr%2Fspecs).
+Read the governing spec, its dependencies and the applicable top-level rules at
+the merged revision in [netfyr/specs](https://github.com/netfyr/specs). Check
+which dependencies have landed in code and raise missing ones with their owners.
+Each feature PR advances one spec. A spec can take several PRs to complete.
 
-Before starting, read your spec's dependencies. Specs reference each other backwards
-only, never forwards, so everything your spec depends on is already merged and
-implemented. If it is not, say so rather than implementing it yourself: that belongs to
-whoever owns the dependency.
-
-A spec creates its own crates under `crates/` and adds them to the workspace `members`
-list. The workspace starts empty by design.
+Propose new behavior or revise requirements in SpecDoc. A board draft can be
+ahead of the published requirements. Use the merged text to assess the
+implementation. See [Contributing specifications](https://github.com/netfyr/specs/blob/main/CONTRIBUTING.md)
+and the [development guide](https://netfyr.io/development/).
 
 ## Development workflow
 
-```
+Use Linux, Git, Make and a Rust toolchain that supports the workspace's
+[edition and minimum Rust version](Cargo.toml). Work in the library that owns
+the behavior. Add a new crate to the workspace members when the feature needs one.
+
+```sh
 cargo build                    # compile the workspace
-cargo test                     # unit tests
-make test                      # shell integration tests
-make test TAGS=ipv4,routing    # integration tests tagged ipv4 OR routing
-make test TAGS=ipv4+routing    # integration tests tagged ipv4 AND routing
+cargo test                     # Rust unit, integration and documentation tests
+make test                      # build and run the host shell checks
+make test TAGS=build,meta       # shell checks tagged build OR meta
+make test TAGS=meta+policy      # shell checks tagged meta AND policy
 make fmt                       # format
 make clippy                    # lint
 make hooks                     # install the git hooks (do this once)
 ```
 
-`make hooks` needs [pre-commit](https://pre-commit.com) on your `PATH` and installs the
-hooks it declares: `cargo fmt --check` on commits that touch Rust files, `cargo clippy`
-before pushes that do. A commit touching only docs or shell runs neither. An existing
-hook of the same type is preserved as `<hook>.legacy` and still runs; hooks of other
-types, `commit-msg` included, are left alone.
+`make hooks` needs [pre-commit](https://pre-commit.com) on your `PATH`.
+The [hook configuration](.pre-commit-config.yaml) runs `cargo fmt --check` on
+commits that touch Rust and Clippy before pushes that touch Rust. An existing
+hook of either type still runs as `<hook>.legacy`.
 
 ## Code conventions
 
@@ -44,6 +48,8 @@ name = "netfyr-example"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 ```
 
 ### Dependency policy
@@ -56,8 +62,10 @@ Prefer the standard library. When two crates do the same job, take the one with 
 transitive dependencies. Every dependency costs build time, binary size, audit surface,
 and a supply chain you now depend on.
 
-Justify each dependency with a comment in the manifest, saying what it does that the
-standard library cannot:
+For low-level networking, check the [rust-netlink crates](https://github.com/rust-netlink)
+and [Nispor](https://github.com/nispor/nispor) before writing a local adapter.
+Document the API gap if you need one. Justify each dependency in a manifest
+comment explaining what the standard library lacks.
 
 ```toml
 # socket2: sets SO_BINDTODEVICE, which tokio's UdpSocket does not expose.
@@ -70,41 +78,38 @@ Unit tests are `#[cfg(test)]` modules inside the source file they cover. They te
 parsing, validation, data structure invariants, and pure functions. They must not depend
 on external tools, network namespaces, or built binaries.
 
-Integration tests are shell scripts in `tests/`. They test CLI behavior, system
-interaction, and end-to-end workflows, exercising the binary the way a user would. They
-are shell rather than Rust so that anyone can read and modify them without knowing Rust.
+Use Rust integration tests in a crate's `tests/` directory to exercise its public
+API. Host shell tests in `tests/*.sh` cover the build, repository conventions
+and shell runner.
 
-When in doubt, write a unit test. It fails in a way that points at the cause.
+For backend changes that affect Linux networking, build the backend probe and
+run the pytest acceptance suite in a disposable VM. The suite checks kernel
+state independently with `ip`. Keep the results outside the guest before
+rollback. The [backend acceptance guide](tests/integration/coverage.md) lists
+the prerequisites, commands and covered requirements.
 
-### Writing an integration test
+### Writing a shell test
 
-Name the script for what it does: `set-mtu.sh`, `yaml-roundtrip.sh`. Declare its tags in
-a comment within the first 10 lines, which is the window the runner scans:
+Name the script for the behavior it checks, as in `workspace-builds.sh`.
+The runner reads tags from a comment within the first ten lines.
 
 ```bash
 #!/bin/bash
-# tags: ipv4 routing backend
+# tags: build meta
 ```
 
-Tags are free-form with no central registry. They describe what the test exercises, so
-that someone working on routing can run the routing tests without knowing spec numbers.
-A test with no tags runs when no filter is given and is excluded when one is.
+Choose tags that describe what the test exercises. An unfiltered run includes
+untagged scripts. If a filter matches nothing, the runner prints
+`no tests matched` and exits successfully. Check the selection before
+reporting a focused run.
 
 The runner executes every `tests/*.sh`, so shared helper files must not live directly in
 `tests/` or they will be run as tests. Put them in `tests/lib/` and source them.
 
-Locate built binaries through `NETFYR_TARGET_DIR`, which the runner exports, falling back
-to the in-tree target directory so the script still works when you run it on its own:
-
-```bash
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-NETFYR_BIN="${NETFYR_TARGET_DIR:-$repo_root/target}/debug/netfyr"
-[ -x "$NETFYR_BIN" ] || { echo "FAIL: netfyr not built at $NETFYR_BIN" >&2; exit 1; }
-```
-
-Never hardcode `../target/debug`. CI overrides the target directory, and the fallback
-only holds for a default build; run through `scripts/run-tests.sh` and the exported value
-also accounts for `build.target-dir`.
+Locate built binaries through `NETFYR_TARGET_DIR`. The
+[shell runner](scripts/run-tests.sh) exports Cargo's resolved target directory,
+including any `CARGO_TARGET_DIR` or `build.target-dir` override. For a direct
+run against a default build, a test can fall back to the repository's `target/`.
 
 ### No skipping
 
@@ -128,32 +133,43 @@ steps. Reserve unit tests for verifying a single function.
 
 ## Submitting changes
 
-One spec per pull request.
+Use imperative subjects. Split work into commits that a reviewer can assess
+individually. Explain the problem, what changes and any compatibility limits
+in the commit messages and PR description.
 
-Commit messages use the imperative mood, explain why rather than what, and reference the
-spec they implement with a `Spec:` trailer naming the spec's path in
-[netfyr/specs](https://github.com/netfyr/specs), without the `.md`:
+Put exactly one `Spec:` trailer in the final paragraph of each ordinary commit.
+End the PR description with a trailer block naming the same spec, even if the
+PR contains only exempt commits. Merge, revert, `fixup!`, `squash!` and
+`amend!` commits are exempt. Use the published path without `.md`. For
+repository-wide work, cite the applicable `meta/` spec.
 
 ```
-Add per-field priority merge to the reconciler
+Accept CIDR strings in reconciliation
 
-Reconciliation needs to preserve DHCP-assigned addresses when a static
-policy touches an unrelated field on the same interface.
+Library callers can supply an IPv4 address as a CIDR string. Match it
+to the equivalent typed address when planning changes.
 
-Spec: core/201-reconciliation-merge
+Spec: core/005-reconciliation
 ```
 
-When fixing a bug introduced by an earlier commit, add a
-`Fixes: HASH12 ("COMMIT SUBJECT")` trailer with the 12-character hash.
+When a PR completes a feature, add `implements netfyr/specs#N` to the last
+non-exempt commit. Use the original spec publication PR number. For example,
+`Spec: core/004-network-backend` pairs with `implements netfyr/specs#17`.
+Preserve both lines when merging. Partial work uses the governing `Spec:`
+reference without a completion line. Top-level specs remain approved. See the
+[merged spec-reference rules](https://github.com/netfyr/specs/blob/main/workspace/009-spec-references-in-commits-and-pull-requests.md).
 
-Split work into logical commits: one reviewable increment each. Reviewers read per
-commit, so do not bundle a refactor with the feature that motivated it.
+Put the same qualified `implements` line in the completing PR description so
+SpecDoc can find it for [implementation feedback](https://specdoc.josie.cloud/spec-lifecycle/#learning-from-implementation-review).
+A follow-up PR for an already implemented feature can link its description
+the same way. For a regression with a known introducing commit, add
+`Fixes: HASH12 ("COMMIT SUBJECT")` to the fix commit, using the 12-character
+hash and subject of the commit that introduced the bug.
 
-Before opening a pull request, make sure `make test` passes, and once the workspace has
-crates, that `cargo test` and `make clippy` do too. State what the change does and why,
-and update the affected documentation.
+Before opening a PR, run `cargo fmt --check`, `cargo test`, `make test` and
+`make clippy`. Keep verification checklists, commands, results and gaps in
+chat or separate review evidence. Update the affected documentation.
 
-Add a `CHANGELOG.md` entry under `## [Unreleased]`, naming the spec in parentheses, only
-when a user or packager would notice the change. Scaffolding, test infrastructure, and
-contributor tooling stay out of it: the audience for that file is people deciding whether
-to upgrade, not people working on netfyr.
+Add a `CHANGELOG.md` entry under `## [Unreleased]` for behavior or
+compatibility changes that users or packagers would notice. Name the spec in
+parentheses so readers can find the requirements behind the entry.
